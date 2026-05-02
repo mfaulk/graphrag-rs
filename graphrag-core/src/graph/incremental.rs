@@ -891,16 +891,19 @@ impl UpdateMonitor {
         affected_entities: usize,
         affected_relationships: usize,
     ) {
-        let mut log = self.operations_log.lock();
-        if let Some(entry) = log.iter_mut().find(|e| &e.operation_id == operation_id) {
-            entry.end_time = Some(Instant::now());
-            entry.success = Some(success);
-            entry.error_message = error;
-            entry.affected_entities = affected_entities;
-            entry.affected_relationships = affected_relationships;
+        // parking_lot::Mutex is not reentrant; release the operations_log
+        // guard before update_performance_stats reacquires it.
+        {
+            let mut log = self.operations_log.lock();
+            if let Some(entry) = log.iter_mut().find(|e| &e.operation_id == operation_id) {
+                entry.end_time = Some(Instant::now());
+                entry.success = Some(success);
+                entry.error_message = error;
+                entry.affected_entities = affected_entities;
+                entry.affected_relationships = affected_relationships;
+            }
         }
 
-        // Update performance stats
         self.update_performance_stats();
     }
 
@@ -2622,7 +2625,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_basic_entity_upsert() {
         let config = IncrementalConfig::default();
         let graph = KnowledgeGraph::new();
@@ -2914,7 +2916,6 @@ mod tests {
     // (instead of hanging the cargo test process).
     #[cfg(feature = "incremental")]
     #[test]
-    #[ignore = "regression for #11; unignore once UpdateMonitor self-deadlock is fixed"]
     fn complete_operation_does_not_self_deadlock() {
         let monitor = Arc::new(UpdateMonitor::new());
         let op = monitor.start_operation("regression_11");
