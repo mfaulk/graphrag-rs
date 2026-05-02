@@ -2906,4 +2906,125 @@ mod tests {
         assert!(matches!(event.event_type, ChangeEventType::EntityUpserted));
         assert!(event.entity_id.is_some());
     }
+
+    // Regression for issue #11: UpdateMonitor::complete_operation must not
+    // self-deadlock when calling update_performance_stats while holding the
+    // operations_log parking_lot Mutex. Runs the call on a dedicated OS
+    // thread and aborts via mpsc::recv_timeout so a deadlock fails the test
+    // (instead of hanging the cargo test process).
+    #[cfg(feature = "incremental")]
+    #[test]
+    #[ignore = "regression for #11; unignore once UpdateMonitor self-deadlock is fixed"]
+    fn complete_operation_does_not_self_deadlock() {
+        let monitor = Arc::new(UpdateMonitor::new());
+        let op = monitor.start_operation("regression_11");
+        let m = Arc::clone(&monitor);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            m.complete_operation(&op, true, None, 1, 0);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("complete_operation self-deadlocked");
+        let stats = monitor.get_performance_stats();
+        assert_eq!(stats.total_operations, 1);
+        assert_eq!(stats.successful_operations, 1);
+    }
+
+    // Regression for issue #13: apply_change_with_conflict_resolution must
+    // return change.change_id (not the monitor's operation_id) so callers
+    // can look the returned id up in change_log without panicking on the
+    // immediate .unwrap() at the upsert_entity call site. Runs the async
+    // call inside an OS thread + dedicated runtime to bound failure time.
+    #[cfg(feature = "incremental")]
+    #[test]
+    #[ignore = "regression for #13; unignore once apply_change_with_conflict_resolution returns change_id"]
+    fn upsert_entity_returns_id_present_in_change_log() {
+        let graph = KnowledgeGraph::new();
+        let config = IncrementalConfig::default();
+        let resolver = ConflictResolver::new(ConflictStrategy::Merge);
+        let store = Arc::new(tokio::sync::Mutex::new(ProductionGraphStore::new(
+            graph, config, resolver,
+        )));
+        let entity = Entity::new(
+            EntityId::new("regression_13".to_string()),
+            "Regression 13".to_string(),
+            "Person".to_string(),
+            0.9,
+        );
+
+        let store_for_thread = Arc::clone(&store);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<UpdateId>>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            let result = rt.block_on(async {
+                let mut s = store_for_thread.lock().await;
+                s.upsert_entity(entity).await
+            });
+            let _ = tx.send(result);
+        });
+
+        let returned = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upsert_entity hung (likely #11 deadlock or #13 panic)")
+            .expect("upsert_entity returned err");
+
+        let verify_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build verify runtime");
+        verify_rt.block_on(async {
+            let s = store.lock().await;
+            assert!(
+                s.change_log.get(&returned).is_some(),
+                "returned id is not present in change_log; apply_change_with_conflict_resolution returned the wrong id"
+            );
+        });
+    }
+
+    // Regression for issue #12: BatchProcessor::add_change must release the
+    // pending_batches entry RefMut before calling pending_batches.remove on
+    // the same key, or DashMap shard reentry deadlocks the caller.
+    #[cfg(feature = "incremental")]
+    #[test]
+    #[ignore = "regression for #12; unignore once add_change releases entry before remove"]
+    fn add_change_does_not_deadlock_on_batch_flush() {
+        let processor = Arc::new(BatchProcessor::new(1, Duration::from_millis(500), 4));
+        let entity = Entity::new(
+            EntityId::new("regression_12".to_string()),
+            "Regression 12".to_string(),
+            "Person".to_string(),
+            0.9,
+        );
+        let change = ChangeRecord {
+            change_id: UpdateId::new(),
+            timestamp: Utc::now(),
+            change_type: ChangeType::EntityAdded,
+            entity_id: Some(entity.id.clone()),
+            document_id: None,
+            operation: Operation::Insert,
+            data: ChangeData::Entity(entity),
+            metadata: HashMap::new(),
+        };
+
+        let p = Arc::clone(&processor);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String>>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            let result = rt.block_on(async { p.add_change(change).await });
+            let _ = tx.send(result);
+        });
+
+        let batch_id = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("add_change deadlocked on batch flush")
+            .expect("add_change returned err");
+        assert!(!batch_id.is_empty());
+    }
 }
