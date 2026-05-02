@@ -37,6 +37,7 @@ mod ollama_tests {
             repeat_penalty: Some(1.2),
             num_ctx: None,
             keep_alive: None,
+            context: None,
         };
 
         assert_eq!(params.num_predict, Some(500));
