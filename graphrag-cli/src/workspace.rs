@@ -139,8 +139,8 @@ impl WorkspaceManager {
     }
 }
 
-impl Default for WorkspaceManager {
-    fn default() -> Self {
-        Self::new().expect("Failed to create workspace manager")
-    }
-}
+// Removed `Default for WorkspaceManager` — its body was
+// `Self::new().expect("Failed to create workspace manager")`, which panics
+// when `dirs::home_dir()` is `None` (containers with no `HOME`, sandboxes,
+// etc.). No call sites in the crate used it. Construct via `Self::new()`
+// and propagate the error instead.

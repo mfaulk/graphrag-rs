@@ -1005,6 +1005,22 @@ impl App {
         Ok(())
     }
 
+    /// Resolve the per-platform XDG workspaces dir, surfacing a TUI error
+    /// instead of silently writing to `./workspaces` if the platform doesn't
+    /// expose a data dir. Returns `None` and emits a status error when the
+    /// caller should bail out (closes #60 on the workspace path).
+    fn resolve_workspace_dir(&self) -> Option<PathBuf> {
+        if let Some(base) = dirs::data_dir() {
+            Some(base.join("graphrag").join("workspaces"))
+        } else {
+            let _ = self.action_tx.send(Action::SetStatus(
+                StatusType::Error,
+                "Cannot determine data directory; set $XDG_DATA_HOME".to_string(),
+            ));
+            None
+        }
+    }
+
     /// Handle loading workspace
     async fn handle_load_workspace(&mut self, name: String) -> Result<()> {
         if !self.graphrag.is_initialized().await {
@@ -1020,10 +1036,10 @@ impl App {
             name
         )))?;
 
-        // Get workspace directory from workspace_manager (default: ~/.graphrag/workspaces)
-        let workspace_dir = dirs::data_dir()
-            .map(|p| p.join("graphrag").join("workspaces"))
-            .unwrap_or_else(|| std::path::PathBuf::from("./workspaces"));
+        let workspace_dir = match self.resolve_workspace_dir() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         match self
             .graphrag
@@ -1065,9 +1081,10 @@ impl App {
 
     /// Handle listing workspaces
     async fn handle_list_workspaces(&mut self) -> Result<()> {
-        let workspace_dir = dirs::data_dir()
-            .map(|p| p.join("graphrag").join("workspaces"))
-            .unwrap_or_else(|| std::path::PathBuf::from("./workspaces"));
+        let workspace_dir = match self.resolve_workspace_dir() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         match self
             .graphrag
@@ -1108,9 +1125,10 @@ impl App {
             name
         )))?;
 
-        let workspace_dir = dirs::data_dir()
-            .map(|p| p.join("graphrag").join("workspaces"))
-            .unwrap_or_else(|| std::path::PathBuf::from("./workspaces"));
+        let workspace_dir = match self.resolve_workspace_dir() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         match self
             .graphrag
@@ -1157,9 +1175,10 @@ impl App {
             name
         )))?;
 
-        let workspace_dir = dirs::data_dir()
-            .map(|p| p.join("graphrag").join("workspaces"))
-            .unwrap_or_else(|| std::path::PathBuf::from("./workspaces"));
+        let workspace_dir = match self.resolve_workspace_dir() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
 
         match self
             .graphrag
