@@ -62,20 +62,46 @@ impl FileOperations {
             .map_err(|e| eyre!("Failed to write file {}: {}", path.display(), e))
     }
 
-    /// Expand tilde (~) in path
-    pub fn expand_tilde(path: &Path) -> PathBuf {
-        if path.starts_with("~") {
-            if let Some(home) = dirs::home_dir() {
-                return home.join(path.strip_prefix("~").unwrap());
+    /// Expand tilde (~) in path.
+    ///
+    /// Only `~/...` (with a path separator) is expanded. `~user/...`
+    /// (POSIX user-name expansion) is intentionally NOT supported: the old
+    /// implementation passed any `~`-prefixed string through unchanged on a
+    /// home-dir-less environment, which let `/load ~user/foo` resolve to
+    /// the literal directory `~user/foo` (a real, attacker-controllable
+    /// directory in the cwd).
+    ///
+    /// Returns an error when the input starts with `~/` and the home
+    /// directory can't be determined — closes the silent-fallback half of
+    /// #54. Non-`~` paths are returned unchanged.
+    pub fn expand_tilde(path: &Path) -> Result<PathBuf> {
+        let s = match path.to_str() {
+            Some(s) => s,
+            None => return Ok(path.to_path_buf()),
+        };
+        // Only the `~/` form (or bare `~`) expands. `~user` stays literal —
+        // it's never been supported and silently passing it through opened
+        // a path-traversal surface.
+        if s == "~" || s.starts_with("~/") {
+            let home = dirs::home_dir().ok_or_else(|| {
+                eyre!(
+                    "Cannot expand `{}`: $HOME is not set and dirs::home_dir() returned None",
+                    path.display()
+                )
+            })?;
+            if s == "~" {
+                return Ok(home);
             }
+            // strip "~/"
+            return Ok(home.join(&s[2..]));
         }
-        path.to_path_buf()
+        Ok(path.to_path_buf())
     }
 
     /// Resolve relative path to absolute
     #[allow(dead_code)]
     pub fn canonicalize(path: &Path) -> Result<PathBuf> {
-        let expanded = Self::expand_tilde(path);
+        let expanded = Self::expand_tilde(path)?;
 
         if expanded.is_absolute() {
             Ok(expanded)
@@ -112,11 +138,40 @@ mod tests {
     #[test]
     fn test_expand_tilde() {
         let path = Path::new("~/test.txt");
-        let expanded = FileOperations::expand_tilde(path);
+        let expanded = FileOperations::expand_tilde(path).unwrap();
 
         if let Some(home) = dirs::home_dir() {
             assert_eq!(expanded, home.join("test.txt"));
         }
+    }
+
+    // The bare `~` form expands to home (no trailing slash).
+    #[test]
+    fn expand_tilde_handles_bare_tilde() {
+        let path = Path::new("~");
+        let expanded = FileOperations::expand_tilde(path).unwrap();
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expanded, home);
+        }
+    }
+
+    // Non-tilde paths pass through unchanged.
+    #[test]
+    fn expand_tilde_passes_non_tilde_through() {
+        let path = Path::new("/etc/passwd");
+        let expanded = FileOperations::expand_tilde(path).unwrap();
+        assert_eq!(expanded, PathBuf::from("/etc/passwd"));
+    }
+
+    // The previous code silently passed `~user/foo` through as a literal
+    // relative path. Now `~user/...` is left as a literal `PathBuf` (not
+    // expanded), so callers don't accidentally resolve to a real `~user`
+    // directory in cwd. Regression for #54 expand_tilde half.
+    #[test]
+    fn expand_tilde_does_not_expand_user_form() {
+        let path = Path::new("~bob/foo");
+        let expanded = FileOperations::expand_tilde(path).unwrap();
+        assert_eq!(expanded, PathBuf::from("~bob/foo"));
     }
 
     #[test]
