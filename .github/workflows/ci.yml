@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + rustfmt)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + clippy)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-stable
+      - name: Run clippy
+        # Exclude pyo3 (graphrag_py) and wasm crates from native lint;
+        # they are linted in their dedicated jobs below.
+        run: |
+          cargo clippy \
+            --workspace \
+            --all-targets \
+            --exclude graphrag_py \
+            --exclude graphrag-wasm \
+            -- -D warnings
+
+  test:
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ matrix.os }}-stable
+      - name: Build (workspace, excluding pyo3 + wasm crates)
+        run: |
+          cargo build \
+            --workspace \
+            --exclude graphrag_py \
+            --exclude graphrag-wasm \
+            --verbose
+      - name: Test (workspace, excluding pyo3 + wasm crates)
+        run: |
+          cargo test \
+            --workspace \
+            --exclude graphrag_py \
+            --exclude graphrag-wasm \
+            --verbose
+
+  wasm-build:
+    name: WASM build (graphrag-wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable + wasm target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm32
+      - name: Build graphrag-wasm (lib) for wasm32
+        run: cargo build -p graphrag-wasm --lib --target wasm32-unknown-unknown
+
+  python-build:
+    name: Python extension build (graphrag_py)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-stable-py
+      - name: Build graphrag_py (cdylib)
+        run: cargo build -p graphrag_py
