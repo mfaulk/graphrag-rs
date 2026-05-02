@@ -1,17 +1,23 @@
 //! Input validation middleware and utilities for GraphRAG Server
 //!
 //! Provides request validation, sanitization, and security checks.
+//!
+//! Length limits below are byte-based (not codepoint/grapheme counts) — they
+//! exist to bound DoS surface, not to mirror user-visible character counts.
+//! Error messages refer to "bytes" so multi-byte UTF-8 input behaves
+//! predictably (a CJK paragraph hits the byte limit much earlier than a
+//! "characters"-worded message would suggest).
 
 /// Maximum request body size (10MB)
 pub const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
 
-/// Maximum query length
+/// Maximum query length, in bytes
 pub const MAX_QUERY_LENGTH: usize = 10_000;
 
-/// Maximum document title length
+/// Maximum document title length, in bytes
 pub const MAX_TITLE_LENGTH: usize = 500;
 
-/// Maximum document content length (5MB of text)
+/// Maximum document content length, in bytes (5MB of text)
 pub const MAX_CONTENT_LENGTH: usize = 5 * 1024 * 1024;
 
 /// Maximum top_k value for queries
@@ -37,23 +43,20 @@ pub fn validate_query(query: &str) -> Result<(), ValidationError> {
 
     if query.len() > MAX_QUERY_LENGTH {
         return Err(ValidationError {
-            error: format!(
-                "Query exceeds maximum length of {} characters",
-                MAX_QUERY_LENGTH
-            ),
+            error: format!("Query exceeds maximum length of {} bytes", MAX_QUERY_LENGTH),
             field: Some("query".to_string()),
             max_length: Some(MAX_QUERY_LENGTH),
         });
     }
 
-    // Check for potentially malicious patterns
-    if contains_sql_injection_patterns(query) {
-        return Err(ValidationError {
-            error: "Query contains potentially malicious patterns".to_string(),
-            field: Some("query".to_string()),
-            max_length: None,
-        });
-    }
+    // Note: removed the SQL-injection blocklist that previously lived here.
+    // None of the configured backends (Qdrant, in-memory) are SQL — there is
+    // no SQL surface to inject into, so the check was producing false
+    // positives on legitimate questions ("What does the SQL DROP TABLE
+    // clause do?") while masking real concerns (prompt injection into
+    // Ollama, payload injection into Qdrant filters). Real injection
+    // hardening should live next to the backend that actually parses the
+    // input, not as a generic substring match here.
 
     Ok(())
 }
@@ -70,10 +73,7 @@ pub fn validate_title(title: &str) -> Result<(), ValidationError> {
 
     if title.len() > MAX_TITLE_LENGTH {
         return Err(ValidationError {
-            error: format!(
-                "Title exceeds maximum length of {} characters",
-                MAX_TITLE_LENGTH
-            ),
+            error: format!("Title exceeds maximum length of {} bytes", MAX_TITLE_LENGTH),
             field: Some("title".to_string()),
             max_length: Some(MAX_TITLE_LENGTH),
         });
@@ -95,7 +95,7 @@ pub fn validate_content(content: &str) -> Result<(), ValidationError> {
     if content.len() > MAX_CONTENT_LENGTH {
         return Err(ValidationError {
             error: format!(
-                "Content exceeds maximum length of {} characters",
+                "Content exceeds maximum length of {} bytes",
                 MAX_CONTENT_LENGTH
             ),
             field: Some("content".to_string()),
@@ -135,30 +135,13 @@ pub fn sanitize_string(input: &str) -> String {
         .collect()
 }
 
-/// Check for common SQL injection patterns (basic check)
-fn contains_sql_injection_patterns(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    let dangerous_patterns = [
-        "drop table",
-        "drop database",
-        "delete from",
-        "insert into",
-        "update set",
-        "; --",
-        "' or '1'='1",
-        "\" or \"1\"=\"1",
-        "union select",
-        "exec(",
-        "execute(",
-    ];
-
-    dangerous_patterns
-        .iter()
-        .any(|pattern| lower.contains(pattern))
-}
-
 // Note: Request body size limits are now configured in main.rs using
-// PayloadConfig and JsonConfig with MAX_BODY_SIZE constant
+// PayloadConfig and JsonConfig with MAX_BODY_SIZE constant.
+//
+// The previous `contains_sql_injection_patterns` helper was removed: none
+// of the configured backends are SQL, so the substring blocklist (`drop
+// table`, `delete from`, etc.) only produced false positives on legitimate
+// queries. See #42.
 
 #[cfg(test)]
 mod tests {
@@ -170,10 +153,30 @@ mod tests {
         assert!(validate_query("What is GraphRAG?").is_ok());
         assert!(validate_query("A".repeat(1000).as_str()).is_ok());
 
-        // Invalid queries
+        // Invalid queries (length-based only — no SQL substring matching)
         assert!(validate_query("").is_err());
         assert!(validate_query(&"A".repeat(MAX_QUERY_LENGTH + 1)).is_err());
-        assert!(validate_query("'; DROP TABLE users; --").is_err());
+    }
+
+    // Legitimate questions that *talk about* SQL must pass (regression for
+    // #42 — the old SQL-injection blocklist 400'd these).
+    #[test]
+    fn validate_query_accepts_questions_that_mention_sql_keywords() {
+        assert!(validate_query("What does the SQL DROP TABLE clause do?").is_ok());
+        assert!(validate_query("How do I write an INSERT INTO statement?").is_ok());
+        assert!(validate_query("Compare DELETE FROM and TRUNCATE.").is_ok());
+        assert!(validate_query("'; DROP TABLE users; --").is_ok());
+    }
+
+    // Length errors must mention "bytes" (not "characters") — see #42.
+    #[test]
+    fn validate_query_length_error_says_bytes_not_characters() {
+        let err = validate_query(&"A".repeat(MAX_QUERY_LENGTH + 1)).expect_err("too long");
+        assert!(
+            err.error.contains("bytes"),
+            "expected 'bytes' in length error, got: {}",
+            err.error
+        );
     }
 
     #[test]
@@ -205,18 +208,6 @@ mod tests {
         assert_eq!(sanitize_string("Normal text"), "Normal text");
     }
 
-    #[test]
-    fn test_sql_injection_detection() {
-        assert!(contains_sql_injection_patterns("'; DROP TABLE users; --"));
-        assert!(contains_sql_injection_patterns("' OR '1'='1"));
-        assert!(contains_sql_injection_patterns(
-            "UNION SELECT * FROM passwords"
-        ));
-        assert!(!contains_sql_injection_patterns(
-            "What is the drop in temperature?"
-        ));
-        assert!(!contains_sql_injection_patterns(
-            "Normal query about tables"
-        ));
-    }
+    // (test_sql_injection_detection removed alongside the
+    // contains_sql_injection_patterns helper — see #42.)
 }
