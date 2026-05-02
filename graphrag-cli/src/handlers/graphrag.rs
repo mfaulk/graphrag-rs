@@ -123,34 +123,41 @@ impl GraphRAGHandler {
             return Ok(()); // purely algorithmic config, no Ollama needed
         }
 
-        // Quick HTTP check with a short timeout.
+        // Quick HTTP check with a short timeout. The probe is ureq (sync),
+        // so it runs on the blocking pool to avoid parking a tokio worker
+        // while the TUI event loop is waiting for input/render ticks.
         let url = format!("{}:{}/api/tags", host, port);
-        let agent = ureq::AgentBuilder::new()
-            .timeout(std::time::Duration::from_secs(3))
-            .build();
-
-        let available: Vec<String> = match agent.get(&url).call() {
-            Ok(resp) => {
-                let body: serde_json::Value = resp
-                    .into_json()
-                    .unwrap_or_else(|_| serde_json::json!({"models": []}));
-                body["models"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|m| m["name"].as_str().map(|s| s.to_string()))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            },
-            Err(e) => {
-                return Err(eyre!(
-                    "Cannot reach Ollama at {} — is it running?\nError: {}",
-                    url,
-                    e
-                ));
-            },
-        };
+        let probe_url = url.clone();
+        let probe_result: Result<Vec<String>> =
+            tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout(std::time::Duration::from_secs(3))
+                    .build();
+                let resp = agent.get(&probe_url).call().map_err(|e| {
+                    eyre!(
+                        "Cannot reach Ollama at {} — is it running?\nError: {}",
+                        probe_url,
+                        e
+                    )
+                })?;
+                let body = resp.into_string().map_err(|e| {
+                    eyre!(
+                        "Ollama responded at {} but the body could not be read: {}",
+                        probe_url,
+                        e
+                    )
+                })?;
+                parse_ollama_tags(&body).map_err(|e| {
+                    eyre!(
+                        "Ollama responded at {} but the body was not valid JSON: {}",
+                        probe_url,
+                        e
+                    )
+                })
+            })
+            .await
+            .map_err(|join_err| eyre!("Ollama pre-flight task failed to join: {}", join_err))?;
+        let available: Vec<String> = probe_result?;
 
         // Compare required vs available (Ollama names may include `:latest`).
         let missing: Vec<&String> = required
@@ -550,5 +557,76 @@ impl GraphRAGHandler {
 impl Default for GraphRAGHandler {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Parse Ollama's `/api/tags` response body into a list of installed model names.
+///
+/// Returns `Err` if the body is not valid JSON. Returns an empty `Vec` if the
+/// JSON is well-formed but contains no `models` array (or it is empty), which
+/// is a legitimate "Ollama is up but has no models pulled" state.
+fn parse_ollama_tags(body: &str) -> Result<Vec<String>> {
+    let json: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| eyre!("malformed JSON: {}", e))?;
+    Ok(json["models"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m["name"].as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Well-formed Ollama /api/tags response yields the model names in order.
+    #[test]
+    fn parse_ollama_tags_well_formed_returns_names() {
+        let body = r#"{
+            "models": [
+                {"name": "llama3.2:3b", "modified_at": "..."},
+                {"name": "nomic-embed-text:latest", "modified_at": "..."}
+            ]
+        }"#;
+        let names = parse_ollama_tags(body).expect("should parse");
+        assert_eq!(names, vec!["llama3.2:3b", "nomic-embed-text:latest"]);
+    }
+
+    // A truncated body should surface as an explicit JSON parse error,
+    // not be silently swallowed into an empty model list (regression for #63).
+    #[test]
+    fn parse_ollama_tags_malformed_returns_err() {
+        let truncated = r#"{"models": [{"name": "llama3"#;
+        let err = parse_ollama_tags(truncated).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("malformed JSON"),
+            "expected JSON parse error, got: {msg}"
+        );
+    }
+
+    // A 200 OK with valid JSON but no models field is a legitimate "empty"
+    // state; do NOT confuse it with a parse error.
+    #[test]
+    fn parse_ollama_tags_missing_models_field_returns_empty() {
+        let body = r#"{}"#;
+        let names = parse_ollama_tags(body).expect("should parse");
+        assert!(names.is_empty());
+    }
+
+    // Models entry without a "name" field is skipped, not panicked on.
+    #[test]
+    fn parse_ollama_tags_skips_entries_missing_name() {
+        let body = r#"{
+            "models": [
+                {"modified_at": "..."},
+                {"name": "llama3.2:3b"}
+            ]
+        }"#;
+        let names = parse_ollama_tags(body).expect("should parse");
+        assert_eq!(names, vec!["llama3.2:3b"]);
     }
 }
