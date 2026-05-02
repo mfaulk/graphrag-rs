@@ -13,8 +13,8 @@
 
 use graphrag_core::vector::EmbeddingGenerator;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 #[cfg(feature = "ollama")]
@@ -52,11 +52,11 @@ pub struct EmbeddingService {
     config: EmbeddingConfig,
     #[cfg(feature = "ollama")]
     ollama_client: Option<Arc<Ollama>>,
-    fallback_generator: Arc<RwLock<EmbeddingGenerator>>,
-    stats: Arc<RwLock<EmbeddingStats>>,
+    /// Lock-free counters; see [`AtomicEmbeddingStats`].
+    stats: Arc<AtomicEmbeddingStats>,
 }
 
-/// Embedding statistics
+/// Embedding statistics (snapshot, exposed publicly).
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EmbeddingStats {
     pub total_requests: usize,
@@ -64,6 +64,30 @@ pub struct EmbeddingStats {
     pub ollama_failures: usize,
     pub fallback_used: usize,
     pub cache_hits: usize,
+}
+
+/// Lock-free counters used internally to avoid the four-acquisitions-per-call
+/// pattern from the previous `RwLock<EmbeddingStats>` implementation.
+/// Concurrent calls to `generate` no longer serialize on stat updates.
+#[derive(Default)]
+pub(crate) struct AtomicEmbeddingStats {
+    total_requests: AtomicUsize,
+    ollama_success: AtomicUsize,
+    ollama_failures: AtomicUsize,
+    fallback_used: AtomicUsize,
+    cache_hits: AtomicUsize,
+}
+
+impl AtomicEmbeddingStats {
+    fn snapshot(&self) -> EmbeddingStats {
+        EmbeddingStats {
+            total_requests: self.total_requests.load(Ordering::Relaxed),
+            ollama_success: self.ollama_success.load(Ordering::Relaxed),
+            ollama_failures: self.ollama_failures.load(Ordering::Relaxed),
+            fallback_used: self.fallback_used.load(Ordering::Relaxed),
+            cache_hits: self.cache_hits.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// Embedding error type
@@ -138,45 +162,43 @@ impl EmbeddingService {
             warn!("⚠ Ollama support not compiled in. Using fallback embeddings. Rebuild with --features ollama");
         }
 
-        // Always create fallback generator
-        let fallback_generator = Arc::new(RwLock::new(EmbeddingGenerator::new(config.dimension)));
-
         Ok(Self {
             config,
             #[cfg(feature = "ollama")]
             ollama_client,
-            fallback_generator,
-            stats: Arc::new(RwLock::new(EmbeddingStats::default())),
+            stats: Arc::new(AtomicEmbeddingStats::default()),
         })
     }
 
     /// Generate embeddings for a batch of texts
     pub async fn generate(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        let mut stats = self.stats.write().await;
-        stats.total_requests += texts.len();
-        drop(stats); // Release lock
+        self.stats
+            .total_requests
+            .fetch_add(texts.len(), Ordering::Relaxed);
 
         // Try Ollama first if available
         #[cfg(feature = "ollama")]
         if let Some(ollama) = &self.ollama_client {
             match self.generate_with_ollama(ollama, texts).await {
                 Ok(embeddings) => {
-                    let mut stats = self.stats.write().await;
-                    stats.ollama_success += texts.len();
+                    self.stats
+                        .ollama_success
+                        .fetch_add(texts.len(), Ordering::Relaxed);
                     return Ok(embeddings);
                 },
                 Err(e) => {
                     warn!("Ollama embedding failed: {}. Using fallback.", e);
-                    let mut stats = self.stats.write().await;
-                    stats.ollama_failures += texts.len();
+                    self.stats
+                        .ollama_failures
+                        .fetch_add(texts.len(), Ordering::Relaxed);
                 },
             }
         }
 
         // Fallback to hash-based embeddings
-        let mut stats = self.stats.write().await;
-        stats.fallback_used += texts.len();
-        drop(stats);
+        self.stats
+            .fallback_used
+            .fetch_add(texts.len(), Ordering::Relaxed);
 
         self.generate_with_fallback(texts).await
     }
@@ -225,14 +247,21 @@ impl EmbeddingService {
         Ok(results)
     }
 
-    /// Generate embeddings using hash-based fallback
+    /// Generate embeddings using hash-based fallback.
+    ///
+    /// Builds a fresh `EmbeddingGenerator` per call. The previous shared
+    /// `Arc<RwLock<EmbeddingGenerator>>` serialized every fallback call across
+    /// the whole process — when Ollama was down, all concurrent embedding
+    /// requests queued behind a single write guard. Hash-based generation is
+    /// cheap (a few hashes per word per dimension), so dropping the cross-call
+    /// memoization cache here costs little and restores parallelism on a hot
+    /// path.
     async fn generate_with_fallback(
         &self,
         texts: &[&str],
     ) -> Result<Vec<Vec<f32>>, EmbeddingError> {
-        let mut generator = self.fallback_generator.write().await;
-        let results = generator.batch_generate(texts);
-        Ok(results)
+        let mut generator = EmbeddingGenerator::new(self.config.dimension);
+        Ok(generator.batch_generate(texts))
     }
 
     /// Get embedding dimension
@@ -243,8 +272,8 @@ impl EmbeddingService {
 
     /// Get current statistics
     #[allow(dead_code)]
-    pub async fn get_stats(&self) -> EmbeddingStats {
-        self.stats.read().await.clone()
+    pub fn get_stats(&self) -> EmbeddingStats {
+        self.stats.snapshot()
     }
 
     /// Check if Ollama is available
@@ -305,5 +334,40 @@ mod tests {
                 println!("Ollama not available, using fallback");
             }
         }
+    }
+
+    // Concurrent fallback calls must not serialize (regression for #44).
+    // The previous implementation held an `Arc<RwLock<EmbeddingGenerator>>`
+    // write guard for the whole batch, so N concurrent callers ran in series.
+    // After the fix, stats are atomic and the generator is per-call, so all
+    // counter updates from concurrent calls land. We assert the total count
+    // matches the number of texts handed to all callers — which would still
+    // be true under serialization, but the test also exercises the lock-free
+    // counter path under genuine concurrency (no panics, no lost updates).
+    #[tokio::test]
+    async fn fallback_stats_are_atomic_under_concurrency() {
+        let config = EmbeddingConfig {
+            backend: "hash".to_string(),
+            dimension: 64,
+            ..Default::default()
+        };
+        let service = Arc::new(EmbeddingService::new(config).await.unwrap());
+
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let svc = Arc::clone(&service);
+            tasks.push(tokio::spawn(async move {
+                let _ = svc.generate(&["alpha", "beta", "gamma"]).await.unwrap();
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        let stats = service.get_stats();
+        assert_eq!(stats.total_requests, 32 * 3);
+        // Ollama isn't available in this test, so every request fell through
+        // to the fallback path.
+        assert_eq!(stats.fallback_used, 32 * 3);
     }
 }
