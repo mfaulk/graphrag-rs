@@ -54,7 +54,7 @@ pub use chunking_strategies::RustCodeChunkingStrategy;
 use crate::parallel::{ParallelProcessor, PerformanceMonitor};
 use crate::{
     core::{ChunkId, ChunkingStrategy, Document, TextChunk},
-    Result,
+    GraphRAGError, Result,
 };
 use chunking::HierarchicalChunker;
 
@@ -70,8 +70,12 @@ pub struct TextProcessor {
 }
 
 impl TextProcessor {
-    /// Create a new text processor
+    /// Create a new text processor.
+    ///
+    /// Returns an error if `chunk_size == 0` or `chunk_overlap >= chunk_size`,
+    /// either of which would cause the chunking loop to fail to make progress.
     pub fn new(chunk_size: usize, chunk_overlap: usize) -> Result<Self> {
+        Self::validate_chunk_params(chunk_size, chunk_overlap)?;
         Ok(Self {
             chunk_size,
             chunk_overlap,
@@ -82,19 +86,39 @@ impl TextProcessor {
         })
     }
 
-    /// Create a new text processor with parallel processing support
+    /// Create a new text processor with parallel processing support.
+    ///
+    /// Returns an error if `chunk_size == 0` or `chunk_overlap >= chunk_size`.
     #[cfg(feature = "parallel-processing")]
     pub fn with_parallel_processing(
         chunk_size: usize,
         chunk_overlap: usize,
         parallel_processor: ParallelProcessor,
     ) -> Result<Self> {
+        Self::validate_chunk_params(chunk_size, chunk_overlap)?;
         Ok(Self {
             chunk_size,
             chunk_overlap,
             parallel_processor: Some(parallel_processor),
             performance_monitor: PerformanceMonitor::new(),
         })
+    }
+
+    fn validate_chunk_params(chunk_size: usize, chunk_overlap: usize) -> Result<()> {
+        if chunk_size == 0 {
+            return Err(GraphRAGError::Config {
+                message: "chunk_size must be > 0".to_string(),
+            });
+        }
+        if chunk_overlap >= chunk_size {
+            return Err(GraphRAGError::Config {
+                message: format!(
+                    "chunk_overlap ({chunk_overlap}) must be less than chunk_size ({chunk_size}); \
+                     equal or larger overlap causes the chunker to make no forward progress",
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Split text into chunks with overlap using hierarchical boundary preservation
@@ -637,5 +661,32 @@ mod tests {
         assert!(!chunks.is_empty());
         // Verify metadata is present
         assert!(chunks.iter().any(|c| !c.metadata.keywords.is_empty()));
+    }
+
+    // Regression test for #19: chunker hung forever when overlap >= chunk_size
+    // because next_start <= start on every iteration. Now rejected at construction.
+    #[test]
+    fn rejects_overlap_equal_to_chunk_size() {
+        let err = TextProcessor::new(256, 256).unwrap_err();
+        assert!(
+            matches!(err, GraphRAGError::Config { .. }),
+            "expected GraphRAGError::Config, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_overlap_greater_than_chunk_size() {
+        assert!(TextProcessor::new(100, 200).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_chunk_size() {
+        assert!(TextProcessor::new(0, 0).is_err());
+    }
+
+    #[test]
+    fn accepts_overlap_less_than_chunk_size() {
+        assert!(TextProcessor::new(256, 64).is_ok());
+        assert!(TextProcessor::new(100, 0).is_ok());
     }
 }
