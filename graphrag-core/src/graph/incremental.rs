@@ -1660,7 +1660,11 @@ impl BatchProcessor {
     pub async fn add_change(&self, change: ChangeRecord) -> Result<String> {
         let batch_key = self.get_batch_key(&change);
 
-        let batch_id = {
+        // Capture the batch snapshot and id under the entry RefMut, then
+        // drop the RefMut before touching pending_batches again. DashMap
+        // remove on the same key while a RefMut is alive deadlocks on the
+        // shard write lock the RefMut holds.
+        let (batch_id, batch_to_flush) = {
             let mut entry = self
                 .pending_batches
                 .entry(batch_key.clone())
@@ -1675,23 +1679,20 @@ impl BatchProcessor {
                 || entry.created_at.elapsed() > self.max_wait_time;
 
             let batch_id = entry.batch_id.clone();
-
-            if should_process {
-                // Move batch out for processing
-                let batch = entry.clone();
-                self.pending_batches.remove(&batch_key);
-
-                // Process batch asynchronously
-                let processor = Arc::new(self.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = processor.process_batch(batch).await {
-                        eprintln!("Batch processing error: {e}");
-                    }
-                });
-            }
-
-            batch_id
+            let batch_to_flush = should_process.then(|| entry.clone());
+            (batch_id, batch_to_flush)
         };
+
+        if let Some(batch) = batch_to_flush {
+            self.pending_batches.remove(&batch_key);
+
+            let processor = Arc::new(self.clone());
+            tokio::spawn(async move {
+                if let Err(e) = processor.process_batch(batch).await {
+                    eprintln!("Batch processing error: {e}");
+                }
+            });
+        }
 
         Ok(batch_id)
     }
@@ -2991,7 +2992,6 @@ mod tests {
     // the same key, or DashMap shard reentry deadlocks the caller.
     #[cfg(feature = "incremental")]
     #[test]
-    #[ignore = "regression for #12; unignore once add_change releases entry before remove"]
     fn add_change_does_not_deadlock_on_batch_flush() {
         let processor = Arc::new(BatchProcessor::new(1, Duration::from_millis(500), 4));
         let entity = Entity::new(
