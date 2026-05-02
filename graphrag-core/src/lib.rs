@@ -155,6 +155,9 @@ pub mod incremental;
 /// ROGRAG (Robustly Optimized GraphRAG) implementation
 pub mod rograg;
 
+/// UTF-8-safe string helpers and other small utilities.
+pub mod util;
+
 // Future utility modules (optional, not currently needed):
 // pub mod automatic_entity_linking;  // Advanced entity linking
 // pub mod phase_saver;               // Phase state persistence

@@ -915,7 +915,11 @@ impl LogicFormExecutor {
                             if let Some(pos) = content_lower.find(keyword) {
                                 let start = pos.saturating_sub(20);
                                 let end = (pos + keyword.len() + 20).min(chunk.content.len());
-                                let context = &chunk.content[start..end];
+                                let context = crate::util::text_safe::slice_on_char_boundary(
+                                    &chunk.content,
+                                    start,
+                                    end,
+                                );
 
                                 bindings.push(VariableBinding {
                                     variable: "T".to_string(),
@@ -1125,7 +1129,11 @@ impl LogicFormExecutor {
                                 if let Some(pos) = content_lower.find(keyword) {
                                     let start = pos.saturating_sub(30);
                                     let end = (pos + keyword.len() + 30).min(chunk.content.len());
-                                    let context = &chunk.content[start..end];
+                                    let context = crate::util::text_safe::slice_on_char_boundary(
+                                        &chunk.content,
+                                        start,
+                                        end,
+                                    );
 
                                     bindings.push(VariableBinding {
                                         variable: "C".to_string(),
