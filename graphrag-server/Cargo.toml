@@ -64,6 +64,7 @@ parking_lot = { workspace = true }
 
 # Caching and distributed systems
 redis = { workspace = true }
+lru = { workspace = true }
 
 # Other
 uuid = { workspace = true }

@@ -35,11 +35,12 @@
 //! └─────────────────────────────────────┘
 //! ```
 
+use lru::LruCache;
 use parking_lot::RwLock;
 use redis::aio::ConnectionManager;
 use redis::{AsyncCommands, Client, RedisError};
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -64,10 +65,14 @@ struct CacheEntry<T> {
 pub struct DistributedCache {
     /// L1 cache: In-memory LRU cache.
     ///
-    /// Uses `parking_lot::RwLock`, which is correct because no `.await`
-    /// occurs while a guard is held — every helper that touches `l1_cache`
-    /// drops the guard before any async operation.
-    l1_cache: Arc<RwLock<HashMap<String, CacheEntry<Vec<u8>>>>>,
+    /// Uses `lru::LruCache` for O(1) get/put/eviction. The previous
+    /// `HashMap` + `min_by_key` scan was O(n) per eviction under a write
+    /// lock, which serialized every cache operation behind a 1000-element
+    /// linear scan once the cache reached capacity.
+    ///
+    /// Wrapped in `parking_lot::RwLock` — no `.await` occurs while a guard
+    /// is held; every helper drops the guard before any async operation.
+    l1_cache: Arc<RwLock<LruCache<String, CacheEntry<Vec<u8>>>>>,
     /// L1 cache max size
     l1_max_size: usize,
     /// L1 TTL
@@ -224,8 +229,13 @@ impl DistributedCache {
             None
         };
 
+        // LruCache requires NonZeroUsize; clamp 0 → 1 so a misconfigured
+        // l1_max_size doesn't panic. A 1-entry cache is degenerate but
+        // safe; any sensible config will use a much larger value.
+        let l1_capacity =
+            NonZeroUsize::new(config.l1_max_size.max(1)).expect("max(1) is always non-zero");
         Ok(Self {
-            l1_cache: Arc::new(RwLock::new(HashMap::new())),
+            l1_cache: Arc::new(RwLock::new(LruCache::new(l1_capacity))),
             l1_max_size: config.l1_max_size,
             l1_ttl: Duration::from_secs(config.l1_ttl_secs),
             redis,
@@ -309,7 +319,7 @@ impl DistributedCache {
     ///
     /// Removes from both L1 and L2 caches. L2 errors are logged.
     pub async fn invalidate(&self, key: &str) {
-        self.l1_cache.write().remove(key);
+        self.l1_cache.write().pop(key);
 
         if let Some(mut conn) = self.redis.clone() {
             if let Err(e) = conn.del::<_, ()>(key).await {
@@ -325,15 +335,15 @@ impl DistributedCache {
         let l1_keys_to_remove: Vec<String> = self
             .l1_cache
             .read()
-            .keys()
-            .filter(|k| Self::matches_pattern(k, pattern))
-            .cloned()
+            .iter()
+            .filter(|(k, _)| Self::matches_pattern(k, pattern))
+            .map(|(k, _)| k.clone())
             .collect();
 
         if !l1_keys_to_remove.is_empty() {
             let mut cache = self.l1_cache.write();
             for key in &l1_keys_to_remove {
-                cache.remove(key);
+                cache.pop(key);
             }
         }
 
@@ -392,34 +402,42 @@ impl DistributedCache {
     // --- Private methods ---
 
     /// Get from L1 cache (synchronous; guard never crosses an `.await`).
+    ///
+    /// `LruCache::peek` checks TTL without bumping LRU order; if expired we
+    /// remove and miss. Otherwise `get_mut` bumps the entry to most-recently-
+    /// used and returns the value.
     fn get_l1(&self, key: &str) -> Option<Vec<u8>> {
         let mut cache = self.l1_cache.write();
 
-        if let Some(entry) = cache.get_mut(key) {
-            // Check TTL
+        if let Some(entry) = cache.peek(key) {
             if entry.created_at.elapsed() > self.l1_ttl {
-                cache.remove(key);
+                cache.pop(key);
                 return None;
             }
-
-            entry.access_count += 1;
-            entry.last_accessed = Instant::now();
-            return Some(entry.value.clone());
         }
 
-        None
+        cache.get_mut(key).map(|entry| {
+            entry.access_count += 1;
+            entry.last_accessed = Instant::now();
+            entry.value.clone()
+        })
     }
 
     /// Set in L1 cache (synchronous; guard never crosses an `.await`).
+    ///
+    /// Eviction is O(1): if we're at capacity and the key is new, pop the
+    /// LRU entry first and bump the eviction counter. `LruCache::put` will
+    /// also evict transparently if we don't pre-pop, but doing it here lets
+    /// us increment `stats.evictions`.
     fn set_l1(&self, key: &str, value: Vec<u8>) {
         let mut cache = self.l1_cache.write();
 
-        // Evict if at capacity
-        if cache.len() >= self.l1_max_size && !cache.contains_key(key) {
-            self.evict_l1(&mut cache);
+        if cache.len() >= self.l1_max_size && cache.peek(key).is_none() && cache.pop_lru().is_some()
+        {
+            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
         }
 
-        cache.insert(
+        cache.put(
             key.to_string(),
             CacheEntry {
                 value,
@@ -428,15 +446,6 @@ impl DistributedCache {
                 last_accessed: Instant::now(),
             },
         );
-    }
-
-    /// Evict from L1 cache using LRU
-    fn evict_l1(&self, cache: &mut HashMap<String, CacheEntry<Vec<u8>>>) {
-        if let Some((lru_key, _)) = cache.iter().min_by_key(|(_, entry)| entry.last_accessed) {
-            let lru_key = lru_key.clone();
-            cache.remove(&lru_key);
-            self.stats.evictions.fetch_add(1, Ordering::Relaxed);
-        }
     }
 
     /// Get from L2 cache (Redis)
