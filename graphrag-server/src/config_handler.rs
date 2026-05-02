@@ -10,6 +10,23 @@ use serde_json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Errors produced by [`ConfigManager`].
+///
+/// Distinguishing parse from validation lets the API handler boundary map each
+/// case to the right HTTP status (both BadRequest, but the body shape differs)
+/// and lets future callers programmatically branch on the failure mode.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error("failed to parse JSON: {0}")]
+    Parse(#[from] serde_json::Error),
+
+    #[error("configuration validation failed: {0:?}")]
+    Validation(Vec<String>),
+
+    #[error("no configuration set")]
+    NotSet,
+}
+
 /// Server configuration state
 #[derive(Clone)]
 pub struct ConfigManager {
@@ -29,16 +46,15 @@ impl ConfigManager {
     }
 
     /// Set configuration from JSON
-    pub async fn set_from_json(&self, json_str: &str) -> Result<(), String> {
-        // Parse JSON into Config
-        let config: Config =
-            serde_json::from_str(json_str).map_err(|e| format!("Failed to parse JSON: {}", e))?;
+    pub async fn set_from_json(&self, json_str: &str) -> Result<(), ConfigError> {
+        // Parse JSON into Config — `?` lifts serde_json::Error via #[from]
+        let config: Config = serde_json::from_str(json_str)?;
 
         // Validate configuration
         let errors = self.validate_config(&config).await;
         if !errors.is_empty() {
             *self.validation_errors.write().await = errors.clone();
-            return Err(format!("Configuration validation failed: {:?}", errors));
+            return Err(ConfigError::Validation(errors));
         }
 
         // Store configuration
@@ -95,12 +111,11 @@ impl ConfigManager {
     }
 
     /// Convert Config to JSON string
-    pub async fn to_json(&self) -> Result<String, String> {
+    pub async fn to_json(&self) -> Result<String, ConfigError> {
         let config = self.config.read().await;
         match config.as_ref() {
-            Some(cfg) => serde_json::to_string_pretty(cfg)
-                .map_err(|e| format!("Failed to serialize config: {}", e)),
-            None => Err("No configuration set".to_string()),
+            Some(cfg) => Ok(serde_json::to_string_pretty(cfg)?),
+            None => Err(ConfigError::NotSet),
         }
     }
 
@@ -369,5 +384,63 @@ mod tests {
         let json = serde_json::to_string(&invalid_config).unwrap();
         let result = manager.set_from_json(&json).await;
         assert!(result.is_err());
+    }
+
+    // Malformed JSON should produce a typed Parse error, not a freeform String
+    // (regression for #47: callers can now branch on the failure mode).
+    #[tokio::test]
+    async fn set_from_json_returns_parse_variant_on_malformed_input() {
+        let manager = ConfigManager::new();
+        let err = manager
+            .set_from_json("{not valid json")
+            .await
+            .expect_err("malformed JSON should error");
+        match err {
+            ConfigError::Parse(_) => {},
+            other => panic!("expected ConfigError::Parse, got: {other:?}"),
+        }
+    }
+
+    // A well-formed Config that fails semantic validation should produce a
+    // Validation variant carrying the structured error list. Build the JSON
+    // from the defaults so we exercise the validation path rather than
+    // tripping a missing-field parse error.
+    #[tokio::test]
+    async fn set_from_json_returns_validation_variant_with_error_list() {
+        let manager = ConfigManager::new();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&ConfigManager::default_config_json())
+                .expect("default config JSON should parse");
+        value["chunk_size"] = serde_json::json!(0);
+        let json = serde_json::to_string(&value).unwrap();
+
+        let err = manager
+            .set_from_json(&json)
+            .await
+            .expect_err("zero chunk_size should fail validation");
+        match err {
+            ConfigError::Validation(errors) => {
+                assert!(
+                    !errors.is_empty(),
+                    "validation error list should be populated"
+                );
+                assert!(
+                    errors.iter().any(|e| e.contains("chunk_size")),
+                    "should mention chunk_size, got: {errors:?}"
+                );
+            },
+            other => panic!("expected ConfigError::Validation, got: {other:?}"),
+        }
+    }
+
+    // Reading config when none has been set returns a typed NotSet variant.
+    #[tokio::test]
+    async fn to_json_returns_not_set_variant_when_unconfigured() {
+        let manager = ConfigManager::new();
+        let err = manager
+            .to_json()
+            .await
+            .expect_err("unconfigured to_json should error");
+        assert!(matches!(err, ConfigError::NotSet));
     }
 }
