@@ -22,12 +22,14 @@
 use qdrant_client::{
     qdrant::{
         CreateCollectionBuilder, DeletePointsBuilder, Distance, Filter, PointStruct, PointsIdsList,
-        SearchPointsBuilder, UpsertPointsBuilder, Value as QdrantValue, VectorParamsBuilder,
+        ScoredPoint, SearchPointsBuilder, UpsertPointsBuilder, Value as QdrantValue,
+        VectorParamsBuilder,
     },
     Qdrant,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::warn;
 
 /// Qdrant store errors
 #[derive(Debug, thiserror::Error)]
@@ -156,21 +158,8 @@ impl QdrantStore {
         embedding: Vec<f32>,
         metadata: DocumentMetadata,
     ) -> Result<(), QdrantError> {
-        let payload = serde_json::to_value(&metadata)
-            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
-
-        use std::collections::HashMap;
-        let point = PointStruct::new(
-            id.to_string(),
-            embedding,
-            payload
-                .as_object()
-                .unwrap()
-                .clone()
-                .into_iter()
-                .map(|(k, v)| (k, QdrantValue::from(v)))
-                .collect::<HashMap<String, QdrantValue>>(),
-        );
+        let payload = metadata_to_payload(&metadata)?;
+        let point = PointStruct::new(id.to_string(), embedding, payload);
 
         self.client
             .upsert_points(UpsertPointsBuilder::new(&self.collection_name, vec![point]))
@@ -189,20 +178,10 @@ impl QdrantStore {
         let points: Vec<PointStruct> = documents
             .into_iter()
             .map(|(id, embedding, metadata)| {
-                let payload = serde_json::to_value(&metadata).unwrap();
-                PointStruct::new(
-                    id,
-                    embedding,
-                    payload
-                        .as_object()
-                        .unwrap()
-                        .clone()
-                        .into_iter()
-                        .map(|(k, v)| (k, QdrantValue::from(v)))
-                        .collect::<HashMap<String, QdrantValue>>(),
-                )
+                metadata_to_payload(&metadata)
+                    .map(|payload| PointStruct::new(id, embedding, payload))
             })
-            .collect();
+            .collect::<Result<_, _>>()?;
 
         self.client
             .upsert_points(UpsertPointsBuilder::new(&self.collection_name, points))
@@ -244,28 +223,12 @@ impl QdrantStore {
         let search_results: Vec<SearchResult> = results
             .result
             .into_iter()
-            .map(|point| {
-                let payload_value = serde_json::to_value(&point.payload).unwrap();
-                let metadata: DocumentMetadata = serde_json::from_value(payload_value).unwrap();
-
-                // Extract ID from PointId enum
-                let id_str = match point.id.unwrap() {
-                    qdrant_client::qdrant::PointId {
-                        point_id_options:
-                            Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s)),
-                    } => s,
-                    qdrant_client::qdrant::PointId {
-                        point_id_options:
-                            Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
-                    } => n.to_string(),
-                    _ => String::from("unknown"),
-                };
-
-                SearchResult {
-                    id: id_str,
-                    score: point.score,
-                    metadata,
-                }
+            .filter_map(|point| match try_decode_search_result(point) {
+                Ok(result) => Some(result),
+                Err(e) => {
+                    warn!(error = %e, "skipping qdrant point with undecodable payload");
+                    None
+                },
             })
             .collect();
 
@@ -286,32 +249,24 @@ impl QdrantStore {
         Ok(())
     }
 
-    /// Clear all documents from collection
+    /// Delete every point in the collection while preserving the collection
+    /// itself (schema, dimension, distance metric).
+    ///
+    /// Implemented as a single `delete_points` request with a match-all filter
+    /// rather than `delete_collection` + `create_collection`, so a transient
+    /// failure cannot leave the collection missing or with the wrong dimension.
+    ///
+    /// This is destructive: every point's vector and payload is removed.
     #[allow(dead_code)]
     pub async fn clear(&self) -> Result<(), QdrantError> {
-        // Delete and recreate collection
-        let info = self
-            .client
-            .collection_info(&self.collection_name)
+        self.client
+            .delete_points(
+                DeletePointsBuilder::new(&self.collection_name)
+                    .points(Filter::default())
+                    .wait(true),
+            )
             .await
-            .map_err(|e| QdrantError::CollectionError(e.to_string()))?;
-
-        let dimension = info
-            .result
-            .and_then(|c| c.config)
-            .and_then(|cfg| cfg.params)
-            .and_then(|p| p.vectors_config)
-            .and_then(|v| v.config)
-            .and_then(|cfg| match cfg {
-                qdrant_client::qdrant::vectors_config::Config::Params(params) => Some(params.size),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                QdrantError::OperationError("Could not get vector dimension".to_string())
-            })?;
-
-        self.delete_collection().await?;
-        self.create_collection(dimension).await?;
+            .map_err(|e| QdrantError::OperationError(e.to_string()))?;
 
         Ok(())
     }
@@ -346,9 +301,209 @@ impl QdrantStore {
     }
 }
 
+/// Convert `DocumentMetadata` into the payload map Qdrant expects.
+///
+/// Returns `OperationError` if the metadata cannot be JSON-encoded; this
+/// should be impossible for the current `DocumentMetadata` shape but we
+/// surface the error rather than panic so future schema changes can't
+/// crash the worker.
+fn metadata_to_payload(
+    metadata: &DocumentMetadata,
+) -> Result<HashMap<String, QdrantValue>, QdrantError> {
+    let payload = serde_json::to_value(metadata)
+        .map_err(|e| QdrantError::OperationError(format!("payload encode: {e}")))?;
+
+    let object = payload.as_object().ok_or_else(|| {
+        QdrantError::OperationError("payload encode: metadata did not serialize to object".into())
+    })?;
+
+    Ok(object
+        .clone()
+        .into_iter()
+        .map(|(k, v)| (k, QdrantValue::from(v)))
+        .collect())
+}
+
+/// Decode a single Qdrant search hit into our `SearchResult`.
+///
+/// Returns `OperationError` instead of panicking when the remote payload
+/// doesn't match the current `DocumentMetadata` schema or the point id is
+/// missing — both can happen when a collection contains data written by
+/// another version of the server, by `qdrant-client` CLI, or by a partial
+/// upsert. Callers in `search()` log and skip such points.
+fn try_decode_search_result(point: ScoredPoint) -> Result<SearchResult, QdrantError> {
+    let payload_value = serde_json::to_value(&point.payload)
+        .map_err(|e| QdrantError::OperationError(format!("payload re-encode: {e}")))?;
+    let metadata: DocumentMetadata = serde_json::from_value(payload_value)
+        .map_err(|e| QdrantError::OperationError(format!("payload decode: {e}")))?;
+
+    let id_str = match point.id {
+        Some(qdrant_client::qdrant::PointId {
+            point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Uuid(s)),
+        }) => s,
+        Some(qdrant_client::qdrant::PointId {
+            point_id_options: Some(qdrant_client::qdrant::point_id::PointIdOptions::Num(n)),
+        }) => n.to_string(),
+        Some(_) | None => {
+            return Err(QdrantError::OperationError(
+                "search hit missing point id".into(),
+            ));
+        },
+    };
+
+    Ok(SearchResult {
+        id: id_str,
+        score: point.score,
+        metadata,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qdrant_client::qdrant::{point_id::PointIdOptions, PointId, ScoredPoint};
+
+    fn point_with_payload(id: Option<PointId>, json: serde_json::Value) -> ScoredPoint {
+        let payload: HashMap<String, QdrantValue> = json
+            .as_object()
+            .expect("test payload must be a JSON object")
+            .clone()
+            .into_iter()
+            .map(|(k, v)| (k, QdrantValue::from(v)))
+            .collect();
+
+        ScoredPoint {
+            id,
+            payload,
+            score: 0.5,
+            ..Default::default()
+        }
+    }
+
+    fn good_metadata_json() -> serde_json::Value {
+        serde_json::json!({
+            "id": "doc1",
+            "title": "Test",
+            "text": "hello",
+            "chunk_index": 0,
+            "entities": [],
+            "relationships": [],
+            "timestamp": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    // Decoding a well-formed payload + UUID id returns Ok with the right id.
+    #[test]
+    fn decode_succeeds_on_well_formed_uuid_point() {
+        let point = point_with_payload(
+            Some(PointId {
+                point_id_options: Some(PointIdOptions::Uuid("doc1".into())),
+            }),
+            good_metadata_json(),
+        );
+
+        let result = try_decode_search_result(point).expect("should decode");
+        assert_eq!(result.id, "doc1");
+        assert_eq!(result.metadata.title, "Test");
+    }
+
+    // Decoding a numeric id returns Ok with the id formatted as a string.
+    #[test]
+    fn decode_succeeds_on_numeric_id() {
+        let point = point_with_payload(
+            Some(PointId {
+                point_id_options: Some(PointIdOptions::Num(42)),
+            }),
+            good_metadata_json(),
+        );
+
+        let result = try_decode_search_result(point).expect("should decode");
+        assert_eq!(result.id, "42");
+    }
+
+    // A payload missing required fields returns Err instead of panicking
+    // (regression for #36 — schema drift used to crash the worker).
+    #[test]
+    fn decode_returns_err_on_payload_missing_required_field() {
+        let bad = serde_json::json!({
+            "id": "doc1",
+            // intentionally missing title/text/chunk_index/etc
+        });
+        let point = point_with_payload(
+            Some(PointId {
+                point_id_options: Some(PointIdOptions::Uuid("doc1".into())),
+            }),
+            bad,
+        );
+
+        let err = try_decode_search_result(point).expect_err("should fail, not panic");
+        assert!(
+            matches!(err, QdrantError::OperationError(ref msg) if msg.contains("payload decode")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // A payload with a wrong-typed required field returns Err, not panic.
+    #[test]
+    fn decode_returns_err_on_type_mismatch() {
+        let mut payload = good_metadata_json();
+        payload["chunk_index"] = serde_json::json!("not-a-number");
+        let point = point_with_payload(
+            Some(PointId {
+                point_id_options: Some(PointIdOptions::Uuid("doc1".into())),
+            }),
+            payload,
+        );
+
+        let err = try_decode_search_result(point).expect_err("should fail, not panic");
+        assert!(
+            matches!(err, QdrantError::OperationError(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // A point with no id returns Err instead of panicking on .unwrap().
+    #[test]
+    fn decode_returns_err_on_missing_point_id() {
+        let point = point_with_payload(None, good_metadata_json());
+        let err = try_decode_search_result(point).expect_err("should fail, not panic");
+        assert!(
+            matches!(err, QdrantError::OperationError(ref msg) if msg.contains("missing point id")),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    // A point with a PointId whose oneof is None also returns Err.
+    #[test]
+    fn decode_returns_err_on_empty_point_id_oneof() {
+        let point = point_with_payload(
+            Some(PointId {
+                point_id_options: None,
+            }),
+            good_metadata_json(),
+        );
+        let err = try_decode_search_result(point).expect_err("should fail, not panic");
+        assert!(matches!(err, QdrantError::OperationError(_)));
+    }
+
+    // metadata_to_payload round-trips a normal DocumentMetadata.
+    #[test]
+    fn metadata_to_payload_round_trips() {
+        let metadata = DocumentMetadata {
+            id: "doc1".into(),
+            title: "Test".into(),
+            text: "hello".into(),
+            chunk_index: 3,
+            entities: vec![],
+            relationships: vec![],
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            custom: HashMap::new(),
+        };
+
+        let payload = metadata_to_payload(&metadata).expect("should encode");
+        assert!(payload.contains_key("id"));
+        assert!(payload.contains_key("chunk_index"));
+    }
 
     #[tokio::test]
     #[ignore] // Requires Qdrant server running
@@ -377,6 +532,56 @@ mod tests {
         let results = store.search(vec![0.1; 384], 10, None).await.unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, "doc1");
+
+        store.delete_collection().await.unwrap();
+    }
+
+    // Integration test for #38: clear() must preserve the collection (and its
+    // dimension) even though it removes all points. Requires Qdrant server.
+    #[tokio::test]
+    #[ignore]
+    async fn clear_preserves_collection_schema() {
+        let store = QdrantStore::new("http://localhost:6334", "test-clear-collection")
+            .await
+            .unwrap();
+        // start clean
+        let _ = store.delete_collection().await;
+        store.create_collection(384).await.unwrap();
+
+        let metadata = DocumentMetadata {
+            id: "doc1".to_string(),
+            title: "Test".to_string(),
+            text: "hello".to_string(),
+            chunk_index: 0,
+            entities: vec![],
+            relationships: vec![],
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            custom: HashMap::new(),
+        };
+        store
+            .add_document("doc1", vec![0.1; 384], metadata)
+            .await
+            .unwrap();
+
+        store.clear().await.unwrap();
+
+        // Collection must still exist with the original dimension — adding
+        // a 384-dim vector after clear() must succeed.
+        assert!(store.collection_exists().await.unwrap());
+        let metadata = DocumentMetadata {
+            id: "doc2".to_string(),
+            title: "Test2".to_string(),
+            text: "hello again".to_string(),
+            chunk_index: 0,
+            entities: vec![],
+            relationships: vec![],
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            custom: HashMap::new(),
+        };
+        store
+            .add_document("doc2", vec![0.2; 384], metadata)
+            .await
+            .expect("collection schema should be preserved");
 
         store.delete_collection().await.unwrap();
     }
