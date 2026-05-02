@@ -72,9 +72,17 @@ impl RetrievalSystem {
         let vector_store =
             std::sync::Arc::new(crate::vector::memory_store::MemoryVectorStore::new());
 
+        // Use the configured embedding dimension for the hash fallback so the
+        // hot retrieval path actually respects `[embeddings]` config. Even
+        // before the configured embedder gets wired through (see #6 / #7),
+        // dimension parity matters: a 768-dim Nomic / 1536-dim OpenAI
+        // configuration would have silently downgraded query-time embeddings
+        // to the previous hardcoded 128 dims.
+        let embedding_dim = config.embeddings.dimension.max(1);
+
         Ok(Self {
             vector_store,
-            embedding_generator: EmbeddingGenerator::new(128), // 128-dimensional embeddings
+            embedding_generator: EmbeddingGenerator::new(embedding_dim),
             config: retrieval_config,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
@@ -1930,6 +1938,32 @@ mod tests {
         let config = Config::default();
         let retrieval = RetrievalSystem::new(&config);
         assert!(retrieval.is_ok());
+    }
+
+    // The retrieval embedding generator must respect the configured embedding
+    // dimension instead of the previously hardcoded 128 (regression for #7).
+    // Pre-fix, configuring 768-dim Nomic / 1536-dim OpenAI silently fell back
+    // to 128-dim hash embeddings on the query path.
+    #[test]
+    fn retrieval_embedding_generator_honors_config_dimension() {
+        let mut config = Config::default();
+        config.embeddings.dimension = 768;
+        let retrieval = RetrievalSystem::new(&config).unwrap();
+        assert_eq!(
+            retrieval.embedding_generator.dimension(),
+            768,
+            "configured dimension should propagate to retrieval embedder"
+        );
+    }
+
+    // Zero-dimension config should be clamped to 1 instead of producing a
+    // zero-length embedding (which downstream similarity ops can't handle).
+    #[test]
+    fn retrieval_embedding_generator_clamps_zero_dimension_to_one() {
+        let mut config = Config::default();
+        config.embeddings.dimension = 0;
+        let retrieval = RetrievalSystem::new(&config).unwrap();
+        assert_eq!(retrieval.embedding_generator.dimension(), 1);
     }
 
     #[test]
