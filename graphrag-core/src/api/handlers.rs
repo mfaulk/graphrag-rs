@@ -242,10 +242,28 @@ fn default_page_size() -> usize {
     20
 }
 
+/// Reject zero pagination values up front: page=0 underflows
+/// `(page-1)*page_size` to `usize::MAX` and the multiplication panics on
+/// overflow; page_size=0 panics the divisor in
+/// `(total + page_size - 1) / page_size`.
+fn validate_pagination(page: usize, page_size: usize) -> Result<(), AppError> {
+    if page == 0 {
+        return Err(AppError::BadRequest("page must be >= 1".to_string()));
+    }
+    if page_size == 0 {
+        return Err(AppError::BadRequest(
+            "page_size must be >= 1".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 pub async fn list_entities(
     State(state): State<AppState>,
     Query(params): Query<ListEntitiesQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
+    validate_pagination(params.page, params.page_size)?;
+
     let graphrag = state.graphrag.read().await;
 
     if let Some(graph) = graphrag.get_knowledge_graph() {
@@ -268,7 +286,7 @@ pub async fn list_entities(
             .collect();
 
         let total = entities.len();
-        let start = (params.page - 1) * params.page_size;
+        let start = params.page.saturating_sub(1).saturating_mul(params.page_size);
         entities = entities
             .into_iter()
             .skip(start)
@@ -280,7 +298,7 @@ pub async fn list_entities(
             "page": params.page,
             "page_size": params.page_size,
             "total": total,
-            "total_pages": (total + params.page_size - 1) / params.page_size
+            "total_pages": total.div_ceil(params.page_size)
         })))
     } else {
         Ok(Json(serde_json::json!({
@@ -340,5 +358,35 @@ impl IntoResponse for AppError {
         }));
 
         (status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression tests for #14: previously page=0 / page_size=0 reached the
+    // arithmetic and panicked the worker, an unauthenticated DoS.
+    #[test]
+    fn validate_pagination_rejects_page_zero() {
+        let err = validate_pagination(0, 20).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_pagination_rejects_page_size_zero() {
+        let err = validate_pagination(1, 0).unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[test]
+    fn validate_pagination_accepts_minimum_valid_values() {
+        assert!(validate_pagination(1, 1).is_ok());
+    }
+
+    #[test]
+    fn validate_pagination_accepts_typical_values() {
+        assert!(validate_pagination(1, 20).is_ok());
+        assert!(validate_pagination(10, 100).is_ok());
     }
 }
