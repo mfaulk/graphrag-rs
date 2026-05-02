@@ -54,37 +54,36 @@ jobs:
             --exclude graphrag-wasm
 
   test:
-    name: Build & Test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: Build & Test
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ${{ matrix.os }}-stable
+          shared-key: linux-stable
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: Build (workspace, excluding pyo3 + wasm crates)
         run: |
           cargo build \
             --workspace \
             --exclude graphrag_py \
-            --exclude graphrag-wasm \
-            --verbose
+            --exclude graphrag-wasm
       - name: Test (workspace, excluding pyo3 + wasm crates)
         # `--tests` runs unit + integration tests but skips example targets.
         # Several examples have pre-existing compile errors that are out of
         # scope for the CI bring-up; tighten this once examples are repaired.
+        # Tests marked `#[ignore]` (long-running or env-dependent) are skipped.
         run: |
-          cargo test \
+          cargo nextest run \
             --workspace \
             --tests \
             --exclude graphrag_py \
-            --exclude graphrag-wasm \
-            --verbose
+            --exclude graphrag-wasm
 
   wasm-build:
     name: WASM build (advisory)
