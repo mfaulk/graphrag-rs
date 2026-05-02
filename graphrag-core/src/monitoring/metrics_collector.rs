@@ -155,10 +155,16 @@ impl AsyncMetricsCollector for MetricsCollector {
         }
 
         let key = Self::metric_key(name, tags);
-        let gauge = self
-            .gauges
-            .entry(key)
-            .or_insert_with(|| Arc::new(std::sync::RwLock::new(0.0)));
+        // Clone the Arc out of the DashMap entry so the shard RefMut is dropped
+        // before we take the inner RwLock — preventing any future maintainer who
+        // turns this body genuinely async from holding a sync DashMap lock across
+        // an inner-lock acquisition.
+        let gauge = Arc::clone(
+            &self
+                .gauges
+                .entry(key)
+                .or_insert_with(|| Arc::new(std::sync::RwLock::new(0.0))),
+        );
 
         *gauge.write().unwrap() = value;
     }
@@ -169,10 +175,12 @@ impl AsyncMetricsCollector for MetricsCollector {
         }
 
         let key = Self::metric_key(name, tags);
-        let hist = self
-            .histograms
-            .entry(key)
-            .or_insert_with(|| Arc::new(std::sync::RwLock::new(Vec::new())));
+        let hist = Arc::clone(
+            &self
+                .histograms
+                .entry(key)
+                .or_insert_with(|| Arc::new(std::sync::RwLock::new(Vec::new()))),
+        );
 
         hist.write().unwrap().push(value);
     }
