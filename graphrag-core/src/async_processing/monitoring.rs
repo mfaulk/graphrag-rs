@@ -222,11 +222,9 @@ impl ProcessingMetrics {
     /// # Parameters
     /// - `memory_bytes`: Current memory usage in bytes
     pub fn update_peak_memory_usage(&self, memory_bytes: u64) {
-        let current = self.peak_memory_usage.load(Ordering::Relaxed);
-        if memory_bytes > current {
-            self.peak_memory_usage
-                .store(memory_bytes, Ordering::Relaxed);
-        }
+        // fetch_max is a single atomic op with no lost-update race.
+        self.peak_memory_usage
+            .fetch_max(memory_bytes, Ordering::Relaxed);
     }
 
     // Getters for current values
@@ -461,5 +459,43 @@ pub struct SystemMetrics {
 impl Default for ProcessingMetrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn peak_memory_usage_takes_maximum_of_sequential_updates() {
+        let metrics = ProcessingMetrics::new();
+        for v in [1u64, 100, 50, 200, 75, 300, 80] {
+            metrics.update_peak_memory_usage(v);
+        }
+        assert_eq!(metrics.peak_memory_usage.load(Ordering::Relaxed), 300);
+    }
+
+    #[test]
+    fn peak_memory_usage_is_monotonic_under_concurrent_updates() {
+        // Regression test for #18: previously implemented as load-then-store,
+        // which races and can drop a higher peak. fetch_max is a single op.
+        let metrics = Arc::new(ProcessingMetrics::new());
+        let max_value = 10_000u64;
+        let handles: Vec<_> = (1..=max_value)
+            .map(|v| {
+                let m = metrics.clone();
+                thread::spawn(move || m.update_peak_memory_usage(v))
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+        assert_eq!(
+            metrics.peak_memory_usage.load(Ordering::Relaxed),
+            max_value,
+            "peak must equal the max value submitted across all threads"
+        );
     }
 }
