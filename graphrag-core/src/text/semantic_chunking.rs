@@ -235,6 +235,9 @@ impl SemanticChunker {
 
     /// Calculate threshold based on percentile
     fn calculate_percentile_threshold(&self, diffs: &[f32]) -> f32 {
+        if diffs.is_empty() {
+            return 0.0;
+        }
         let mut sorted = diffs.to_vec();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -246,6 +249,9 @@ impl SemanticChunker {
 
     /// Calculate threshold based on standard deviation
     fn calculate_std_threshold(&self, diffs: &[f32]) -> f32 {
+        if diffs.is_empty() {
+            return 0.0;
+        }
         let mean: f32 = diffs.iter().sum::<f32>() / diffs.len() as f32;
 
         let variance: f32 =
@@ -418,5 +424,27 @@ mod tests {
             assert!(!chunk.content.is_empty());
             assert!(chunk.sentence_count > 0);
         }
+    }
+
+    // Empty diffs slice should not underflow `sorted.len() - 1`
+    // (regression for #22, percentile path).
+    #[test]
+    fn calculate_percentile_threshold_does_not_panic_on_empty() {
+        let config = SemanticChunkerConfig::default();
+        let embedding_gen = EmbeddingGenerator::new(384);
+        let chunker = SemanticChunker::new(config, embedding_gen);
+        let result = chunker.calculate_percentile_threshold(&[]);
+        assert_eq!(result, 0.0, "empty diffs should yield default threshold");
+    }
+
+    // Empty diffs slice should not divide by zero
+    // (regression for #22, std-deviation path).
+    #[test]
+    fn calculate_std_threshold_does_not_panic_on_empty() {
+        let config = SemanticChunkerConfig::default();
+        let embedding_gen = EmbeddingGenerator::new(384);
+        let chunker = SemanticChunker::new(config, embedding_gen);
+        let result = chunker.calculate_std_threshold(&[]);
+        assert_eq!(result, 0.0, "empty diffs should yield default threshold");
     }
 }

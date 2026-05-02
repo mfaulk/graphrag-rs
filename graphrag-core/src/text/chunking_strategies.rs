@@ -163,13 +163,42 @@ impl ChunkingStrategy for RustCodeChunkingStrategy {
     fn chunk(&self, text: &str) -> Vec<TextChunk> {
         use tree_sitter::Parser;
 
+        // Helper: emit `text` as a single chunk and return.
+        // Used when tree-sitter can't parse (cancellation / size limits / etc.)
+        // — the trait signature is infallible, so we degrade rather than panic.
+        let single_chunk = || {
+            if text.trim().is_empty() {
+                return Vec::new();
+            }
+            let chunk_id = ChunkId::new(format!(
+                "{}_{}",
+                self.document_id,
+                CHUNK_COUNTER.fetch_add(1, Ordering::SeqCst)
+            ));
+            vec![TextChunk::new(
+                chunk_id,
+                self.document_id.clone(),
+                text.to_string(),
+                0,
+                text.len(),
+            )]
+        };
+
         let mut parser = Parser::new();
         let language = tree_sitter_rust::language();
-        parser
-            .set_language(&language)
-            .expect("Error loading Rust grammar");
+        if parser.set_language(&language).is_err() {
+            tracing::warn!(
+                "RustCodeChunkingStrategy: failed to load Rust grammar; returning text as a single chunk"
+            );
+            return single_chunk();
+        }
 
-        let tree = parser.parse(text, None).expect("Error parsing Rust code");
+        let Some(tree) = parser.parse(text, None) else {
+            tracing::warn!(
+                "RustCodeChunkingStrategy: tree-sitter returned no parse tree; returning text as a single chunk"
+            );
+            return single_chunk();
+        };
         let root_node = tree.root_node();
 
         let mut chunks = Vec::new();
@@ -179,19 +208,7 @@ impl ChunkingStrategy for RustCodeChunkingStrategy {
 
         // If no chunks found (e.g., just expressions), create a single chunk
         if chunks.is_empty() && !text.trim().is_empty() {
-            let chunk_id = ChunkId::new(format!(
-                "{}_{}",
-                self.document_id,
-                CHUNK_COUNTER.fetch_add(1, Ordering::SeqCst)
-            ));
-            let chunk = TextChunk::new(
-                chunk_id,
-                self.document_id.clone(),
-                text.to_string(),
-                0,
-                text.len(),
-            );
-            chunks.push(chunk);
+            chunks = single_chunk();
         }
 
         chunks
@@ -520,11 +537,31 @@ impl BoundaryAwareChunkingStrategy {
 
 impl ChunkingStrategy for BoundaryAwareChunkingStrategy {
     fn chunk(&self, text: &str) -> Vec<TextChunk> {
-        // Create a Tokio runtime to execute async code synchronously
-        // This allows us to use async coherence scoring in a sync context
-        let runtime = tokio::runtime::Runtime::new().expect("Failed to create Tokio runtime");
-
-        runtime.block_on(self.chunk_async(text))
+        // The sync trait impl needs to drive async coherence scoring. Pick the
+        // bridging strategy by inspecting the calling context:
+        //
+        //   * If we're inside an existing tokio runtime, `block_in_place` +
+        //     `Handle::block_on` is the only safe path. Constructing a fresh
+        //     `Runtime` from inside another runtime panics with
+        //     "Cannot start a runtime from within a runtime."
+        //   * If we're not in any runtime, build one ad-hoc.
+        //
+        // `block_in_place` requires the multi-threaded scheduler. Callers on
+        // a `current_thread` runtime will panic — that's a runtime-flavor
+        // contract we can't surface through the infallible trait signature,
+        // so the constraint is documented on the trait.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(self.chunk_async(text))),
+            Err(_) => match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt.block_on(self.chunk_async(text)),
+                Err(e) => {
+                    tracing::warn!(
+                        "BoundaryAwareChunkingStrategy: could not build a tokio runtime ({e}); returning empty chunk list"
+                    );
+                    Vec::new()
+                },
+            },
+        }
     }
 }
 
