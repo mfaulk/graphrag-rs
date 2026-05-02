@@ -1,23 +1,23 @@
 //! Authentication and Authorization Middleware
 //!
-//! Provides JWT token-based authentication and API key authentication for the REST API.
+//! **STATUS: Not yet ported to actix-web (issue #40).** This module
+//! still imports from `axum::{extract, http, middleware, response}`
+//! while the rest of the server is built on `actix-web`. The `auth`
+//! Cargo feature is currently disabled in `default = ["qdrant"]` for
+//! exactly this reason — turning it on produces ~30 unrelated-looking
+//! compile errors about an unresolved `axum` crate.
 //!
-//! ## Features
-//!
-//! - JWT token generation and validation
-//! - API key authentication
-//! - Role-based access control (RBAC)
-//! - Rate limiting per user/IP
-//! - Request audit logging
-//!
-//! ## Usage
-//!
-//! ```rust
-//! // Add authentication middleware to your routes
-//! Router::new()
-//!     .route("/api/protected", get(protected_handler))
-//!     .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
-//! ```
+//! The `compile_error!` below makes that failure mode loud: anyone
+//! enabling `--features auth` gets one clear message instead of a wall
+//! of "use of unresolved module or unlinked crate `axum`" errors.
+//! Remove it once auth.rs is ported to `actix-web-httpauth`-style
+//! middleware (or, alternatively, once `axum` is added as a dep and
+//! the Apistos integration is reworked).
+
+compile_error!(
+    "the `auth` Cargo feature is not yet ported to actix-web — see issue #40. \
+     Disable the feature (it is off by default) until the port lands."
+);
 
 use axum::{
     extract::{Extension, Request, State},
