@@ -57,9 +57,9 @@
 //! ```
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{Semaphore, SemaphorePermit};
-use tokio::time;
+use tokio::time::{self, Instant};
 
 use super::{AsyncConfig, ComponentStatus};
 use crate::core::GraphRAGError;
@@ -106,38 +106,33 @@ impl RateTracker {
         }
     }
 
-    /// Checks rate limit and waits if necessary before allowing request
-    ///
-    /// Automatically resets the counter when entering a new second. If the
-    /// rate limit is reached, waits until the next second before proceeding.
-    ///
-    /// # Returns
-    /// Ok if request can proceed, or an error if rate limiting fails
-    async fn wait_if_needed(&mut self) -> Result<(), GraphRAGError> {
+    /// Reserve a slot in the rate window and return how long the caller must
+    /// sleep before proceeding. Synchronous so callers can drop the owning
+    /// mutex guard before awaiting the returned duration (see issue #21).
+    fn next_wait(&mut self) -> Duration {
         let now = Instant::now();
+        let mut wait = Duration::ZERO;
 
         if let Some(last_request) = self.last_request {
-            let time_since_last = now.duration_since(last_request);
+            // A previously scheduled caller may sit in the future; this caller
+            // cannot start before that scheduled time.
+            let effective_now = now.max(last_request);
+            wait += effective_now.saturating_duration_since(now);
 
-            // Reset counter if we're in a new second
+            let time_since_last = effective_now.saturating_duration_since(last_request);
             if time_since_last >= Duration::from_secs(1) {
                 self.requests_this_second = 0;
             }
 
-            // Check if we need to wait
-            if self.requests_this_second as f64 >= self.rate_limit {
-                let wait_time = Duration::from_secs(1) - time_since_last;
-                if wait_time > Duration::ZERO {
-                    time::sleep(wait_time).await;
-                }
+            if (self.requests_this_second as f64) >= self.rate_limit {
+                wait += Duration::from_secs(1).saturating_sub(time_since_last);
                 self.requests_this_second = 0;
             }
         }
 
-        self.last_request = Some(now);
+        self.last_request = Some(now + wait);
         self.requests_this_second += 1;
-
-        Ok(())
+        wait
     }
 }
 
@@ -180,10 +175,14 @@ impl RateLimiter {
                 message: format!("Failed to acquire LLM permit: {e}"),
             })?;
 
-        // Then check rate limiting
-        {
+        // Reserve a rate-limit slot, then drop the guard before sleeping so
+        // concurrent callers aren't serialized behind the wait window.
+        let wait = {
             let mut rate_tracker = self.llm_rate_tracker.lock().await;
-            rate_tracker.wait_if_needed().await?;
+            rate_tracker.next_wait()
+        };
+        if wait > Duration::ZERO {
+            time::sleep(wait).await;
         }
 
         Ok(permit)
@@ -207,10 +206,12 @@ impl RateLimiter {
                     message: format!("Failed to acquire embedding permit: {e}"),
                 })?;
 
-        // Then check rate limiting
-        {
+        let wait = {
             let mut rate_tracker = self.embedding_rate_tracker.lock().await;
-            rate_tracker.wait_if_needed().await?;
+            rate_tracker.next_wait()
+        };
+        if wait > Duration::ZERO {
+            time::sleep(wait).await;
         }
 
         Ok(permit)
@@ -260,5 +261,87 @@ impl RateLimiter {
     /// Reference to the async processing configuration
     pub fn get_config(&self) -> &AsyncConfig {
         &self.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression for issue #21: the rate-tracker mutex must not be held while a caller
+    // sleeps inside the rate-limit window, or every concurrent caller serializes behind it.
+    #[tokio::test(start_paused = true)]
+    async fn rate_limit_mutex_is_not_held_across_sleep() {
+        let config = AsyncConfig {
+            max_concurrent_llm_calls: 10,
+            llm_rate_limit_per_second: 1.0,
+            ..Default::default()
+        };
+        let limiter = Arc::new(RateLimiter::new(&config));
+
+        // Burn the only slot in the current 1-second window.
+        let _first = limiter.acquire_llm_permit().await.unwrap();
+
+        // Spawn a second caller; it must enter the rate-limit sleep.
+        let limiter_for_waiter = Arc::clone(&limiter);
+        let waiter = tokio::spawn(async move {
+            let _permit = limiter_for_waiter.acquire_llm_permit().await.unwrap();
+        });
+
+        // Let the spawned task progress to its inner sleep.
+        for _ in 0..4 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(
+            limiter.llm_rate_tracker.try_lock().is_ok(),
+            "rate tracker mutex must be released before sleeping (see issue #21)"
+        );
+
+        tokio::time::advance(Duration::from_secs(2)).await;
+        waiter.await.unwrap();
+    }
+
+    // Calls within the configured rate are admitted with no required wait.
+    #[tokio::test(start_paused = true)]
+    async fn next_wait_is_zero_within_limit() {
+        let mut tracker = RateTracker::new(2.0);
+        assert_eq!(tracker.next_wait(), Duration::ZERO);
+        assert_eq!(tracker.next_wait(), Duration::ZERO);
+    }
+
+    // Exceeding the rate within a window forces the caller to wait until the next window.
+    #[tokio::test(start_paused = true)]
+    async fn next_wait_pushes_excess_to_next_window() {
+        let mut tracker = RateTracker::new(2.0);
+        tracker.next_wait();
+        tracker.next_wait();
+        assert_eq!(tracker.next_wait(), Duration::from_secs(1));
+    }
+
+    // After advancing past the window, the counter resets and admits the next call immediately.
+    #[tokio::test(start_paused = true)]
+    async fn next_wait_resets_after_window_expires() {
+        let mut tracker = RateTracker::new(2.0);
+        tracker.next_wait();
+        tracker.next_wait();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tracker.next_wait(), Duration::ZERO);
+    }
+
+    // When earlier callers have reserved into the future, subsequent callers stack into the
+    // following windows rather than racing ahead — this is what prevents the bug fix from
+    // letting too many requests through during one window.
+    #[tokio::test(start_paused = true)]
+    async fn next_wait_stacks_concurrent_overflow() {
+        let mut tracker = RateTracker::new(2.0);
+        tracker.next_wait();
+        tracker.next_wait();
+        let third = tracker.next_wait();
+        let fourth = tracker.next_wait();
+        let fifth = tracker.next_wait();
+        assert_eq!(third, Duration::from_secs(1));
+        assert_eq!(fourth, Duration::from_secs(1));
+        assert_eq!(fifth, Duration::from_secs(2));
     }
 }

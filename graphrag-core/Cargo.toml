@@ -359,6 +359,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 pretty_assertions = "1.4"
 proptest = "1.4"
 tempfile = "3.8"
+tokio = { version = "1.0", features = ["full", "test-util"] }
 
 [lib]
 crate-type = ["rlib", "cdylib"] # rlib for Rust, cdylib for WASM/FFI
