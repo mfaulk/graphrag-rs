@@ -8,9 +8,33 @@ use super::{
 use crate::core::traits::{GenerationParams, LanguageModel, ModelInfo};
 use crate::core::Result;
 use moka::future::Cache;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+
+/// Drive an async future from a sync trait method.
+///
+/// Inside an existing tokio runtime we use `block_in_place` + `Handle::block_on`
+/// (the only safe way; constructing a fresh `Runtime` from inside one panics).
+/// Outside any runtime we build an ad-hoc one. `block_in_place` requires the
+/// multi-threaded scheduler — calling this from a `current_thread` runtime
+/// would still panic, but we now report ad-hoc runtime construction failures
+/// as a `Generation` error rather than the previous `unwrap`/`expect` panics.
+fn run_sync<F, T>(work: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(work)),
+        Err(_) => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(work),
+            Err(e) => Err(crate::core::GraphRAGError::Generation {
+                message: format!("Failed to construct ad-hoc tokio runtime: {e}"),
+            }),
+        },
+    }
+}
 
 /// High-performance cached LLM client that wraps any LanguageModel implementation
 pub struct CachedLLMClient<T: LanguageModel> {
@@ -321,41 +345,43 @@ impl CacheInfo {
 impl<T: LanguageModel + Send + Sync> LanguageModel for CachedLLMClient<T> {
     type Error = crate::core::GraphRAGError;
 
-    /// Complete a prompt with caching support (synchronous version)
+    /// Complete a prompt with caching support (synchronous version).
+    ///
+    /// The sync trait must drive async cache lookups. Pick the bridging
+    /// strategy by runtime context: inside a runtime we use
+    /// `block_in_place` + `Handle::block_on`; outside, we build an ad-hoc
+    /// runtime. `block_in_place` requires the multi-threaded scheduler;
+    /// calling this from a `current_thread` runtime returns an error
+    /// rather than the previous unconditional panic.
     fn complete(&self, prompt: &str) -> Result<String> {
-        // For sync trait, we need to use a blocking approach
-        // In practice, you might want to use async version or handle this differently
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let cache_key = self.generate_cache_key(prompt, None).await.map_err(|e| {
-                    crate::core::GraphRAGError::Generation {
-                        message: format!("Cache key generation failed: {e}"),
-                    }
-                })?;
-
-                self.execute_with_cache(cache_key, || async { self.inner.complete(prompt) })
-                    .await
-            })
-        })
+        let work = async {
+            let cache_key = self.generate_cache_key(prompt, None).await.map_err(|e| {
+                crate::core::GraphRAGError::Generation {
+                    message: format!("Cache key generation failed: {e}"),
+                }
+            })?;
+            self.execute_with_cache(cache_key, || async { self.inner.complete(prompt) })
+                .await
+        };
+        run_sync(work)
     }
 
-    /// Complete a prompt with parameters and caching support (synchronous version)
+    /// Complete a prompt with parameters and caching support (synchronous version).
     fn complete_with_params(&self, prompt: &str, params: GenerationParams) -> Result<String> {
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                let cache_key = self
-                    .generate_cache_key(prompt, Some(&params))
-                    .await
-                    .map_err(|e| crate::core::GraphRAGError::Generation {
-                        message: format!("Cache key generation failed: {e}"),
-                    })?;
-
-                self.execute_with_cache(cache_key, || async {
-                    self.inner.complete_with_params(prompt, params.clone())
-                })
+        let work = async {
+            let cache_key = self
+                .generate_cache_key(prompt, Some(&params))
                 .await
+                .map_err(|e| crate::core::GraphRAGError::Generation {
+                    message: format!("Cache key generation failed: {e}"),
+                })?;
+
+            self.execute_with_cache(cache_key, || async {
+                self.inner.complete_with_params(prompt, params.clone())
             })
-        })
+            .await
+        };
+        run_sync(work)
     }
 
     /// Check if the underlying model is available
