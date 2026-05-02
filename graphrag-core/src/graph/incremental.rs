@@ -891,16 +891,19 @@ impl UpdateMonitor {
         affected_entities: usize,
         affected_relationships: usize,
     ) {
-        let mut log = self.operations_log.lock();
-        if let Some(entry) = log.iter_mut().find(|e| &e.operation_id == operation_id) {
-            entry.end_time = Some(Instant::now());
-            entry.success = Some(success);
-            entry.error_message = error;
-            entry.affected_entities = affected_entities;
-            entry.affected_relationships = affected_relationships;
+        // parking_lot::Mutex is not reentrant; release the operations_log
+        // guard before update_performance_stats reacquires it.
+        {
+            let mut log = self.operations_log.lock();
+            if let Some(entry) = log.iter_mut().find(|e| &e.operation_id == operation_id) {
+                entry.end_time = Some(Instant::now());
+                entry.success = Some(success);
+                entry.error_message = error;
+                entry.affected_entities = affected_entities;
+                entry.affected_relationships = affected_relationships;
+            }
         }
 
-        // Update performance stats
         self.update_performance_stats();
     }
 
@@ -1657,7 +1660,11 @@ impl BatchProcessor {
     pub async fn add_change(&self, change: ChangeRecord) -> Result<String> {
         let batch_key = self.get_batch_key(&change);
 
-        let batch_id = {
+        // Capture the batch snapshot and id under the entry RefMut, then
+        // drop the RefMut before touching pending_batches again. DashMap
+        // remove on the same key while a RefMut is alive deadlocks on the
+        // shard write lock the RefMut holds.
+        let (batch_id, batch_to_flush) = {
             let mut entry = self
                 .pending_batches
                 .entry(batch_key.clone())
@@ -1672,23 +1679,20 @@ impl BatchProcessor {
                 || entry.created_at.elapsed() > self.max_wait_time;
 
             let batch_id = entry.batch_id.clone();
-
-            if should_process {
-                // Move batch out for processing
-                let batch = entry.clone();
-                self.pending_batches.remove(&batch_key);
-
-                // Process batch asynchronously
-                let processor = Arc::new(self.clone());
-                tokio::spawn(async move {
-                    if let Err(e) = processor.process_batch(batch).await {
-                        eprintln!("Batch processing error: {e}");
-                    }
-                });
-            }
-
-            batch_id
+            let batch_to_flush = should_process.then(|| entry.clone());
+            (batch_id, batch_to_flush)
         };
+
+        if let Some(batch) = batch_to_flush {
+            self.pending_batches.remove(&batch_key);
+
+            let processor = Arc::new(self.clone());
+            tokio::spawn(async move {
+                if let Err(e) = processor.process_batch(batch).await {
+                    eprintln!("Batch processing error: {e}");
+                }
+            });
+        }
 
         Ok(batch_id)
     }
@@ -1988,6 +1992,10 @@ impl ProductionGraphStore {
         change: ChangeRecord,
     ) -> Result<UpdateId> {
         let operation_id = self.monitor.start_operation("apply_change");
+        // Capture change_id for the return value: change_log is keyed by
+        // change.change_id, not by the monitor's operation_id, so callers
+        // that look the returned id up in change_log would otherwise miss.
+        let change_id = change.change_id.clone();
 
         // Check for conflicts
         if let Some(conflict) = self.detect_conflict(&change)? {
@@ -2017,7 +2025,7 @@ impl ProductionGraphStore {
 
         self.monitor
             .complete_operation(&operation_id, true, None, 1, 0);
-        Ok(operation_id)
+        Ok(change_id)
     }
 
     fn detect_conflict(&self, change: &ChangeRecord) -> Result<Option<Conflict>> {
@@ -2622,7 +2630,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_basic_entity_upsert() {
         let config = IncrementalConfig::default();
         let graph = KnowledgeGraph::new();
@@ -2656,7 +2663,6 @@ mod tests {
 
     #[cfg(feature = "incremental")]
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_production_graph_store_entity_upsert() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
@@ -2680,7 +2686,6 @@ mod tests {
 
     #[cfg(feature = "incremental")]
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_production_graph_store_relationship_upsert() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
@@ -2753,7 +2758,6 @@ mod tests {
 
     #[cfg(feature = "incremental")]
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_production_graph_store_event_publishing() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
@@ -2905,5 +2909,123 @@ mod tests {
 
         assert!(matches!(event.event_type, ChangeEventType::EntityUpserted));
         assert!(event.entity_id.is_some());
+    }
+
+    // Regression for issue #11: UpdateMonitor::complete_operation must not
+    // self-deadlock when calling update_performance_stats while holding the
+    // operations_log parking_lot Mutex. Runs the call on a dedicated OS
+    // thread and aborts via mpsc::recv_timeout so a deadlock fails the test
+    // (instead of hanging the cargo test process).
+    #[cfg(feature = "incremental")]
+    #[test]
+    fn complete_operation_does_not_self_deadlock() {
+        let monitor = Arc::new(UpdateMonitor::new());
+        let op = monitor.start_operation("regression_11");
+        let m = Arc::clone(&monitor);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            m.complete_operation(&op, true, None, 1, 0);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("complete_operation self-deadlocked");
+        let stats = monitor.get_performance_stats();
+        assert_eq!(stats.total_operations, 1);
+        assert_eq!(stats.successful_operations, 1);
+    }
+
+    // Regression for issue #13: apply_change_with_conflict_resolution must
+    // return change.change_id (not the monitor's operation_id) so callers
+    // can look the returned id up in change_log without panicking on the
+    // immediate .unwrap() at the upsert_entity call site. Runs the async
+    // call inside an OS thread + dedicated runtime to bound failure time.
+    #[cfg(feature = "incremental")]
+    #[test]
+    fn upsert_entity_returns_id_present_in_change_log() {
+        let graph = KnowledgeGraph::new();
+        let config = IncrementalConfig::default();
+        let resolver = ConflictResolver::new(ConflictStrategy::Merge);
+        let store = Arc::new(tokio::sync::Mutex::new(ProductionGraphStore::new(
+            graph, config, resolver,
+        )));
+        let entity = Entity::new(
+            EntityId::new("regression_13".to_string()),
+            "Regression 13".to_string(),
+            "Person".to_string(),
+            0.9,
+        );
+
+        let store_for_thread = Arc::clone(&store);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<UpdateId>>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            let result = rt.block_on(async {
+                let mut s = store_for_thread.lock().await;
+                s.upsert_entity(entity).await
+            });
+            let _ = tx.send(result);
+        });
+
+        let returned = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upsert_entity hung (likely #11 deadlock or #13 panic)")
+            .expect("upsert_entity returned err");
+
+        let verify_rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("build verify runtime");
+        verify_rt.block_on(async {
+            let s = store.lock().await;
+            assert!(
+                s.change_log.get(&returned).is_some(),
+                "returned id is not present in change_log; apply_change_with_conflict_resolution returned the wrong id"
+            );
+        });
+    }
+
+    // Regression for issue #12: BatchProcessor::add_change must release the
+    // pending_batches entry RefMut before calling pending_batches.remove on
+    // the same key, or DashMap shard reentry deadlocks the caller.
+    #[cfg(feature = "incremental")]
+    #[test]
+    fn add_change_does_not_deadlock_on_batch_flush() {
+        let processor = Arc::new(BatchProcessor::new(1, Duration::from_millis(500), 4));
+        let entity = Entity::new(
+            EntityId::new("regression_12".to_string()),
+            "Regression 12".to_string(),
+            "Person".to_string(),
+            0.9,
+        );
+        let change = ChangeRecord {
+            change_id: UpdateId::new(),
+            timestamp: Utc::now(),
+            change_type: ChangeType::EntityAdded,
+            entity_id: Some(entity.id.clone()),
+            document_id: None,
+            operation: Operation::Insert,
+            data: ChangeData::Entity(entity),
+            metadata: HashMap::new(),
+        };
+
+        let p = Arc::clone(&processor);
+        let (tx, rx) = std::sync::mpsc::channel::<Result<String>>();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            let result = rt.block_on(async { p.add_change(change).await });
+            let _ = tx.send(result);
+        });
+
+        let batch_id = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("add_change deadlocked on batch flush")
+            .expect("add_change returned err");
+        assert!(!batch_id.is_empty());
     }
 }
