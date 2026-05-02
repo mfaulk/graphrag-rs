@@ -220,12 +220,18 @@ impl LLMEntityExtractor {
             keep_alive: self.keep_alive.clone(),
             ..Default::default()
         };
-        match self.ollama_client.generate_with_params(prompt, params.clone()).await {
+        match self
+            .ollama_client
+            .generate_with_params(prompt, params.clone())
+            .await
+        {
             Ok(response) => Ok(response),
             Err(e) => {
                 tracing::warn!("LLM call failed, retrying: {}", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                self.ollama_client.generate_with_params(prompt, params).await
+                self.ollama_client
+                    .generate_with_params(prompt, params)
+                    .await
             },
         }
     }
@@ -245,7 +251,9 @@ impl LLMEntityExtractor {
             keep_alive: self.keep_alive.clone(),
             ..Default::default()
         };
-        self.ollama_client.generate_with_params(prompt, params).await
+        self.ollama_client
+            .generate_with_params(prompt, params)
+            .await
     }
 
     /// Parse LLM response into structured extraction output
