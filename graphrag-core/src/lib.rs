@@ -291,6 +291,11 @@ pub struct GraphRAG {
     #[cfg(feature = "parallel-processing")]
     #[allow(dead_code)]
     parallel_processor: Option<parallel::ParallelProcessor>,
+    /// Optional override for chat-completion calls. When set, the built-in
+    /// Ollama client is bypassed for the final answer-generation step in
+    /// `ask` and `ask_explained`. See [`core::backend::ChatBackend`].
+    #[cfg(feature = "async")]
+    chat_backend: Option<core::backend::DynChatBackend>,
 }
 
 impl GraphRAG {
@@ -304,7 +309,17 @@ impl GraphRAG {
             critic: None,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
+            #[cfg(feature = "async")]
+            chat_backend: None,
         })
+    }
+
+    /// Inject a custom chat backend for answer generation. Once set, the
+    /// built-in Ollama client is bypassed for the final LLM call inside
+    /// `ask` and `ask_explained`. Pass `None` to revert to the default.
+    #[cfg(feature = "async")]
+    pub fn set_chat_backend(&mut self, backend: Option<core::backend::DynChatBackend>) {
+        self.chat_backend = backend;
     }
 
     /// Create a Zero-Config local GraphRAG instance
@@ -1544,9 +1559,6 @@ impl GraphRAG {
             return Ok("No relevant information found in the knowledge graph.".to_string());
         }
 
-        // Create Ollama client
-        let client = OllamaClient::new(self.config.ollama.clone());
-
         // Build prompt for semantic answer generation with RAG best practices (2025)
         let prompt = format!(
             "You are a knowledgeable assistant specialized in answering questions based on a knowledge graph.\n\n\
@@ -1582,8 +1594,24 @@ impl GraphRAG {
             ..Default::default()
         };
 
-        // Generate answer using LLM with dynamic context window
-        match client.generate_with_params(&prompt, params).await {
+        // Dispatch through an injected ChatBackend if one was provided; otherwise
+        // fall back to the built-in Ollama client. This is the single hook
+        // downstream crates (e.g. semanticore) use to plug OpenAI-style providers
+        // into the answer-generation step without forking the rest of the
+        // pipeline.
+        let answer_result = if let Some(backend) = self.chat_backend.clone() {
+            let chat_params = crate::core::backend::ChatParams {
+                max_tokens: params.num_predict,
+                temperature: params.temperature,
+                num_ctx: params.num_ctx,
+            };
+            backend.complete(&prompt, &chat_params).await
+        } else {
+            let client = OllamaClient::new(self.config.ollama.clone());
+            client.generate_with_params(&prompt, params).await
+        };
+
+        match answer_result {
             Ok(answer) => {
                 // Post-processing: Remove <think> tags if present (Qwen3)
                 let cleaned_answer = Self::remove_thinking_tags(&answer);
