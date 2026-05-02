@@ -324,7 +324,7 @@ impl AsyncGraphRAG {
         }
 
         // Sort by score and limit results
-        all_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        all_results.sort_by(|a, b| b.score.total_cmp(&a.score));
         all_results.truncate(max_results);
 
         Ok(all_results)

@@ -256,7 +256,7 @@ impl GraphBuilder {
                 }
 
                 // Sort by similarity and take top connections
-                similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+                similarities.sort_by(|a, b| b.1.total_cmp(&a.1));
                 similarities.truncate(self.max_connections);
 
                 // Add semantic similarity relationships

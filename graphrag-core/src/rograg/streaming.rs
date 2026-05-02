@@ -863,7 +863,7 @@ impl SynthesisEngine {
 
         // Sort by confidence and combine
         let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        sorted_results.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
 
         let content = sorted_results
             .iter()
@@ -899,7 +899,7 @@ impl SynthesisEngine {
     fn synthesize_best_only(&self, results: &[SubqueryResult]) -> Result<SynthesisResult> {
         let best_result = results
             .iter()
-            .max_by(|a, b| a.confidence.partial_cmp(&b.confidence).unwrap())
+            .max_by(|a, b| a.confidence.total_cmp(&b.confidence))
             .ok_or_else(|| StreamingError::SynthesisFailed {
                 reason: "No best result found".to_string(),
             })?;
@@ -972,7 +972,7 @@ impl SynthesisEngine {
     fn synthesize_hierarchical(&self, results: &[SubqueryResult]) -> Result<SynthesisResult> {
         // Sort by confidence and create hierarchical structure
         let mut sorted_results = results.to_vec();
-        sorted_results.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+        sorted_results.sort_by(|a, b| b.confidence.total_cmp(&a.confidence));
 
         let mut content_parts = Vec::new();
 

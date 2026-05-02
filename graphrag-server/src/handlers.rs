@@ -582,7 +582,7 @@ fn query_collection(
         })
         .collect();
 
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
     results.iter_mut().enumerate().for_each(|(i, r)| r.rank = i + 1);
     results.truncate(top_k);
 
@@ -608,7 +608,7 @@ fn apply_rrf(result_sets: Vec<Vec<QueryResult>>, top_k: usize) -> Vec<QueryResul
     }
 
     let mut merged: Vec<(String, f32)> = rrf_scores.into_iter().collect();
-    merged.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+    merged.sort_by(|a, b| b.1.total_cmp(&a.1));
 
     merged
         .into_iter()
@@ -626,7 +626,7 @@ fn apply_rrf(result_sets: Vec<Vec<QueryResult>>, top_k: usize) -> Vec<QueryResul
 fn concat_results(result_sets: Vec<Vec<QueryResult>>, top_k: usize) -> Vec<QueryResult> {
     let mut all_results: Vec<QueryResult> = result_sets.into_iter().flatten().collect();
 
-    all_results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    all_results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
     all_results.iter_mut().enumerate().for_each(|(i, r)| r.rank = i + 1);
     all_results.truncate(top_k);
 

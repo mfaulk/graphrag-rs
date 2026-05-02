@@ -255,7 +255,7 @@ impl AsyncVectorStore for MockVectorStore {
             .collect();
 
         // Sort by distance (ascending)
-        results.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap());
+        results.sort_by(|a, b| a.distance.total_cmp(&b.distance));
 
         // Take top k
         Ok(results.into_iter().take(k).collect())

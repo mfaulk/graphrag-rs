@@ -361,7 +361,7 @@ impl CustomNER {
         entities.sort_by(|a, b| {
             a.start
                 .cmp(&b.start)
-                .then(b.confidence.partial_cmp(&a.confidence).unwrap())
+                .then(b.confidence.total_cmp(&a.confidence))
         });
 
         let mut result = Vec::new();

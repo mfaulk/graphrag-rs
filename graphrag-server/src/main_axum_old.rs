@@ -529,7 +529,7 @@ async fn query(
         .filter(|r| r.similarity > 0.5)
         .collect();
 
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
     results.truncate(req.top_k);
 
     let processing_time = start.elapsed().as_millis() as u64;
