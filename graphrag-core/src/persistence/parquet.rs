@@ -189,9 +189,24 @@ impl ParquetPersistence {
 
         // Load relationships
         let relationships = self.load_relationships()?;
+        let mut dropped_relationships: usize = 0;
         for relationship in relationships {
-            // Ignore errors for missing entities (they'll be logged)
-            let _ = graph.add_relationship(relationship);
+            // A relationship can fail to attach if its endpoints reference
+            // entities that aren't in the graph (schema drift between save/
+            // load, partial corruption, etc.). Don't crash the load — but
+            // also don't silently ignore: count and log so users see a
+            // signal instead of "queries return slightly wrong answers."
+            if graph.add_relationship(relationship).is_err() {
+                dropped_relationships += 1;
+            }
+        }
+        if dropped_relationships > 0 {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "Parquet load: dropped {} relationship(s) whose endpoints \
+                 are not present in the graph (possible schema drift or partial corruption)",
+                dropped_relationships
+            );
         }
 
         #[cfg(feature = "tracing")]
@@ -204,7 +219,16 @@ impl ParquetPersistence {
         Ok(graph)
     }
 
-    /// Save entities to Parquet
+    /// Save entities to Parquet.
+    ///
+    /// **Lossy round-trip warning:** the current schema persists only
+    /// `mention_count` (a `usize`), not the `EntityMention` payload itself.
+    /// On load, entities are reconstructed with `mentions: Vec::new()`. The
+    /// entity-to-chunk provenance used by retrieval (`source_chunks`) is
+    /// derived from mentions and is therefore lost across save+load. A
+    /// warning is logged at save time when any entity has non-empty mentions
+    /// so users see the signal. Persisting full mentions in a separate
+    /// `entity_mentions.parquet` is tracked in #24.
     #[cfg(feature = "persistent-storage")]
     fn save_entities(&self, graph: &KnowledgeGraph) -> Result<()> {
         let entities: Vec<_> = graph.entities().collect();
@@ -213,6 +237,18 @@ impl ParquetPersistence {
             #[cfg(feature = "tracing")]
             tracing::warn!("No entities to save");
             return Ok(());
+        }
+
+        let entities_with_mentions = entities.iter().filter(|e| !e.mentions.is_empty()).count();
+        if entities_with_mentions > 0 {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "Parquet save: {} of {} entities have mentions, but the current schema \
+                 persists only `mention_count` — full mention payloads will be lost on \
+                 reload. See issue #24.",
+                entities_with_mentions,
+                entities.len()
+            );
         }
 
         // Build Arrow schema for entities
