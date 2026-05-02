@@ -82,11 +82,18 @@ impl Tui {
                         maybe_event = reader.next() => {
                             match maybe_event {
                                 Some(Ok(evt)) => {
-                                    // Handle resize events specially
+                                    // Pick exactly one channel per crossterm event:
+                                    // resize → `Event::Resize` (specialized);
+                                    // everything else → `Event::Crossterm`. The
+                                    // previous code emitted both for a resize, so
+                                    // any future component reacting to
+                                    // `Event::Crossterm(Resize(..))` would fire
+                                    // twice.
                                     if let CrosstermEvent::Resize(w, h) = evt {
                                         let _ = event_tx.send(Event::Resize(w, h));
+                                    } else {
+                                        let _ = event_tx.send(Event::Crossterm(evt));
                                     }
-                                    let _ = event_tx.send(Event::Crossterm(evt));
                                 }
                                 Some(Err(_)) => {}
                                 None => break,
