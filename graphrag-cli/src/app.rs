@@ -477,11 +477,7 @@ impl App {
                     .to_string()],
                 };
 
-                self.query_history.add_entry(entry.clone());
-
-                // Update info panel with query history
-                self.info_panel
-                    .add_query(entry.query, entry.duration_ms, entry.results_count);
+                self.record_query_history(entry);
 
                 // Update raw results viewer with search results
                 let mut raw_display = vec![
@@ -552,9 +548,7 @@ impl App {
                     )
                     .to_string()],
                 };
-                self.query_history.add_entry(entry.clone());
-                self.info_panel
-                    .add_query(entry.query, entry.duration_ms, entry.results_count);
+                self.record_query_history(entry);
 
                 // Populate raw results with source list
                 let mut raw_display = vec![
@@ -660,9 +654,7 @@ impl App {
                     )
                     .to_string()],
                 };
-                self.query_history.add_entry(entry.clone());
-                self.info_panel
-                    .add_query(entry.query, entry.duration_ms, entry.results_count);
+                self.record_query_history(entry);
 
                 self.raw_results_viewer.set_content(vec![
                     "REASON mode — query decomposition active".to_string(),
@@ -1003,6 +995,19 @@ impl App {
         }
 
         Ok(())
+    }
+
+    /// Record a completed query in **both** the master \`query_history\` (the
+    /// canonical 1000-entry store, exported via /export) and the InfoPanel's
+    /// 10-entry display cache. Centralizing in one method removes the
+    /// dual-write smell where each query handler had to remember to update
+    /// both stores (closes #64 item 2). The two stores still exist for
+    /// API-trait reasons (Component::render is &mut self, no slice param);
+    /// future Component-trait work can collapse them entirely.
+    fn record_query_history(&mut self, entry: QueryEntry) {
+        self.query_history.add_entry(entry.clone());
+        self.info_panel
+            .add_query(entry.query, entry.duration_ms, entry.results_count);
     }
 
     /// Resolve the per-platform XDG workspaces dir, surfacing a TUI error

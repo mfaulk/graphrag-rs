@@ -649,7 +649,20 @@ async fn run_setup_wizard(template: Option<String>, output: PathBuf) -> Result<(
         }
     }
 
-    fs::write(&output, config_content)?;
+    // Atomic write: stage to a sibling .tmp file, then rename. Ctrl-C during
+    // the write window no longer truncates the destination (the rename is
+    // atomic on POSIX/NTFS once the data is fully written). Closes the
+    // wizard half of #62.
+    let tmp_output = match output.extension() {
+        Some(ext) => {
+            let mut new_ext = std::ffi::OsString::from(ext);
+            new_ext.push(".tmp");
+            output.with_extension(new_ext)
+        },
+        None => output.with_extension("tmp"),
+    };
+    fs::write(&tmp_output, config_content)?;
+    fs::rename(&tmp_output, &output)?;
 
     println!("   ✅ Configuration saved to: {}\n", output.display());
     println!("╔════════════════════════════════════════════════════════════╗");
