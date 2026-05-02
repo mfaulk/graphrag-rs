@@ -371,7 +371,15 @@ async fn query(
                         title: r.metadata.title,
                         similarity: r.score,
                         excerpt: if r.metadata.text.len() > 200 {
-                            format!("{}...", &r.metadata.text[..200])
+                            // Clamp to UTF-8 char boundary so multi-byte input
+                            // (emoji, accented characters, CJK) doesn't panic.
+                            format!(
+                                "{}...",
+                                graphrag_core::util::text_safe::truncate_chars(
+                                    &r.metadata.text,
+                                    200
+                                )
+                            )
                         } else {
                             r.metadata.text
                         },
@@ -421,7 +429,10 @@ async fn query(
                 };
 
             let excerpt = if doc.content.len() > 200 {
-                format!("{}...", &doc.content[..200])
+                format!(
+                    "{}...",
+                    graphrag_core::util::text_safe::truncate_chars(&doc.content, 200)
+                )
             } else {
                 doc.content.clone()
             };
@@ -436,7 +447,7 @@ async fn query(
         .filter(|r| r.similarity > 0.5)
         .collect();
 
-    results.sort_by(|a, b| b.similarity.partial_cmp(&a.similarity).unwrap());
+    results.sort_by(|a, b| b.similarity.total_cmp(&a.similarity));
     results.truncate(body.top_k);
 
     let processing_time = start.elapsed().as_millis() as u64;

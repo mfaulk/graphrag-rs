@@ -315,7 +315,12 @@ impl InfoPanel {
 
         for (i, src) in self.sources.iter().skip(self.scroll_offset).enumerate() {
             let excerpt = if src.excerpt.len() > 60 {
-                format!("{}…", &src.excerpt[..57])
+                // Clamp truncation to UTF-8 char boundary so multi-byte input
+                // (CJK, emoji) cannot panic the TUI.
+                format!(
+                    "{}…",
+                    graphrag_core::util::text_safe::truncate_chars(&src.excerpt, 57)
+                )
             } else {
                 src.excerpt.clone()
             };
@@ -331,7 +336,7 @@ impl InfoPanel {
                         Style::default().fg(Color::Cyan),
                     ),
                     Span::styled(
-                        src.id[..src.id.len().min(20)].to_string(),
+                        graphrag_core::util::text_safe::truncate_chars(&src.id, 20).to_string(),
                         self.theme.highlight(),
                     ),
                 ]),
@@ -373,7 +378,10 @@ impl InfoPanel {
             .enumerate()
             .map(|(i, entry)| {
                 let query_display = if entry.query.len() > 28 {
-                    format!("{}…", &entry.query[..25])
+                    format!(
+                        "{}…",
+                        graphrag_core::util::text_safe::truncate_chars(&entry.query, 25)
+                    )
                 } else {
                     entry.query.clone()
                 };

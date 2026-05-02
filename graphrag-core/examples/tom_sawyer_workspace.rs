@@ -113,13 +113,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (source, target, rel_type, confidence) in &relationships_data {
-        let relationship = Relationship {
-            source: EntityId::new(source.to_string()),
-            target: EntityId::new(target.to_string()),
-            relation_type: rel_type.to_string(),
-            confidence: *confidence,
-            context: vec![ChunkId::new("chunk_0".to_string())],
-        };
+        let relationship = Relationship::new(
+            EntityId::new(source.to_string()),
+            EntityId::new(target.to_string()),
+            rel_type.to_string(),
+            *confidence,
+        )
+        .with_context(vec![ChunkId::new("chunk_0".to_string())]);
         graph.add_relationship(relationship)?;
     }
     println!("   ✅ Added {} relationships", relationships_data.len());

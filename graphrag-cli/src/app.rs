@@ -471,7 +471,10 @@ impl App {
                     timestamp: Utc::now(),
                     duration_ms: duration.as_millis(),
                     results_count: raw_results.len(),
-                    results_preview: vec![answer[..answer.len().min(200)].to_string()],
+                    results_preview: vec![graphrag_core::util::text_safe::truncate_chars(
+                        &answer, 200,
+                    )
+                    .to_string()],
                 };
 
                 self.query_history.add_entry(entry.clone());
@@ -543,7 +546,11 @@ impl App {
                     timestamp: Utc::now(),
                     duration_ms: duration.as_millis(),
                     results_count: result.sources.len(),
-                    results_preview: vec![result.answer[..result.answer.len().min(200)].to_string()],
+                    results_preview: vec![graphrag_core::util::text_safe::truncate_chars(
+                        &result.answer,
+                        200,
+                    )
+                    .to_string()],
                 };
                 self.query_history.add_entry(entry.clone());
                 self.info_panel
@@ -566,7 +573,7 @@ impl App {
                         src.relevance_score,
                         src.id
                     ));
-                    let excerpt = &src.excerpt[..src.excerpt.len().min(120)];
+                    let excerpt = graphrag_core::util::text_safe::truncate_chars(&src.excerpt, 120);
                     raw_display.push(format!("   {}", excerpt));
                     raw_display.push(String::new());
                 }
@@ -648,7 +655,10 @@ impl App {
                     timestamp: Utc::now(),
                     duration_ms: duration.as_millis(),
                     results_count: 0,
-                    results_preview: vec![answer[..answer.len().min(200)].to_string()],
+                    results_preview: vec![graphrag_core::util::text_safe::truncate_chars(
+                        &answer, 200,
+                    )
+                    .to_string()],
                 };
                 self.query_history.add_entry(entry.clone());
                 self.info_panel

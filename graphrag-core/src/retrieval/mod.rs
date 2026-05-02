@@ -1402,7 +1402,7 @@ impl RetrievalSystem {
         }
 
         // Sort by adjusted scores
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         // Diversity-aware deduplication
         let mut deduplicated = Vec::new();
@@ -1526,7 +1526,7 @@ impl RetrievalSystem {
 
         // Select top entities by combined score
         let mut sorted_entities: Vec<_> = entity_scores.iter().collect();
-        sorted_entities.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap());
+        sorted_entities.sort_by(|a, b| b.1.total_cmp(a.1));
 
         for (entity_id, score) in sorted_entities.iter().take(3) {
             if let Some(entity) = graph.entities().find(|e| e.id.to_string() == **entity_id) {
@@ -1647,7 +1647,7 @@ impl RetrievalSystem {
         }
 
         // Sort by similarity
-        similarities.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        similarities.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         Ok(similarities)
     }
@@ -1705,7 +1705,7 @@ impl RetrievalSystem {
     /// Rank and deduplicate search results (legacy)
     fn rank_and_deduplicate(&self, mut results: Vec<SearchResult>) -> Result<Vec<SearchResult>> {
         // Sort by score descending
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
 
         // Deduplicate by ID
         let mut seen_ids = HashSet::new();

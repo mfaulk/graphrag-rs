@@ -825,7 +825,7 @@ impl DocumentTree {
             .collect();
 
         // Sort by score descending
-        sentence_scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        sentence_scores.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Select top sentences up to max_summary_length
         let mut summary = String::new();
@@ -932,7 +932,7 @@ impl DocumentTree {
         }
 
         // Sort by score and return top results
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(max_results);
 
         Ok(results)

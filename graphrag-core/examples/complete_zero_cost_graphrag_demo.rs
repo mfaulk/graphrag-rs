@@ -226,6 +226,8 @@ fn create_pure_algorithmic_config() -> Config {
             max_gleaning_rounds: 3,
             enable_triple_reflection: false,
             validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 50,
         },
         retrieval: graphrag_core::config::RetrievalConfig {
             top_k: 10,
@@ -353,6 +355,9 @@ fn create_pure_algorithmic_config() -> Config {
         },
         enhancements: Default::default(),
         auto_save: Default::default(),
+        gliner: Default::default(),
+        advanced_features: Default::default(),
+        suppress_progress_bars: false,
     }
 }
 

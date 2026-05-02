@@ -291,12 +291,7 @@ impl ServiceContext {
 
     /// Get a service by type
     pub fn get<T: Any + Send + Sync>(&self) -> Result<&T> {
-        // Safety: This is safe because we're getting an immutable reference
-        // from an Arc, which ensures the registry stays alive
-        unsafe {
-            let ptr = self.registry.as_ref() as *const ServiceRegistry;
-            (*ptr).get::<T>()
-        }
+        self.registry.get::<T>()
     }
 }
 

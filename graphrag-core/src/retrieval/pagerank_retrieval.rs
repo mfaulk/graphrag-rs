@@ -214,7 +214,7 @@ impl PageRankRetrievalSystem {
         }
 
         // Step 5: Sort by combined score and limit results
-        scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        scored_results.sort_by(|a, b| b.score.total_cmp(&a.score));
         scored_results.truncate(max_results);
 
         println!(
@@ -356,7 +356,7 @@ impl PageRankRetrievalSystem {
             }
         }
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        results.sort_by(|a, b| b.score.total_cmp(&a.score));
         results.truncate(self.max_results);
 
         results
@@ -534,7 +534,7 @@ impl PageRankRetrievalSystem {
         }
 
         // Step 8: Sort by combined score and limit results
-        scored_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+        scored_results.sort_by(|a, b| b.score.total_cmp(&a.score));
         scored_results.truncate(max_results);
 
         #[cfg(feature = "tracing")]
