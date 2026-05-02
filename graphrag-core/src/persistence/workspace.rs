@@ -29,6 +29,13 @@ pub struct WorkspaceMetadata {
     pub description: Option<String>,
 }
 
+/// Current on-disk workspace metadata format version.
+///
+/// Bumped when the metadata schema changes in a backward-incompatible way.
+/// Loading a workspace whose `format_version` differs from this constant
+/// emits a warning (no migration story exists yet — see #23).
+pub const CURRENT_FORMAT_VERSION: &str = "1.0";
+
 impl WorkspaceMetadata {
     /// Create new workspace metadata
     pub fn new(name: String) -> Self {
@@ -41,7 +48,7 @@ impl WorkspaceMetadata {
             relationship_count: 0,
             document_count: 0,
             chunk_count: 0,
-            format_version: "1.0".to_string(),
+            format_version: CURRENT_FORMAT_VERSION.to_string(),
             description: None,
         }
     }
@@ -243,10 +250,24 @@ impl WorkspaceManager {
         {
             use super::parquet::ParquetPersistence;
             let parquet = ParquetPersistence::new(workspace_path.clone())?;
-            if let Ok(graph) = parquet.load_graph() {
-                #[cfg(feature = "tracing")]
-                tracing::info!("Loaded graph from Parquet: {}", workspace_name);
-                return Ok(graph);
+            match parquet.load_graph() {
+                Ok(graph) => {
+                    #[cfg(feature = "tracing")]
+                    tracing::info!("Loaded graph from Parquet: {}", workspace_name);
+                    return Ok(graph);
+                },
+                Err(_e) => {
+                    // Parquet load failed — fall through to JSON. Surface
+                    // the failure instead of silently degrading: the parquet
+                    // file might be corrupt, version-mismatched, or missing.
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        workspace = %workspace_name,
+                        error = %_e,
+                        "Parquet load failed; falling back to JSON. \
+                         Investigate the parquet artifact before relying on this load."
+                    );
+                },
             }
         }
 
@@ -277,7 +298,10 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Load workspace metadata
+    /// Load workspace metadata.
+    ///
+    /// Warns (without failing) if the on-disk `format_version` doesn't match
+    /// [`CURRENT_FORMAT_VERSION`]. There is no migration story yet — see #23.
     fn load_metadata(&self, workspace_name: &str) -> Result<WorkspaceMetadata> {
         let workspace_path = self.workspace_path(workspace_name);
         let metadata_path = workspace_path.join("metadata.toml");
@@ -293,6 +317,17 @@ impl WorkspaceManager {
             toml::from_str(&toml_string).map_err(|e| GraphRAGError::Config {
                 message: format!("Failed to parse metadata: {}", e),
             })?;
+
+        if metadata.format_version != CURRENT_FORMAT_VERSION {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                workspace = %workspace_name,
+                on_disk = %metadata.format_version,
+                expected = %CURRENT_FORMAT_VERSION,
+                "Workspace metadata format_version mismatch — proceeding without migration; \
+                 some fields may be missing or interpreted incorrectly (see issue #23)"
+            );
+        }
 
         Ok(metadata)
     }
@@ -365,5 +400,43 @@ mod tests {
 
         let loaded_graph = workspace.load_graph("test").unwrap();
         assert_eq!(loaded_graph.entity_count(), 0);
+    }
+
+    // Loading a workspace whose metadata declares a different format_version
+    // must succeed (we don't gate on it), but the version mismatch should be
+    // observable in the returned struct so callers / log inspection can see
+    // it (regression for #23).
+    #[test]
+    fn load_metadata_returns_on_disk_version_even_when_mismatched() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+        workspace.create_workspace("legacy").unwrap();
+
+        // Hand-write a metadata.toml with a deliberately stale format_version.
+        let stale_meta = WorkspaceMetadata {
+            name: "legacy".to_string(),
+            created_at: chrono::Utc::now(),
+            modified_at: chrono::Utc::now(),
+            entity_count: 0,
+            relationship_count: 0,
+            document_count: 0,
+            chunk_count: 0,
+            format_version: "0.0-prehistoric".to_string(),
+            description: None,
+        };
+        let toml_string = toml::to_string_pretty(&stale_meta).unwrap();
+        let meta_path = temp_dir.path().join("legacy").join("metadata.toml");
+        fs::write(meta_path, toml_string).unwrap();
+
+        let loaded = workspace.load_metadata("legacy").unwrap();
+        assert_eq!(loaded.format_version, "0.0-prehistoric");
+        assert_ne!(loaded.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    // Newly-written metadata always carries the current format version.
+    #[test]
+    fn new_metadata_carries_current_format_version() {
+        let m = WorkspaceMetadata::new("fresh".to_string());
+        assert_eq!(m.format_version, CURRENT_FORMAT_VERSION);
     }
 }
