@@ -127,8 +127,14 @@ impl Tui {
         Ok(())
     }
 
-    /// Leave the alternate screen and disable raw mode
-    pub fn exit(&mut self) -> Result<()> {
+    /// Leave the alternate screen and disable raw mode.
+    ///
+    /// Shuts the event-reader task down *before* releasing the terminal so the
+    /// background task cannot poll input against a terminal that is no longer
+    /// in raw mode (which leaves the terminal in a corrupted state).
+    pub async fn exit(&mut self) -> Result<()> {
+        shutdown_event_task(&mut self.task, &self.cancellation_token).await;
+
         self.terminal.show_cursor()?;
         io::stdout().execute(DisableMouseCapture)?;
         io::stdout().execute(LeaveAlternateScreen)?;
@@ -161,8 +167,101 @@ impl Tui {
 
 impl Drop for Tui {
     fn drop(&mut self) {
+        // Drop cannot await; do best-effort sync cleanup. Callers that care
+        // about clean shutdown should call `exit().await` first.
         self.cancel();
-        let _ = self.exit();
         self.task.abort();
+        let _ = self.terminal.show_cursor();
+        let _ = io::stdout().execute(DisableMouseCapture);
+        let _ = io::stdout().execute(LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
+/// Signal cancellation and await the event task, falling back to abort if it
+/// does not finish promptly. Returns once the task is no longer running.
+async fn shutdown_event_task(task: &mut JoinHandle<()>, token: &CancellationToken) {
+    if task.is_finished() {
+        return;
+    }
+    token.cancel();
+    let shutdown_grace = Duration::from_millis(200);
+    if tokio::time::timeout(shutdown_grace, &mut *task)
+        .await
+        .is_err()
+    {
+        task.abort();
+        // Best-effort: let the runtime observe the abort.
+        let _ = (&mut *task).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // shutdown_event_task awaits a cooperatively-cancellable task before
+    // returning, so callers can rely on the task being done after the call.
+    #[tokio::test]
+    async fn shutdown_awaits_cooperative_task() {
+        let token = CancellationToken::new();
+        let observed_cancel = Arc::new(AtomicBool::new(false));
+
+        let mut task = {
+            let token = token.clone();
+            let observed_cancel = Arc::clone(&observed_cancel);
+            tokio::spawn(async move {
+                token.cancelled().await;
+                observed_cancel.store(true, Ordering::SeqCst);
+            })
+        };
+
+        shutdown_event_task(&mut task, &token).await;
+
+        assert!(
+            task.is_finished(),
+            "task should be joined before shutdown returns"
+        );
+        assert!(
+            observed_cancel.load(Ordering::SeqCst),
+            "task should observe cancellation before being joined",
+        );
+    }
+
+    // shutdown_event_task aborts a task that ignores cancellation, so the
+    // function never blocks the caller indefinitely.
+    #[tokio::test]
+    async fn shutdown_aborts_uncooperative_task() {
+        let token = CancellationToken::new();
+
+        let mut task = tokio::spawn(async {
+            // Ignores cancellation; only an abort can stop this.
+            std::future::pending::<()>().await;
+        });
+
+        shutdown_event_task(&mut task, &token).await;
+
+        assert!(
+            task.is_finished(),
+            "task should be aborted after grace period"
+        );
+    }
+
+    // shutdown_event_task is a no-op when the task has already terminated.
+    #[tokio::test]
+    async fn shutdown_is_idempotent_on_finished_task() {
+        let token = CancellationToken::new();
+        let mut task = tokio::spawn(async {});
+        // Wait for the task to finish on its own.
+        let _ = (&mut task).await;
+        assert!(task.is_finished());
+
+        shutdown_event_task(&mut task, &token).await;
+        assert!(
+            !token.is_cancelled(),
+            "token should not be cancelled if task already finished"
+        );
     }
 }

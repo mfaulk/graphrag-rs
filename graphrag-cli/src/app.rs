@@ -185,7 +185,7 @@ impl App {
         }
 
         // Exit TUI mode
-        self.tui.exit()?;
+        self.tui.exit().await?;
 
         Ok(())
     }
