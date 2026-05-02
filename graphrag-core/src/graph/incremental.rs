@@ -1991,6 +1991,10 @@ impl ProductionGraphStore {
         change: ChangeRecord,
     ) -> Result<UpdateId> {
         let operation_id = self.monitor.start_operation("apply_change");
+        // Capture change_id for the return value: change_log is keyed by
+        // change.change_id, not by the monitor's operation_id, so callers
+        // that look the returned id up in change_log would otherwise miss.
+        let change_id = change.change_id.clone();
 
         // Check for conflicts
         if let Some(conflict) = self.detect_conflict(&change)? {
@@ -2020,7 +2024,7 @@ impl ProductionGraphStore {
 
         self.monitor
             .complete_operation(&operation_id, true, None, 1, 0);
-        Ok(operation_id)
+        Ok(change_id)
     }
 
     fn detect_conflict(&self, change: &ChangeRecord) -> Result<Option<Conflict>> {
@@ -2658,7 +2662,6 @@ mod tests {
 
     #[cfg(feature = "incremental")]
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_production_graph_store_entity_upsert() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
@@ -2682,7 +2685,6 @@ mod tests {
 
     #[cfg(feature = "incremental")]
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_production_graph_store_relationship_upsert() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
@@ -2755,7 +2757,6 @@ mod tests {
 
     #[cfg(feature = "incremental")]
     #[tokio::test]
-    #[ignore = "FIXME(ci-bringup): pre-existing hang in CI"]
     async fn test_production_graph_store_event_publishing() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
@@ -2939,7 +2940,6 @@ mod tests {
     // call inside an OS thread + dedicated runtime to bound failure time.
     #[cfg(feature = "incremental")]
     #[test]
-    #[ignore = "regression for #13; unignore once apply_change_with_conflict_resolution returns change_id"]
     fn upsert_entity_returns_id_present_in_change_log() {
         let graph = KnowledgeGraph::new();
         let config = IncrementalConfig::default();
