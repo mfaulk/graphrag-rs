@@ -6,6 +6,10 @@
 pub mod error;
 pub mod metadata;
 
+// Pluggable chat backend hooks (always available; trait object only)
+#[cfg(feature = "async")]
+pub mod backend;
+
 // Registry requires async feature (uses storage)
 #[cfg(feature = "async")]
 pub mod registry;
