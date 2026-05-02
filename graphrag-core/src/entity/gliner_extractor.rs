@@ -14,7 +14,7 @@ use gliner::model::{
     pipeline::{relation::RelationPipeline, span::SpanPipeline, token::TokenPipeline},
 };
 use orp::{model::Model, params::RuntimeParameters, pipeline::Pipeline};
-use parking_lot::RwLock;
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::Arc;
 
 use crate::{
@@ -78,10 +78,24 @@ impl GLiNERExtractor {
             .to_string()
     }
 
-    /// Ensure the ONNX model is loaded, loading it if necessary.
-    fn ensure_model_loaded(&self) -> Result<(), GraphRAGError> {
-        let mut guard = self.model.write();
-        if guard.is_none() {
+    /// Return a read guard on the loaded model, loading it lazily if needed.
+    ///
+    /// Atomic against TOCTOU: the read guard returned here is held by the
+    /// caller for the entire extraction. Callers that previously called
+    /// `ensure_model_loaded` followed by a fresh `model.read()` could observe
+    /// `None` if a future "unload model" path were added between the two
+    /// acquisitions. Returning the guard from one call closes that window.
+    fn read_or_load_model(&self) -> Result<RwLockReadGuard<'_, Option<Model>>, GraphRAGError> {
+        // Fast path: model already loaded — take a read guard and return it.
+        let read_guard = self.model.read();
+        if read_guard.is_some() {
+            return Ok(read_guard);
+        }
+        drop(read_guard);
+
+        // Slow path: take a write guard, load if still needed, then downgrade.
+        let mut write_guard = self.model.write();
+        if write_guard.is_none() {
             #[allow(unused_mut)]
             let mut rt_params = RuntimeParameters::default();
             if self.config.use_gpu {
@@ -97,9 +111,9 @@ impl GLiNERExtractor {
                     message: format!("Failed to load GLiNER model: {e}"),
                 }
             })?;
-            *guard = Some(model);
+            *write_guard = Some(model);
         }
-        Ok(())
+        Ok(RwLockWriteGuard::downgrade(write_guard))
     }
 
     /// Perform joint NER + RE on a single text chunk (synchronous / blocking).
@@ -116,10 +130,10 @@ impl GLiNERExtractor {
         &self,
         chunk: &TextChunk,
     ) -> Result<(Vec<Entity>, Vec<Relationship>), GraphRAGError> {
-        self.ensure_model_loaded()?;
-
-        let guard = self.model.read();
-        let model = guard.as_ref().expect("model loaded");
+        let guard = self.read_or_load_model()?;
+        let model = guard
+            .as_ref()
+            .expect("read_or_load_model guarantees Some on success");
         let tokenizer = Self::resolve_tokenizer_path(&self.config);
         let params = Parameters::default();
 
