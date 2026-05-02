@@ -58,13 +58,16 @@ impl super::Component for HelpOverlay {
         }
     }
 
-    fn render(&mut self, f: &mut Frame, _area: Rect) {
+    fn render(&mut self, f: &mut Frame, area: Rect) {
         if !self.visible {
             return;
         }
 
-        // Center the popup (60% x 60%)
-        let area = centered_rect(60, 70, f.area());
+        // Center the popup (60% x 60%) inside the caller's `area`. Earlier
+        // this read `f.area()` directly and silently ignored the caller's
+        // rectangle — broke trust whenever a parent layout passed a
+        // sub-region. Closes #64 item 4.
+        let area = centered_rect(60, 70, area);
 
         // Clear background
         f.render_widget(Clear, area);
@@ -80,7 +83,7 @@ impl super::Component for HelpOverlay {
             Line::from(vec![Span::styled("Global Shortcuts", self.theme.title())]),
             Line::from("━".repeat(55)),
             keybinding_line("?", "Toggle this help overlay", &self.theme),
-            keybinding_line("Ctrl+C / q", "Quit application", &self.theme),
+            keybinding_line("Ctrl+C", "Quit application", &self.theme),
             keybinding_line(
                 "Ctrl+N / Ctrl+P",
                 "Cycle focus: Input→Results→Raw→Info",
