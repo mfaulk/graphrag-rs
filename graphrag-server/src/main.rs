@@ -345,8 +345,9 @@ async fn query(
 
     let start = std::time::Instant::now();
 
-    // Increment query count
-    *state.query_count.write().await += 1;
+    // Note: query_count is incremented on success only (see #50). The
+    // previous unconditional pre-increment drifted the /health metric
+    // upward on every embedding/search failure.
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
@@ -388,6 +389,9 @@ async fn query(
                     .collect();
 
                 let processing_time = start.elapsed().as_millis() as u64;
+
+                // Count only successful queries (#50)
+                *state.query_count.write().await += 1;
 
                 return Ok(Json(QueryResponse {
                     query: body.query.clone(),
@@ -451,6 +455,9 @@ async fn query(
 
     let processing_time = start.elapsed().as_millis() as u64;
 
+    // Count only successful queries (#50)
+    *state.query_count.write().await += 1;
+
     Ok(Json(QueryResponse {
         query: body.query.clone(),
         results,
@@ -491,46 +498,94 @@ async fn add_document(
 
     #[cfg(feature = "qdrant")]
     if let Some(qdrant) = &state.qdrant {
-        // Generate real embeddings
-        let embedding = match state.embeddings.generate_single(&content).await {
-            Ok(emb) => emb,
-            Err(e) => {
-                tracing::error!("Failed to generate document embedding: {}", e);
-                return Err(ApiError::InternalError(
-                    "embedding generation failed".to_string(),
-                ));
-            },
-        };
+        // Chunk before embedding (#35).
+        //
+        // The previous code passed the entire `content` (up to 5 MB) to
+        // `embeddings.generate_single` and to Qdrant as a single dense
+        // vector. Most embedding models have an 8k–32k token window; on
+        // overflow the backend either errors or silently truncates, and the
+        // hash fallback would have produced one vector that "represents" 5
+        // MB of text — which dominates similarity search and effectively
+        // poisons the index.
+        let chunks = chunk_for_embedding(&content);
+        if chunks.len() > MAX_CHUNKS_PER_DOCUMENT {
+            tracing::warn!(
+                document_id = %id,
+                chunks = chunks.len(),
+                "document chunked into more than MAX_CHUNKS_PER_DOCUMENT"
+            );
+            return Err(ApiError::BadRequest(format!(
+                "Document chunks ({}) exceed maximum of {}. Split the document or increase chunk_size.",
+                chunks.len(),
+                MAX_CHUNKS_PER_DOCUMENT
+            )));
+        }
+        let chunk_count = chunks.len();
+        for (chunk_index, chunk_text) in chunks.iter().enumerate() {
+            let embedding = match state.embeddings.generate_single(chunk_text).await {
+                Ok(emb) => emb,
+                Err(e) => {
+                    tracing::error!(
+                        document_id = %id,
+                        chunk_index,
+                        "Failed to generate chunk embedding: {}",
+                        e
+                    );
+                    return Err(ApiError::InternalError(
+                        "embedding generation failed".to_string(),
+                    ));
+                },
+            };
 
-        let metadata = DocumentMetadata {
-            id: id.clone(),
-            title: title.clone(),
-            text: content.clone(),
-            chunk_index: 0,
-            entities: Vec::new(),
-            relationships: Vec::new(),
-            timestamp: timestamp.clone(),
-            custom: HashMap::new(),
-        };
+            // Per-chunk Qdrant id derived from doc id + chunk index. Each
+            // chunk also carries the original `id` and `title` in its
+            // payload so cross-chunk retrieval can rejoin them.
+            let chunk_id = format!("{}#{:04}", id, chunk_index);
+            let metadata = DocumentMetadata {
+                id: chunk_id.clone(),
+                title: title.clone(),
+                text: (*chunk_text).to_string(),
+                chunk_index,
+                entities: Vec::new(),
+                relationships: Vec::new(),
+                timestamp: timestamp.clone(),
+                custom: {
+                    let mut m = HashMap::new();
+                    m.insert(
+                        "parent_document_id".to_string(),
+                        serde_json::Value::String(id.clone()),
+                    );
+                    m
+                },
+            };
 
-        match qdrant.add_document(&id, embedding, metadata).await {
-            Ok(_) => {
-                tracing::info!("Added document to Qdrant: {} ({})", title, id);
-
-                return Ok(Json(DocumentOperationResponse {
-                    success: true,
-                    document_id: Some(id),
-                    message: "Document added to Qdrant successfully".to_string(),
-                    backend: "qdrant".to_string(),
-                }));
-            },
-            Err(e) => {
-                tracing::error!("Failed to add document to Qdrant: {}", e);
+            if let Err(e) = qdrant.add_document(&chunk_id, embedding, metadata).await {
+                tracing::error!(
+                    document_id = %id,
+                    chunk_index,
+                    "Failed to add chunk to Qdrant: {}",
+                    e
+                );
                 return Err(ApiError::InternalError(
                     "document storage failed".to_string(),
                 ));
-            },
+            }
         }
+        tracing::info!(
+            "Added document to Qdrant: {} ({}) — {} chunks",
+            title,
+            id,
+            chunk_count
+        );
+        return Ok(Json(DocumentOperationResponse {
+            success: true,
+            document_id: Some(id),
+            message: format!(
+                "Document added to Qdrant successfully ({} chunks)",
+                chunk_count
+            ),
+            backend: "qdrant".to_string(),
+        }));
     }
 
     // Fallback: in-memory storage
@@ -940,6 +995,99 @@ async fn create_api_key(
 // Main Server Configuration
 // ============================================================================
 
+/// Target chunk size in bytes for `add_document`'s in-handler chunker.
+/// ~4000 bytes is well under the 8k–32k token windows of every common
+/// embedding model (a "token" is on the order of 3–4 bytes for English).
+const EMBEDDING_CHUNK_SIZE: usize = 4000;
+
+/// Overlap between adjacent chunks (helps retrieval find spans that
+/// straddle a chunk boundary).
+const EMBEDDING_CHUNK_OVERLAP: usize = 400;
+
+/// Maximum chunks per document. With `EMBEDDING_CHUNK_SIZE = 4000` this
+/// caps a single \`add_document\` request at ~2 MB of effective text — past
+/// that we ask the caller to split, rather than silently emitting hundreds
+/// of embedding requests.
+const MAX_CHUNKS_PER_DOCUMENT: usize = 500;
+
+/// Char-boundary-aware chunker for `add_document`.
+///
+/// Walks `content` in `EMBEDDING_CHUNK_SIZE`-byte windows, advancing by
+/// `(EMBEDDING_CHUNK_SIZE - EMBEDDING_CHUNK_OVERLAP)` bytes per step.
+/// Each window is clamped to a UTF-8 char boundary so multi-byte input
+/// (CJK, emoji) doesn't panic. Returns `&str` slices into the original
+/// content (no allocation per chunk beyond the Vec).
+fn chunk_for_embedding(content: &str) -> Vec<&str> {
+    if content.is_empty() {
+        return Vec::new();
+    }
+    if content.len() <= EMBEDDING_CHUNK_SIZE {
+        return vec![content];
+    }
+
+    let stride = EMBEDDING_CHUNK_SIZE
+        .checked_sub(EMBEDDING_CHUNK_OVERLAP)
+        .and_then(|n| if n == 0 { None } else { Some(n) })
+        .unwrap_or(EMBEDDING_CHUNK_SIZE);
+
+    let mut chunks = Vec::new();
+    let bytes = content.len();
+    let mut start = 0;
+    while start < bytes {
+        let end = (start + EMBEDDING_CHUNK_SIZE).min(bytes);
+        // Clamp `end` down to a char boundary (str::is_char_boundary is
+        // O(1)). Same for `start` (already at a boundary on first iter;
+        // re-check after stride moves it).
+        let safe_end = floor_char_boundary(content, end);
+        let safe_start = floor_char_boundary(content, start);
+        if safe_end <= safe_start {
+            break;
+        }
+        chunks.push(&content[safe_start..safe_end]);
+        if safe_end == bytes {
+            break;
+        }
+        start = safe_start + stride;
+    }
+    chunks
+}
+
+/// Largest char-boundary index `<= idx`. Hand-rolled because
+/// `str::floor_char_boundary` is unstable.
+fn floor_char_boundary(s: &str, idx: usize) -> usize {
+    let idx = idx.min(s.len());
+    let mut i = idx;
+    while i > 0 && !s.is_char_boundary(i) {
+        i -= 1;
+    }
+    i
+}
+
+/// Build the allowed-origin list for CORS.
+///
+/// Reads the comma-separated `ALLOWED_ORIGINS` env var. If unset (or empty
+/// after trimming), defaults to a localhost-only set so dev startup works
+/// without configuration but a production deploy can't accidentally
+/// inherit "any origin." The previous `Cors::default().allow_any_origin()`
+/// was a credentials-exposing landmine — see #34.
+fn build_allowed_origins() -> Vec<String> {
+    match std::env::var("ALLOWED_ORIGINS") {
+        Ok(raw) if !raw.trim().is_empty() => raw
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => vec![
+            "http://localhost:3000".to_string(),
+            "http://localhost:5173".to_string(),
+            "http://localhost:8080".to_string(),
+            "http://127.0.0.1:3000".to_string(),
+            "http://127.0.0.1:5173".to_string(),
+            "http://127.0.0.1:8080".to_string(),
+        ],
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     // Initialize tracing
@@ -997,12 +1145,24 @@ async fn main() -> std::io::Result<()> {
     );
 
     HttpServer::new(move || {
-        // Configure CORS for each app instance
-        let cors = Cors::default()
-            .allow_any_origin()
-            .allow_any_method()
-            .allow_any_header()
+        // Configure CORS for each app instance.
+        //
+        // The previous \`allow_any_origin().allow_any_method().allow_any_header()\`
+        // let any web page on any origin issue authenticated requests against
+        // the API on behalf of a user with a token in localStorage. Combined
+        // with the JWT issuance issues (#31), this widened the blast radius
+        // significantly. (#34)
+        //
+        // Read \`ALLOWED_ORIGINS\` (comma-separated). Default to localhost-only
+        // for safe dev startup. Methods and headers are explicit, not "any".
+        let allowed_origins = build_allowed_origins();
+        let mut cors = Cors::default()
+            .allowed_methods(vec!["GET", "POST", "DELETE"])
+            .allowed_headers(vec!["Content-Type", "Authorization", "X-API-Key"])
             .max_age(3600);
+        for origin in &allowed_origins {
+            cors = cors.allowed_origin(origin);
+        }
 
         App::new()
             // OpenAPI documentation
@@ -1074,4 +1234,101 @@ async fn main() -> std::io::Result<()> {
     .bind("0.0.0.0:8080")?
     .run()
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A small document fits in one chunk and yields the original text.
+    #[test]
+    fn chunk_for_embedding_returns_single_chunk_for_small_input() {
+        let chunks = chunk_for_embedding("hello world");
+        assert_eq!(chunks, vec!["hello world"]);
+    }
+
+    // An exactly-empty document yields zero chunks (regression for #35;
+    // an empty doc would otherwise still trigger one embedding call).
+    #[test]
+    fn chunk_for_embedding_returns_empty_for_empty_input() {
+        let chunks = chunk_for_embedding("");
+        assert!(chunks.is_empty());
+    }
+
+    // A document larger than the chunk size produces overlapping chunks.
+    #[test]
+    fn chunk_for_embedding_splits_large_input_with_overlap() {
+        let big = "x".repeat(EMBEDDING_CHUNK_SIZE * 3);
+        let chunks = chunk_for_embedding(&big);
+        assert!(
+            chunks.len() >= 3,
+            "expected ≥3 chunks, got {}",
+            chunks.len()
+        );
+        // Each chunk respects the size cap.
+        for c in &chunks {
+            assert!(c.len() <= EMBEDDING_CHUNK_SIZE);
+        }
+    }
+
+    // Multi-byte UTF-8 input must not panic at chunk boundaries
+    // (regression for #35; naive byte slicing would split a 3-byte CJK
+    // codepoint mid-character).
+    #[test]
+    fn chunk_for_embedding_does_not_panic_on_utf8_boundaries() {
+        let cjk_chunk = "中文测试".repeat(EMBEDDING_CHUNK_SIZE);
+        let chunks = chunk_for_embedding(&cjk_chunk);
+        for c in &chunks {
+            // If we accidentally split mid-codepoint, this would panic
+            // earlier inside the slice. Reaching here means each chunk
+            // is valid UTF-8.
+            assert!(c.is_char_boundary(0) && c.is_char_boundary(c.len()));
+        }
+    }
+
+    // Default behavior when ALLOWED_ORIGINS is unset: localhost only, no
+    // wildcard. Regression for #34's allow_any_origin landmine.
+    #[test]
+    fn build_allowed_origins_defaults_to_localhost_only() {
+        // Save & restore env to avoid cross-test pollution.
+        let prev = std::env::var("ALLOWED_ORIGINS").ok();
+        std::env::remove_var("ALLOWED_ORIGINS");
+
+        let origins = build_allowed_origins();
+        assert!(
+            origins.iter().any(|o| o.contains("localhost")),
+            "expected localhost in default origins, got {origins:?}"
+        );
+        assert!(
+            !origins.iter().any(|o| o == "*"),
+            "default must not include wildcard, got {origins:?}"
+        );
+
+        if let Some(p) = prev {
+            std::env::set_var("ALLOWED_ORIGINS", p);
+        } else {
+            std::env::remove_var("ALLOWED_ORIGINS");
+        }
+    }
+
+    // ALLOWED_ORIGINS env var is parsed comma-separated, with trimming.
+    #[test]
+    fn build_allowed_origins_parses_env_var() {
+        let prev = std::env::var("ALLOWED_ORIGINS").ok();
+        std::env::set_var(
+            "ALLOWED_ORIGINS",
+            "https://app.example.com, https://admin.example.com",
+        );
+
+        let origins = build_allowed_origins();
+        assert_eq!(origins.len(), 2);
+        assert!(origins.contains(&"https://app.example.com".to_string()));
+        assert!(origins.contains(&"https://admin.example.com".to_string()));
+
+        if let Some(p) = prev {
+            std::env::set_var("ALLOWED_ORIGINS", p);
+        } else {
+            std::env::remove_var("ALLOWED_ORIGINS");
+        }
+    }
 }
