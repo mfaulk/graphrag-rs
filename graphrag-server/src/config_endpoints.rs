@@ -90,9 +90,13 @@ pub async fn set_config(
     )
     .await
     .map_err(|join_err| {
-        ApiError::InternalError(format!("GraphRAG init task panicked: {}", join_err))
+        tracing::error!("GraphRAG init task panicked: {}", join_err);
+        ApiError::InternalError("GraphRAG init task panicked".to_string())
     })?
-    .map_err(|e| ApiError::InternalError(format!("GraphRAG initialization failed: {}", e)))?;
+    .map_err(|e| {
+        tracing::error!("GraphRAG initialization failed: {}", e);
+        ApiError::InternalError("GraphRAG initialization failed".to_string())
+    })?;
 
     // Store the initialized GraphRAG (write lock is taken only for the swap)
     *state.graphrag.write().await = Some(graphrag);

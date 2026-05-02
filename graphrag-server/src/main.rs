@@ -354,11 +354,12 @@ async fn query(
         let query_embedding = match state.embeddings.generate_single(&body.query).await {
             Ok(embedding) => embedding,
             Err(e) => {
+                // Diagnostic detail goes to logs only; the response carries
+                // a generic component name (issue #41).
                 tracing::error!("Failed to generate query embedding: {}", e);
-                return Err(ApiError::InternalError(format!(
-                    "Failed to generate embedding: {}",
-                    e
-                )));
+                return Err(ApiError::InternalError(
+                    "embedding generation failed".to_string(),
+                ));
             },
         };
 
@@ -396,10 +397,8 @@ async fn query(
                 }));
             },
             Err(e) => {
-                return Err(ApiError::InternalError(format!(
-                    "Qdrant search failed: {}",
-                    e
-                )));
+                tracing::error!("Qdrant search failed: {}", e);
+                return Err(ApiError::InternalError("vector search failed".to_string()));
             },
         }
     }
@@ -497,10 +496,9 @@ async fn add_document(
             Ok(emb) => emb,
             Err(e) => {
                 tracing::error!("Failed to generate document embedding: {}", e);
-                return Err(ApiError::InternalError(format!(
-                    "Failed to generate embedding: {}",
-                    e
-                )));
+                return Err(ApiError::InternalError(
+                    "embedding generation failed".to_string(),
+                ));
             },
         };
 
@@ -527,10 +525,10 @@ async fn add_document(
                 }));
             },
             Err(e) => {
-                return Err(ApiError::InternalError(format!(
-                    "Failed to add document to Qdrant: {}",
-                    e
-                )));
+                tracing::error!("Failed to add document to Qdrant: {}", e);
+                return Err(ApiError::InternalError(
+                    "document storage failed".to_string(),
+                ));
             },
         }
     }
@@ -628,10 +626,10 @@ async fn delete_document(
                 }));
             },
             Err(e) => {
-                return Err(ApiError::InternalError(format!(
-                    "Failed to delete from Qdrant: {}",
-                    e
-                )));
+                tracing::error!("Failed to delete from Qdrant: {}", e);
+                return Err(ApiError::InternalError(
+                    "document delete failed".to_string(),
+                ));
             },
         }
     }
@@ -738,10 +736,10 @@ async fn build_graph(state: Data<AppState>) -> Result<Json<BuildGraphResponse>, 
                 }));
             },
             Err(e) => {
-                return Err(ApiError::InternalError(format!(
-                    "Failed to access Qdrant: {}",
-                    e
-                )));
+                tracing::error!("Failed to access Qdrant: {}", e);
+                return Err(ApiError::InternalError(
+                    "vector store access failed".to_string(),
+                ));
             },
         }
     }
@@ -879,10 +877,9 @@ async fn login(
         },
         Err(e) => {
             tracing::error!("❌ Failed to generate token: {}", e);
-            Err(ApiError::InternalError(format!(
-                "Token generation failed: {}",
-                e
-            )))
+            Err(ApiError::InternalError(
+                "token generation failed".to_string(),
+            ))
         },
     }
 }
@@ -932,10 +929,9 @@ async fn create_api_key(
         },
         Err(e) => {
             tracing::error!("❌ Failed to create API key: {}", e);
-            Err(ApiError::InternalError(format!(
-                "API key creation failed: {}",
-                e
-            )))
+            Err(ApiError::InternalError(
+                "API key creation failed".to_string(),
+            ))
         },
     }
 }
