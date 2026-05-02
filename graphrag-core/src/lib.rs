@@ -1254,8 +1254,9 @@ impl GraphRAG {
             }
         }
 
-        if self.config.ollama.enabled {
-            // Initial synthesis
+        if self.chat_backend.is_some() || self.config.ollama.enabled {
+            // Initial synthesis (dispatches through `chat_backend` if set,
+            // otherwise via the built-in Ollama client).
             let mut current_answer = self
                 .generate_semantic_answer_from_results(query, &unique_results)
                 .await?;
@@ -1327,8 +1328,10 @@ impl GraphRAG {
         // Get full search results with metadata
         let search_results = self.query_internal_with_results(query).await?;
 
-        // If Ollama is enabled, generate semantic answer using LLM
-        if self.config.ollama.enabled {
+        // Synthesize via LLM whenever a chat backend is reachable — either an
+        // injected `ChatBackend` (set via `set_chat_backend`) or the built-in
+        // Ollama client. The synthesis function picks the right one internally.
+        if self.chat_backend.is_some() || self.config.ollama.enabled {
             return self
                 .generate_semantic_answer_from_results(query, &search_results)
                 .await;
@@ -1396,8 +1399,9 @@ impl GraphRAG {
         // Get search results
         let search_results = self.query_internal_with_results(query).await?;
 
-        // Generate the answer
-        let answer = if self.config.ollama.enabled {
+        // Generate the answer — dispatch to the LLM whenever any chat
+        // backend is reachable (injected `ChatBackend` OR built-in Ollama).
+        let answer = if self.chat_backend.is_some() || self.config.ollama.enabled {
             self.generate_semantic_answer_from_results(query, &search_results)
                 .await?
         } else {
