@@ -203,7 +203,7 @@ pub async fn run() -> Result<()> {
             );
 
             let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = config.unwrap_or_else(|| PathBuf::from("./graphrag.toml"));
+            let config_path = resolve_config_path(config);
             let cfg = load_config_from_file(&config_path).await?;
             handler.initialize(cfg).await?;
             let result = handler.load_document_with_options(&document, false).await?;
@@ -225,7 +225,7 @@ pub async fn run() -> Result<()> {
             );
 
             let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = config.unwrap_or_else(|| PathBuf::from("./graphrag.toml"));
+            let config_path = resolve_config_path(config);
             let cfg = load_config_from_file(&config_path).await?;
             handler.initialize(cfg).await?;
 
@@ -252,7 +252,7 @@ pub async fn run() -> Result<()> {
             eprintln!("⚠️  `entities` is deprecated. Prefer: graphrag tui, then /entities");
 
             let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = config.unwrap_or_else(|| PathBuf::from("./graphrag.toml"));
+            let config_path = resolve_config_path(config);
             let cfg = load_config_from_file(&config_path).await?;
             handler.initialize(cfg).await?;
             let entities = handler.get_entities(filter.as_deref()).await?;
@@ -278,7 +278,7 @@ pub async fn run() -> Result<()> {
             eprintln!("⚠️  `stats` is deprecated. Prefer: graphrag tui, then /stats");
 
             let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = config.unwrap_or_else(|| PathBuf::from("./graphrag.toml"));
+            let config_path = resolve_config_path(config);
             let cfg = load_config_from_file(&config_path).await?;
             handler.initialize(cfg).await?;
 
@@ -314,10 +314,13 @@ pub async fn run() -> Result<()> {
             book,
             questions,
         }) => {
-            if !cli.debug {
-                std::env::set_var("RUST_LOG", "error");
-            }
-            setup_logging(cli.debug)?;
+            // Bench wants quieter logs by default. Configure the EnvFilter
+            // directly via `setup_logging_with_level("error")` instead of
+            // `env::set_var("RUST_LOG", "error")` — the latter mutates the
+            // process-wide environment after `#[tokio::main]` has already
+            // spawned worker threads, which is a documented data race
+            // (and `unsafe` in the 2024 edition).
+            setup_logging_with_level(cli.debug, "error")?;
 
             let q_vec: Vec<String> = questions.split('|').map(|s| s.to_string()).collect();
             handlers::bench::run_benchmark(&config, &book, q_vec).await?;
@@ -337,6 +340,23 @@ pub async fn run() -> Result<()> {
 
 async fn load_config_from_file(path: &std::path::Path) -> Result<graphrag_core::Config> {
     config::load_config(path).await
+}
+
+/// Resolve the CLI `--config` argument to a concrete path, defaulting to
+/// `./graphrag.toml` if the user didn't pass one.
+///
+/// Logs the absolute resolved path on stderr so users running
+/// `graphrag query foo` from an arbitrary directory see *which* config the
+/// fallback picked up. Closes the silent half of #60.
+fn resolve_config_path(arg: Option<PathBuf>) -> PathBuf {
+    let path = arg.unwrap_or_else(|| PathBuf::from("./graphrag.toml"));
+    let resolved = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+    eprintln!(
+        "📄 config: {} (resolved: {})",
+        path.display(),
+        resolved.display()
+    );
+    path
 }
 
 fn run_validate(config_file: &std::path::Path, format: &str) -> Result<()> {
@@ -784,22 +804,41 @@ pub fn install_panic_hook() {
     }));
 }
 
+/// Default log level used by `setup_logging` for non-debug runs.
+/// Pass an override into `setup_logging_with_level` for commands that need
+/// quieter output (e.g. `bench`).
+const DEFAULT_LOG_LEVEL: &str = "info";
+
 fn setup_logging(debug: bool) -> Result<()> {
+    setup_logging_with_level(debug, DEFAULT_LOG_LEVEL)
+}
+
+fn setup_logging_with_level(debug: bool, non_debug_level: &str) -> Result<()> {
     use tracing_subscriber::EnvFilter;
 
     let filter = if debug {
         EnvFilter::new("graphrag_cli=debug,graphrag_core=debug")
     } else {
-        EnvFilter::new("graphrag_cli=info,graphrag_core=info")
+        EnvFilter::new(format!(
+            "graphrag_cli={lvl},graphrag_core={lvl}",
+            lvl = non_debug_level
+        ))
     };
 
-    tracing_subscriber::fmt()
+    // `try_init` instead of `init`: panics if a global default subscriber is
+    // already set (would trip integration tests that boot the CLI twice or
+    // any future re-entrant code path). Demote the duplicate to a `warn!`
+    // and continue with whatever subscriber is already installed.
+    if let Err(e) = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .with_target(false)
         .with_file(true)
         .with_line_number(true)
-        .init();
+        .try_init()
+    {
+        tracing::warn!("tracing subscriber already initialized; keeping the existing one ({e})");
+    }
 
     Ok(())
 }
@@ -824,14 +863,19 @@ fn setup_tui_logging() -> Result<()> {
 
     let filter = EnvFilter::new("graphrag_cli=warn,graphrag_core=warn");
 
-    tracing_subscriber::fmt()
+    if let Err(e) = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(Arc::new(file))
         .with_target(false)
         .with_file(false)
         .with_line_number(false)
         .with_ansi(false)
-        .init();
+        .try_init()
+    {
+        // Subscriber already installed (e.g. tests bootstrapping the TUI
+        // twice). Keep going; the existing subscriber wins.
+        eprintln!("warning: tracing subscriber already initialized; reusing existing ({e})");
+    }
 
     Ok(())
 }
