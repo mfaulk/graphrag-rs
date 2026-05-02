@@ -59,13 +59,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     graph.add_entity(entity2)?;
 
     // Add a relationship
-    let relationship = Relationship {
-        source: EntityId::new("rust".to_string()),
-        target: EntityId::new("graphrag".to_string()),
-        relation_type: "USES".to_string(),
-        confidence: 0.85,
-        context: vec![ChunkId::new("chunk1".to_string())],
-    };
+    let relationship = Relationship::new(
+        EntityId::new("rust".to_string()),
+        EntityId::new("graphrag".to_string()),
+        "USES".to_string(),
+        0.85,
+    )
+    .with_context(vec![ChunkId::new("chunk1".to_string())]);
     graph.add_relationship(relationship)?;
 
     println!("📊 Created knowledge graph:");

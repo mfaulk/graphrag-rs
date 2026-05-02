@@ -88,38 +88,30 @@ Relationships define how entities are connected, such as "works_for" or "located
 
     // Phase 2: Entity Extraction (simulated)
     let entities = vec![
-        Entity {
-            id: EntityId::new("e1".to_string()),
-            name: "Knowledge Graphs".to_string(),
-            entity_type: "concept".to_string(),
-            confidence: 0.95,
-            mentions: vec![],
-            embedding: None,
-        },
-        Entity {
-            id: EntityId::new("e2".to_string()),
-            name: "Search Engines".to_string(),
-            entity_type: "system".to_string(),
-            confidence: 0.85,
-            mentions: vec![],
-            embedding: None,
-        },
-        Entity {
-            id: EntityId::new("e3".to_string()),
-            name: "Entities".to_string(),
-            entity_type: "concept".to_string(),
-            confidence: 0.9,
-            mentions: vec![],
-            embedding: None,
-        },
-        Entity {
-            id: EntityId::new("e4".to_string()),
-            name: "Relationships".to_string(),
-            entity_type: "concept".to_string(),
-            confidence: 0.9,
-            mentions: vec![],
-            embedding: None,
-        },
+        Entity::new(
+            EntityId::new("e1".to_string()),
+            "Knowledge Graphs".to_string(),
+            "concept".to_string(),
+            0.95,
+        ),
+        Entity::new(
+            EntityId::new("e2".to_string()),
+            "Search Engines".to_string(),
+            "system".to_string(),
+            0.85,
+        ),
+        Entity::new(
+            EntityId::new("e3".to_string()),
+            "Entities".to_string(),
+            "concept".to_string(),
+            0.9,
+        ),
+        Entity::new(
+            EntityId::new("e4".to_string()),
+            "Relationships".to_string(),
+            "concept".to_string(),
+            0.9,
+        ),
     ];
 
     let entity_validation = EntityExtractionValidator::validate(&chunks, &entities);
@@ -140,20 +132,18 @@ Relationships define how entities are connected, such as "works_for" or "located
 
     // Phase 3: Relationship Extraction (simulated)
     let relationships = vec![
-        Relationship {
-            source: EntityId::new("e1".to_string()),
-            target: EntityId::new("e3".to_string()),
-            relation_type: "composed_of".to_string(),
-            confidence: 0.85,
-            context: vec![],
-        },
-        Relationship {
-            source: EntityId::new("e3".to_string()),
-            target: EntityId::new("e4".to_string()),
-            relation_type: "connected_by".to_string(),
-            confidence: 0.8,
-            context: vec![],
-        },
+        Relationship::new(
+            EntityId::new("e1".to_string()),
+            EntityId::new("e3".to_string()),
+            "composed_of".to_string(),
+            0.85,
+        ),
+        Relationship::new(
+            EntityId::new("e3".to_string()),
+            EntityId::new("e4".to_string()),
+            "connected_by".to_string(),
+            0.8,
+        ),
     ];
 
     let rel_validation = RelationshipExtractionValidator::validate(&entities, &relationships);
@@ -232,40 +222,33 @@ fn demo_query_evaluation() -> Result<()> {
 
     // Retrieved entities
     let entities = vec![
-        Entity {
-            id: EntityId::new("e1".to_string()),
-            name: "Knowledge Graphs".to_string(),
-            entity_type: "concept".to_string(),
-            confidence: 0.95,
-            mentions: vec![],
-            embedding: None,
-        },
-        Entity {
-            id: EntityId::new("e2".to_string()),
-            name: "Google".to_string(),
-            entity_type: "organization".to_string(),
-            confidence: 0.9,
-            mentions: vec![],
-            embedding: None,
-        },
-        Entity {
-            id: EntityId::new("e3".to_string()),
-            name: "Search Engines".to_string(),
-            entity_type: "system".to_string(),
-            confidence: 0.85,
-            mentions: vec![],
-            embedding: None,
-        },
+        Entity::new(
+            EntityId::new("e1".to_string()),
+            "Knowledge Graphs".to_string(),
+            "concept".to_string(),
+            0.95,
+        ),
+        Entity::new(
+            EntityId::new("e2".to_string()),
+            "Google".to_string(),
+            "organization".to_string(),
+            0.9,
+        ),
+        Entity::new(
+            EntityId::new("e3".to_string()),
+            "Search Engines".to_string(),
+            "system".to_string(),
+            0.85,
+        ),
     ];
 
     // Retrieved relationships
-    let relationships = vec![Relationship {
-        source: EntityId::new("e2".to_string()),
-        target: EntityId::new("e3".to_string()),
-        relation_type: "is_a".to_string(),
-        confidence: 0.9,
-        context: vec![],
-    }];
+    let relationships = vec![Relationship::new(
+        EntityId::new("e2".to_string()),
+        EntityId::new("e3".to_string()),
+        "is_a".to_string(),
+        0.9,
+    )];
 
     // Context chunks
     let chunks = vec![

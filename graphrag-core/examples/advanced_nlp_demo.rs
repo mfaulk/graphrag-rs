@@ -75,31 +75,27 @@ fn demo_graph_traversal() -> Result<()> {
         ("charlie", "Charlie", "person"),
         ("stanford", "Stanford", "organization"),
     ] {
-        graph.add_entity(Entity {
-            id: EntityId::new(id.to_string()),
-            name: name.to_string(),
-            entity_type: etype.to_string(),
-            confidence: 0.9,
-            mentions: vec![],
-            embedding: None,
-        })?;
+        graph.add_entity(Entity::new(
+            EntityId::new(id.to_string()),
+            name.to_string(),
+            etype.to_string(),
+            0.9,
+        ))?;
     }
 
-    graph.add_relationship(Relationship {
-        source: EntityId::new("alice".to_string()),
-        target: EntityId::new("bob".to_string()),
-        relation_type: "knows".to_string(),
-        confidence: 1.0,
-        context: vec![],
-    })?;
+    graph.add_relationship(Relationship::new(
+        EntityId::new("alice".to_string()),
+        EntityId::new("bob".to_string()),
+        "knows".to_string(),
+        1.0,
+    ))?;
 
-    graph.add_relationship(Relationship {
-        source: EntityId::new("bob".to_string()),
-        target: EntityId::new("charlie".to_string()),
-        relation_type: "knows".to_string(),
-        confidence: 1.0,
-        context: vec![],
-    })?;
+    graph.add_relationship(Relationship::new(
+        EntityId::new("bob".to_string()),
+        EntityId::new("charlie".to_string()),
+        "knows".to_string(),
+        1.0,
+    ))?;
 
     println!(
         "\nGraph: {} entities, {} relationships",
@@ -154,14 +150,12 @@ fn demo_query_optimization() -> Result<()> {
             1 => "organization",
             _ => "location",
         };
-        graph.add_entity(Entity {
-            id: EntityId::new(format!("e{}", i)),
-            name: format!("Entity {}", i),
-            entity_type: etype.to_string(),
-            confidence: 0.9,
-            mentions: vec![],
-            embedding: None,
-        })?;
+        graph.add_entity(Entity::new(
+            EntityId::new(format!("e{}", i)),
+            format!("Entity {}", i),
+            etype.to_string(),
+            0.9,
+        ))?;
     }
 
     let stats = GraphStatistics::from_graph(&graph);

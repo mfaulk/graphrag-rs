@@ -104,13 +104,12 @@ fn main() -> graphrag_core::Result<()> {
     ];
 
     for (src, tgt, rel_type, confidence) in relationships {
-        let rel = Relationship {
-            source: EntityId::new(src.to_string()),
-            target: EntityId::new(tgt.to_string()),
-            relation_type: rel_type.to_string(),
+        let rel = Relationship::new(
+            EntityId::new(src.to_string()),
+            EntityId::new(tgt.to_string()),
+            rel_type.to_string(),
             confidence,
-            context: Vec::new(),
-        };
+        );
         println!("  + {} --[{}]--> {}", src, rel_type, tgt);
         graph.add_relationship(rel)?;
     }
