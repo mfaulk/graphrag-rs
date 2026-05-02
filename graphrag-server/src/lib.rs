@@ -4,10 +4,12 @@
 
 pub mod distributed_cache;
 pub mod embeddings;
-pub mod lancedb_store;
 pub mod multi_model_embeddings;
 pub mod observability;
 pub mod qdrant_store;
+
+#[cfg(feature = "lancedb")]
+pub mod lancedb_store;
 
 #[cfg(feature = "auth")]
 pub mod auth;
@@ -15,6 +17,7 @@ pub mod auth;
 // Re-export common types
 pub use qdrant_store::{QdrantError, QdrantStore};
 
+#[cfg(feature = "lancedb")]
 pub use lancedb_store::{LanceDBError, LanceDBStore};
 
 // Re-export shared types (they're identical between stores)
