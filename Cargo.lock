@@ -4054,6 +4054,7 @@ dependencies = [
  "graphrag-core",
  "jsonwebtoken",
  "lancedb",
+ "lru",
  "ollama-rs",
  "parking_lot",
  "qdrant-client",
