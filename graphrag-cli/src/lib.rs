@@ -182,9 +182,7 @@ pub async fn run() -> Result<()> {
                 config.display()
             );
 
-            let handler = handlers::graphrag::GraphRAGHandler::new();
-            let cfg = load_config_from_file(&config).await?;
-            handler.initialize(cfg).await?;
+            let _handler = init_handler(Some(config.clone())).await?;
 
             if cli.format == "json" {
                 println!(
@@ -202,10 +200,7 @@ pub async fn run() -> Result<()> {
                 document.display()
             );
 
-            let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = resolve_config_path(config);
-            let cfg = load_config_from_file(&config_path).await?;
-            handler.initialize(cfg).await?;
+            let handler = init_handler(config).await?;
             let result = handler.load_document_with_options(&document, false).await?;
 
             if cli.format == "json" {
@@ -224,11 +219,7 @@ pub async fn run() -> Result<()> {
                 query
             );
 
-            let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = resolve_config_path(config);
-            let cfg = load_config_from_file(&config_path).await?;
-            handler.initialize(cfg).await?;
-
+            let handler = init_handler(config).await?;
             let (answer, raw_results) = handler.query_with_raw(&query).await?;
 
             if cli.format == "json" {
@@ -251,10 +242,7 @@ pub async fn run() -> Result<()> {
             setup_logging(cli.debug)?;
             eprintln!("⚠️  `entities` is deprecated. Prefer: graphrag tui, then /entities");
 
-            let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = resolve_config_path(config);
-            let cfg = load_config_from_file(&config_path).await?;
-            handler.initialize(cfg).await?;
+            let handler = init_handler(config).await?;
             let entities = handler.get_entities(filter.as_deref()).await?;
 
             if cli.format == "json" {
@@ -277,10 +265,7 @@ pub async fn run() -> Result<()> {
             setup_logging(cli.debug)?;
             eprintln!("⚠️  `stats` is deprecated. Prefer: graphrag tui, then /stats");
 
-            let handler = handlers::graphrag::GraphRAGHandler::new();
-            let config_path = resolve_config_path(config);
-            let cfg = load_config_from_file(&config_path).await?;
-            handler.initialize(cfg).await?;
+            let handler = init_handler(config).await?;
 
             if let Some(stats) = handler.get_stats().await {
                 if cli.format == "json" {
@@ -342,6 +327,18 @@ async fn load_config_from_file(path: &std::path::Path) -> Result<graphrag_core::
     config::load_config(path).await
 }
 
+/// Construct, configure, and initialize a `GraphRAGHandler` for one-shot
+/// (deprecated) subcommands. Centralizes the per-subcommand boilerplate so
+/// future fixes (e.g. additional pre-flight checks) land everywhere at once
+/// instead of needing five identical edits. Closes the duplication side of #58.
+async fn init_handler(config: Option<PathBuf>) -> Result<handlers::graphrag::GraphRAGHandler> {
+    let handler = handlers::graphrag::GraphRAGHandler::new();
+    let config_path = resolve_config_path(config);
+    let cfg = load_config_from_file(&config_path).await?;
+    handler.initialize(cfg).await?;
+    Ok(handler)
+}
+
 /// Resolve the CLI `--config` argument to a concrete path, defaulting to
 /// `./graphrag.toml` if the user didn't pass one.
 ///
@@ -372,7 +369,11 @@ fn run_validate(config_file: &std::path::Path, format: &str) -> Result<()> {
         } else {
             println!("❌ File not found: {}", config_file.display());
         }
-        return Ok(());
+        // Exit non-zero so CI / Makefile callers see the failure (#59).
+        return Err(color_eyre::eyre::eyre!(
+            "Config file not found: {}",
+            config_file.display()
+        ));
     }
 
     let fmt = match detect_config_format(config_file) {
@@ -386,7 +387,9 @@ fn run_validate(config_file: &std::path::Path, format: &str) -> Result<()> {
             } else {
                 println!("❌ Unsupported file format. Use .toml, .json, or .json5");
             }
-            return Ok(());
+            return Err(color_eyre::eyre::eyre!(
+                "Unsupported config file format (use .toml/.json/.json5)"
+            ));
         },
     };
 
@@ -444,6 +447,7 @@ fn run_validate(config_file: &std::path::Path, format: &str) -> Result<()> {
             } else {
                 println!("❌ Invalid configuration:\n   {}", err);
             }
+            return Err(color_eyre::eyre::eyre!("Invalid configuration: {}", err));
         },
     }
 
@@ -520,6 +524,7 @@ async fn handle_workspace_commands(action: WorkspaceCommands) -> Result<()> {
             Err(e) => {
                 eprintln!("❌ Error loading workspace: {}", e);
                 eprintln!("\nList available workspaces with: graphrag workspace list");
+                return Err(color_eyre::eyre::eyre!("Workspace not found: {}", e));
             },
         },
         WorkspaceCommands::Delete { id } => {
@@ -878,4 +883,52 @@ fn setup_tui_logging() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // run_validate must propagate failure as Err so the process exits non-zero
+    // for CI / Makefile callers (regression for #59).
+    #[test]
+    fn run_validate_returns_err_for_missing_file() {
+        let nonexistent = std::path::PathBuf::from("/tmp/this-does-not-exist-graphrag-test.toml");
+        let result = run_validate(&nonexistent, "text");
+        assert!(
+            result.is_err(),
+            "missing config file must produce a non-zero exit, got Ok"
+        );
+    }
+
+    // An unsupported file extension is also an error condition.
+    #[test]
+    fn run_validate_returns_err_for_unsupported_extension() {
+        let tmp_dir = std::env::temp_dir();
+        let unsupported_path = tmp_dir.join("graphrag-validate-unsupported.xyz");
+        std::fs::write(&unsupported_path, "irrelevant").unwrap();
+
+        let result = run_validate(&unsupported_path, "text");
+        let _ = std::fs::remove_file(&unsupported_path);
+        assert!(
+            result.is_err(),
+            "unsupported file extension must produce non-zero exit"
+        );
+    }
+
+    // A syntactically broken TOML file must surface as Err. Pre-fix this would
+    // return Ok(()) after println — a hard regression for CI usage.
+    #[test]
+    fn run_validate_returns_err_for_invalid_toml_content() {
+        let tmp_dir = std::env::temp_dir();
+        let bad_toml = tmp_dir.join("graphrag-validate-bad.toml");
+        std::fs::write(&bad_toml, "{ this is not valid toml").unwrap();
+
+        let result = run_validate(&bad_toml, "text");
+        let _ = std::fs::remove_file(&bad_toml);
+        assert!(
+            result.is_err(),
+            "invalid TOML must produce a non-zero exit, got Ok"
+        );
+    }
 }
