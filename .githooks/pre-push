@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the same blocking checks as CI before letting a push out.
+#
+# Mirrors the two CI jobs that block PR merges:
+#   - Rustfmt:    cargo fmt --all -- --check
+#   - Build & Test (build step only): cargo build --workspace
+#                  excluding graphrag_py (pyo3) and graphrag-wasm (advisory)
+#
+# Tests are intentionally NOT run here — the full nextest suite is too slow
+# for every push. CI runs them. Run them locally before opening a PR with:
+#   cargo nextest run --workspace --tests --exclude graphrag_py --exclude graphrag-wasm
+#
+# Bypass once with:  SKIP_PREPUSH=1 git push
+# (Use sparingly; CI will still run the same checks.)
+#
+# Install:  git config core.hooksPath .githooks
+
+set -euo pipefail
+
+if [[ "${SKIP_PREPUSH:-0}" == "1" ]]; then
+    echo "[pre-push] SKIP_PREPUSH=1 — bypassing checks"
+    exit 0
+fi
+
+repo_root=$(git rev-parse --show-toplevel)
+cd "$repo_root"
+
+red()   { printf '\033[0;31m%s\033[0m\n' "$1"; }
+green() { printf '\033[0;32m%s\033[0m\n' "$1"; }
+dim()   { printf '\033[2m%s\033[0m\n'   "$1"; }
+
+dim "[pre-push] cargo fmt --all -- --check"
+if ! cargo fmt --all -- --check; then
+    echo
+    red "[pre-push] FAIL: rustfmt diffs above."
+    echo "Run 'cargo fmt --all' and amend or re-commit, then push again."
+    echo "(To bypass: SKIP_PREPUSH=1 git push)"
+    exit 1
+fi
+green "[pre-push] fmt OK"
+
+dim "[pre-push] cargo build --workspace --exclude graphrag_py --exclude graphrag-wasm"
+if ! cargo build --workspace --exclude graphrag_py --exclude graphrag-wasm --quiet; then
+    echo
+    red "[pre-push] FAIL: build errors above."
+    echo "Fix the errors before pushing."
+    echo "(To bypass: SKIP_PREPUSH=1 git push)"
+    exit 1
+fi
+green "[pre-push] build OK"
+
+echo
+green "[pre-push] all checks passed"

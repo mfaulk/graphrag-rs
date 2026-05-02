@@ -970,6 +970,9 @@ We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guid
 git clone https://github.com/your-username/graphrag-rs.git
 cd graphrag-rs
 
+# One-time: enable the shared pre-push hook (mirrors CI's blocking checks)
+git config core.hooksPath .githooks
+
 # Run tests
 cargo test
 
@@ -980,6 +983,11 @@ RUST_LOG=debug cargo run
 cargo clippy
 cargo fmt --check
 ```
+
+The `.githooks/pre-push` hook runs `cargo fmt --check` and a workspace
+build before each `git push`, so CI-blocking failures are caught
+locally. To skip the hook for a single push (e.g. WIP branches):
+`SKIP_PREPUSH=1 git push`.
 
 ## FAQ
 
