@@ -76,6 +76,7 @@ pub struct HasLlm;
 /// # }
 /// ```
 #[derive(Debug)]
+#[must_use = "TypedBuilder methods return a new builder by value; bind it or chain into .build()"]
 pub struct TypedBuilder<Output = NoOutput, Llm = NoLlm> {
     config: Config,
     _output: PhantomData<Output>,
@@ -278,6 +279,7 @@ impl TypedBuilder<HasOutput, HasLlm> {
 ///
 /// Provides a fluent API for configuring GraphRAG with various options.
 #[derive(Debug, Clone)]
+#[must_use = "GraphRAGBuilder methods return a new builder by value; bind it or chain into .build()"]
 pub struct GraphRAGBuilder {
     config: Config,
 }
