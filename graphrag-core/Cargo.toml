@@ -22,10 +22,26 @@ default = [
 # FEATURE BUNDLES - Simplified feature selection for common use cases
 # =============================================================================
 # Use these bundles instead of manually selecting individual features:
+#   cargo add graphrag-core --features minimal    # Smallest dep tree (custom backends)
 #   cargo add graphrag-core --features starter    # Quick start for new users
 #   cargo add graphrag-core --features full       # Production-ready setup
 #   cargo add graphrag-core --features wasm       # Browser/WASM deployment
 #   cargo add graphrag-core --features research   # Advanced research features
+#
+# Heavy transitive deps live behind opt-in features:
+#   persistent-storage / lancedb -> arrow + parquet (~25 crates, slow build)
+#   gliner                       -> gline-rs + ort + onnx (~40 crates, slow build)
+#   neural-embeddings / huggingface-hub -> candle + hf-hub (~50 crates, slow build)
+#   research / rograg            -> heavy CPU-side analytics deps
+# Stick to `minimal` or `starter` if you only need GraphRAG types + a custom
+# chat backend.
+
+## Minimal Bundle - Smallest dep tree for downstream crates with custom backends
+## Includes: async runtime, in-memory graph store, basic retrieval — nothing else
+## Best for: consumer crates that only want the GraphRAG type, Config,
+##           KnowledgeGraph, and ChatBackend trait. No HTTP client, no Ollama,
+##           no parallel processing, no parquet/arrow/gliner/candle.
+minimal = ["async", "memory-storage", "basic-retrieval"]
 
 ## Starter Bundle - Minimal setup for getting started quickly
 ## Includes: async runtime, Ollama LLM, memory storage, basic retrieval

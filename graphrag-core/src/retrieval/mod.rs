@@ -810,35 +810,36 @@ impl RetrievalSystem {
         Ok(())
     }
 
-    /// Parallel batch query processing with optimized workload distribution
-    /// Batch process multiple queries efficiently
+    /// Batch process multiple queries efficiently.
+    ///
+    /// With the `parallel-processing` feature, dispatches via the configured
+    /// `ParallelProcessor`. Without it, falls back to a plain sequential
+    /// hybrid-query loop.
     pub async fn batch_query(
         &mut self,
         queries: &[&str],
         graph: &KnowledgeGraph,
     ) -> Result<Vec<Vec<SearchResult>>> {
-        let processor =
-            self.parallel_processor
-                .as_ref()
-                .ok_or_else(|| crate::core::GraphRAGError::Config {
-                    message: "Parallel processor not initialized".to_string(),
-                })?;
-
-        if !processor.should_use_parallel(queries.len()) {
-            // Use sequential processing for small batches
-            let mut results = Vec::new();
-            for &query in queries {
-                results.push(self.hybrid_query(query, graph).await?);
-            }
-            return Ok(results);
-        }
-
         #[cfg(feature = "parallel-processing")]
         {
-            // For parallel query processing, we need to work around the borrowing limitations
-            // of the embedding generator. We'll use enhanced sequential processing with
-            // better monitoring and chunking for now.
+            let processor = self.parallel_processor.as_ref().ok_or_else(|| {
+                crate::core::GraphRAGError::Config {
+                    message: "Parallel processor not initialized".to_string(),
+                }
+            })?;
 
+            if !processor.should_use_parallel(queries.len()) {
+                // Use sequential processing for small batches
+                let mut results = Vec::new();
+                for &query in queries {
+                    results.push(self.hybrid_query(query, graph).await?);
+                }
+                return Ok(results);
+            }
+
+            // For parallel query processing, we need to work around the borrowing
+            // limitations of the embedding generator. We use enhanced sequential
+            // processing with better monitoring and chunking for now.
             let chunk_size = processor.config().chunk_batch_size.min(queries.len());
             tracing::debug!(
                 "Processing {} queries with enhanced sequential approach (chunk size: {})",
