@@ -380,8 +380,8 @@ impl InferenceEngine {
         if let Some(pattern_pos) = content.find(pattern) {
             let start = pattern_pos.saturating_sub(100); // 100 chars before
             let end = (pattern_pos + pattern.len() + 100).min(content.len()); // 100 chars after
-            // pos.saturating_sub(N) and (pos + len + N) are not guaranteed
-            // to land on UTF-8 char boundaries; clamp them.
+                                                                              // pos.saturating_sub(N) and (pos + len + N) are not guaranteed
+                                                                              // to land on UTF-8 char boundaries; clamp them.
             let context = crate::util::text_safe::slice_on_char_boundary(content, start, end);
 
             context.contains(entity_a) && context.contains(entity_b)

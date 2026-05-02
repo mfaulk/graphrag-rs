@@ -251,9 +251,7 @@ fn validate_pagination(page: usize, page_size: usize) -> Result<(), AppError> {
         return Err(AppError::BadRequest("page must be >= 1".to_string()));
     }
     if page_size == 0 {
-        return Err(AppError::BadRequest(
-            "page_size must be >= 1".to_string(),
-        ));
+        return Err(AppError::BadRequest("page_size must be >= 1".to_string()));
     }
     Ok(())
 }
@@ -286,7 +284,10 @@ pub async fn list_entities(
             .collect();
 
         let total = entities.len();
-        let start = params.page.saturating_sub(1).saturating_mul(params.page_size);
+        let start = params
+            .page
+            .saturating_sub(1)
+            .saturating_mul(params.page_size);
         entities = entities
             .into_iter()
             .skip(start)
