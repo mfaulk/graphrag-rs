@@ -1,37 +1,4 @@
-//! OpenTelemetry Observability
-//!
-//! This module provides comprehensive observability for GraphRAG using OpenTelemetry.
-//! It includes:
-//! - Distributed tracing with Jaeger
-//! - Metrics with Prometheus
-//! - Custom business metrics
-//! - Performance profiling
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────┐
-//! │       GraphRAG Application          │
-//! │                                     │
-//! │  ┌──────────────────────────────┐   │
-//! │  │  Instrumented Code          │   │
-//! │  │  - Spans for operations     │   │
-//! │  │  - Metrics counters/gauges  │   │
-//! │  └──────────┬───────────────────┘   │
-//! └─────────────┼─────────────────────── │
-//!               │
-//!    ┌──────────▼──────────┐
-//!    │  OpenTelemetry SDK  │
-//!    └──────────┬──────────┘
-//!               │
-//!     ┌─────────┴─────────┐
-//!     │                   │
-//!     ▼                   ▼
-//! ┌────────┐         ┌──────────┐
-//! │ Jaeger │         │Prometheus│
-//! │(Traces)│         │(Metrics) │
-//! └────────┘         └──────────┘
-//! ```
+//! OpenTelemetry instrumentation: distributed tracing (Jaeger) and metrics (Prometheus).
 
 use parking_lot::RwLock;
 use std::collections::HashMap;

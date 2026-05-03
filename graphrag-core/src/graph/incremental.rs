@@ -1,25 +1,4 @@
-//! Comprehensive incremental updates architecture for GraphRAG-RS
-//!
-//! This module provides zero-downtime incremental updates with ACID-like guarantees,
-//! intelligent cache invalidation, conflict resolution, and comprehensive monitoring.
-//!
-//! ## Architecture Goals
-//!
-//! - **Zero-downtime updates**: System remains available during modifications
-//! - **Consistency guarantees**: ACID-like properties for graph operations
-//! - **Performance**: Updates should be 10x+ faster than full reconstruction
-//! - **Scalability**: Handle thousands of concurrent updates per second
-//! - **Observability**: Complete audit trail of all changes
-//!
-//! ## Key Components
-//!
-//! - `IncrementalGraphStore` trait for atomic update operations
-//! - `ChangeRecord` and `ChangeLog` for tracking modifications
-//! - `GraphDelta` for representing atomic change sets
-//! - `ConflictResolver` for handling concurrent modifications
-//! - `SelectiveInvalidation` for cache management
-//! - `UpdateMonitor` for change tracking and metrics
-//! - `IncrementalPageRank` for efficient graph algorithm updates
+//! Incremental graph updates: change tracking, conflict resolution, and selective cache invalidation.
 
 use crate::core::{
     DocumentId, Entity, EntityId, GraphRAGError, KnowledgeGraph, Relationship, Result, TextChunk,

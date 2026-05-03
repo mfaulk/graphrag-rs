@@ -1,7 +1,4 @@
-//! Query validation and verification for ROGRAG system
-//!
-//! Provides comprehensive validation of queries and responses to ensure
-//! quality, safety, and appropriateness.
+//! Query and response validation for the ROGRAG pipeline.
 
 #[cfg(feature = "rograg")]
 use crate::rograg::RogragResponse;

@@ -1,7 +1,4 @@
-//! Real extractive summarization with sentence ranking
-//!
-//! This module implements actual sentence ranking algorithms for extractive
-//! summarization, not mock/placeholder implementations.
+//! Extractive summarization via sentence scoring.
 
 use std::collections::{HashMap, HashSet};
 

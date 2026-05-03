@@ -29,6 +29,7 @@ pub async fn health_check() -> impl IntoResponse {
     }))
 }
 
+/// JSON body for `POST /query`.
 #[derive(Deserialize)]
 pub struct QueryRequest {
     pub query: String,
@@ -36,6 +37,7 @@ pub struct QueryRequest {
     pub options: QueryOptions,
 }
 
+/// Per-request retrieval flags.
 #[derive(Deserialize, Default)]
 pub struct QueryOptions {
     #[serde(default = "default_limit")]
@@ -52,6 +54,7 @@ fn default_limit() -> usize {
     10
 }
 
+/// JSON body returned by `POST /query`.
 #[derive(Serialize)]
 pub struct QueryResponse {
     pub answer: Vec<String>,
@@ -62,12 +65,14 @@ pub struct QueryResponse {
     pub metadata: ResponseMetadata,
 }
 
+/// Timing and usage stats attached to every query response.
 #[derive(Serialize)]
 pub struct ResponseMetadata {
     pub query_time_ms: u64,
     pub tokens_used: usize,
 }
 
+/// Handler for `POST /query`.
 pub async fn handle_query(
     State(state): State<AppState>,
     Json(req): Json<QueryRequest>,
@@ -100,6 +105,7 @@ pub async fn handle_query(
     Ok(Json(response))
 }
 
+/// JSON body for `POST /documents`.
 #[derive(Deserialize)]
 pub struct DocumentRequest {
     pub id: String,
@@ -108,6 +114,7 @@ pub struct DocumentRequest {
     pub metadata: HashMap<String, String>,
 }
 
+/// Handler for `POST /documents`.
 pub async fn add_document(
     State(state): State<AppState>,
     Json(req): Json<DocumentRequest>,
@@ -133,6 +140,7 @@ pub async fn add_document(
     })))
 }
 
+/// Handler for `GET /documents/:id`.
 pub async fn get_document(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -153,6 +161,7 @@ pub async fn get_document(
     Err(AppError::NotFound(format!("Document not found: {}", id)))
 }
 
+/// Handler for `GET /graph/stats`.
 pub async fn graph_stats(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -178,6 +187,7 @@ pub async fn graph_stats(
     }
 }
 
+/// Handler for `GET /graph/export` — returns nodes and edges in JSON.
 pub async fn export_graph(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -225,6 +235,7 @@ pub async fn export_graph(
     }
 }
 
+/// Query string for `GET /entities`.
 #[derive(Deserialize)]
 pub struct ListEntitiesQuery {
     #[serde(default = "default_page")]
@@ -256,6 +267,7 @@ fn validate_pagination(page: usize, page_size: usize) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Handler for `GET /entities` with pagination.
 pub async fn list_entities(
     State(state): State<AppState>,
     Query(params): Query<ListEntitiesQuery>,
@@ -312,6 +324,7 @@ pub async fn list_entities(
     }
 }
 
+/// Handler for `GET /metrics` — session and graph counters.
 pub async fn get_metrics(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, AppError> {
@@ -337,6 +350,7 @@ pub async fn get_metrics(
 
 // === Error Handling ===
 
+/// HTTP error type returned by API handlers; converted to a JSON error response by `IntoResponse`.
 #[derive(Debug)]
 pub enum AppError {
     GraphRAG(GraphRAGError),

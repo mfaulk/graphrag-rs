@@ -1,7 +1,4 @@
-//! Streaming response generation for ROGRAG system
-//!
-//! Provides robust response generation with streaming capabilities
-//! to improve user experience and system resilience.
+//! Streaming response generation for ROGRAG.
 
 #[cfg(feature = "rograg")]
 use crate::rograg::{

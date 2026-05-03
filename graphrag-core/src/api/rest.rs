@@ -138,12 +138,14 @@ pub mod client {
     use crate::{GraphRAGError, Result};
     use serde::{Deserialize, Serialize};
 
+    /// Blocking HTTP client for a GraphRAG REST server.
     pub struct ApiClient {
         base_url: String,
         client: ureq::Agent,
     }
 
     impl ApiClient {
+        /// Build a client targeting the given base URL (e.g. `http://localhost:8080`).
         pub fn new(base_url: impl Into<String>) -> Self {
             Self {
                 base_url: base_url.into(),
@@ -151,6 +153,7 @@ pub mod client {
             }
         }
 
+        /// POST a query and return the answer strings. Errors map to [`GraphRAGError`].
         pub fn query(&self, query: &str) -> Result<Vec<String>> {
             #[derive(Serialize)]
             struct Request {
@@ -177,6 +180,7 @@ pub mod client {
             Ok(response.results)
         }
 
+        /// GET `/health`; returns `true` on a 200 response.
         pub fn health_check(&self) -> Result<bool> {
             let response = self
                 .client

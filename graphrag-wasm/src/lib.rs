@@ -1,28 +1,8 @@
 //! # GraphRAG WASM
 //!
-//! WASM bindings for GraphRAG - enables 100% client-side knowledge graphs in the browser.
+//! Browser/WASM bindings for GraphRAG: builds and queries knowledge graphs client-side.
 //!
-//! ## Features
-//!
-//! - **Pure Rust Vector Search**: Native WASM cosine similarity search
-//! - **ONNX Runtime Web**: GPU-accelerated embeddings via WebGPU
-//! - **IndexedDB Storage**: Persistent graph data in browser
-//! - **Leptos 0.8 UI**: Reactive web components
-//!
-//! ## Quick Start
-//!
-//! ```javascript
-//! import init, { GraphRAG } from './graphrag_wasm.js';
-//!
-//! async function main() {
-//!   await init();
-//!   const graph = new GraphRAG(384);
-//!   await graph.add_document("doc1", "Your text here", embedding);
-//!   await graph.build_index();
-//!   const results = await graph.query(query_embedding, 5);
-//!   console.log(results);
-//! }
-//! ```
+//! See the README for JavaScript usage and feature flags.
 
 use std::collections::HashMap;
 use wasm_bindgen::prelude::*;

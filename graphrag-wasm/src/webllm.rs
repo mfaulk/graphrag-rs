@@ -1,32 +1,6 @@
-//! WebLLM Bindings for GPU-Accelerated LLM
+//! Rust bindings to [WebLLM](https://github.com/mlc-ai/web-llm), a WebGPU-accelerated LLM runtime for browsers.
 //!
-//! Provides Rust bindings to WebLLM (https://github.com/mlc-ai/web-llm),
-//! a production-ready WebGPU-accelerated LLM runtime for browsers.
-//!
-//! ## Performance
-//! - 40-62 tokens/second with WebGPU
-//! - Supports Llama 3, Phi-3, Gemma, Qwen models
-//! - Progressive model loading with cache
-//!
-//! ## Setup
-//!
-//! Add to your `index.html`:
-//!
-//! ```html
-//! <script type="module">
-//!   import * as webllm from "https://esm.run/@mlc-ai/web-llm";
-//!   window.webllm = webllm;
-//! </script>
-//! ```
-//!
-//! ## Usage
-//!
-//! ```rust
-//! let llm = WebLLM::new("Phi-3-mini-4k-instruct-q4f16_1-MLC").await?;
-//! let response = llm.chat("Hello!", |progress, text| {
-//!     console_log!("Loading: {}% - {}", progress * 100.0, text);
-//! }).await?;
-//! ```
+//! Setup and usage examples live in the WebLLM upstream docs and the crate README.
 
 use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;

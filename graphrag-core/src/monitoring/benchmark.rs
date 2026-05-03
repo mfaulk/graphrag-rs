@@ -1,10 +1,4 @@
-//! Benchmarking system for GraphRAG quality improvements
-//!
-//! This module provides comprehensive benchmarking tools to measure:
-//! - Accuracy improvements from new features
-//! - Token usage and cost reduction
-//! - Latency and throughput
-//! - Quality metrics (F1, Exact Match, BLEU)
+//! Query benchmarking and quality metrics: latency, token usage, F1, exact match, BLEU.
 
 use serde::{Deserialize, Serialize};
 use std::time::Instant;

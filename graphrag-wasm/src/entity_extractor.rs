@@ -7,6 +7,7 @@ use crate::webllm::{ChatMessage, WebLLM};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// One named entity recovered from text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Entity {
     pub name: String,
@@ -14,6 +15,7 @@ pub struct Entity {
     pub description: String,
 }
 
+/// Directed relationship between two entities.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Relationship {
     pub from: String,
@@ -21,6 +23,7 @@ pub struct Relationship {
     pub to: String,
 }
 
+/// Combined entity and relationship output of one extraction pass.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractionResult {
     pub entities: Vec<Entity>,
