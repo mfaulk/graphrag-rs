@@ -269,7 +269,7 @@ impl JinaLateChunkingClient {
         &self,
         chunks: &[TextChunk],
     ) -> crate::Result<Vec<Vec<f32>>> {
-        let inputs: Vec<&str> = chunks.iter().map(|c| c.content.as_str()).collect();
+        let inputs: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
 
         let body = serde_json::json!({
             "model": self.model,
@@ -277,22 +277,30 @@ impl JinaLateChunkingClient {
             "late_chunking": true,
         });
 
-        let agent = ureq::AgentBuilder::new().build();
-        let response = agent
-            .post(Self::ENDPOINT)
-            .set("Authorization", &format!("Bearer {}", self.api_key))
-            .set("Content-Type", "application/json")
-            .send_json(&body)
-            .map_err(|e| GraphRAGError::Generation {
-                message: format!("Jina API request failed: {e}"),
-            })?;
-
-        let json: serde_json::Value =
+        // `ureq` is synchronous; running it directly inside this `async fn`
+        // would park a tokio worker for the whole round-trip. Dispatch to the
+        // blocking pool (issue #4).
+        let api_key = self.api_key.clone();
+        let json = tokio::task::spawn_blocking(move || -> crate::Result<serde_json::Value> {
+            let agent = ureq::AgentBuilder::new().build();
+            let response = agent
+                .post(Self::ENDPOINT)
+                .set("Authorization", &format!("Bearer {}", api_key))
+                .set("Content-Type", "application/json")
+                .send_json(&body)
+                .map_err(|e| GraphRAGError::Generation {
+                    message: format!("Jina API request failed: {e}"),
+                })?;
             response
-                .into_json()
+                .into_json::<serde_json::Value>()
                 .map_err(|e| GraphRAGError::Generation {
                     message: format!("Failed to parse Jina API response: {e}"),
-                })?;
+                })
+        })
+        .await
+        .map_err(|e| GraphRAGError::Generation {
+            message: format!("HTTP worker task panicked or was cancelled: {e}"),
+        })??;
 
         let data = json["data"]
             .as_array()
