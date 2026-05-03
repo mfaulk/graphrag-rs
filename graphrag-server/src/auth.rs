@@ -39,7 +39,15 @@ pub struct Claims {
 }
 
 /// User roles for RBAC
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Ordering encodes the privilege hierarchy `Admin > User > Readonly >
+/// Guest`, so `actual >= minimum` is the canonical permission check
+/// (see `require_role`). `PartialOrd`/`Ord` are implemented manually
+/// instead of derived because the `#[derive]` order would put `Admin`
+/// at the bottom — and the variant declaration order is part of the
+/// public surface (it's also serialized via `#[serde(rename_all)]`,
+/// which we don't want to reshuffle just to satisfy a derive).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     /// Administrator with full access
@@ -50,6 +58,31 @@ pub enum UserRole {
     Readonly,
     /// Guest with limited access
     Guest,
+}
+
+impl UserRole {
+    /// Numeric privilege rank. Higher == more privileged. Used by
+    /// `PartialOrd`/`Ord` so callers can write `actual >= minimum`.
+    fn rank(self) -> u8 {
+        match self {
+            UserRole::Admin => 3,
+            UserRole::User => 2,
+            UserRole::Readonly => 1,
+            UserRole::Guest => 0,
+        }
+    }
+}
+
+impl PartialOrd for UserRole {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for UserRole {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
 }
 
 /// API key structure
@@ -349,21 +382,12 @@ pub async fn require_role(
     Next,
 ) -> futures::future::BoxFuture<'static, Result<Response, AuthError>> {
     move |Extension(user): axum::extract::Extension<AuthUser>, request: Request, next: Next| {
-        let minimum_role = minimum_role.clone();
+        let minimum_role = minimum_role;
         Box::pin(async move {
-            // Check role hierarchy: Admin > User > Readonly > Guest
-            let has_permission = match (&user.role, &minimum_role) {
-                (UserRole::Admin, _) => true,
-                (UserRole::User, UserRole::User) => true,
-                (UserRole::User, UserRole::Readonly) => true,
-                (UserRole::User, UserRole::Guest) => true,
-                (UserRole::Readonly, UserRole::Readonly) => true,
-                (UserRole::Readonly, UserRole::Guest) => true,
-                (UserRole::Guest, UserRole::Guest) => true,
-                _ => false,
-            };
-
-            if !has_permission {
+            // Hierarchy: Admin > User > Readonly > Guest. `UserRole`'s
+            // `Ord` impl encodes this directly, so the brittle 7-arm
+            // match with a `_ => false` catch-all (#46) is gone.
+            if user.role < minimum_role {
                 return Err(AuthError::InsufficientPermissions);
             }
 
@@ -421,6 +445,43 @@ mod tests {
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
         let result = unix_secs(t).expect("post-epoch time must succeed");
         assert_eq!(result, 1_700_000_000);
+    }
+
+    // Exhaustive role-hierarchy check (#46): every (actual, minimum) pair
+    // must satisfy `actual >= minimum` iff actual's privilege level is at
+    // least minimum's. Hierarchy: Admin > User > Readonly > Guest.
+    #[test]
+    fn user_role_ord_covers_every_pair() {
+        use UserRole::*;
+        let all = [Admin, User, Readonly, Guest];
+        // (actual, minimum, expected has_permission)
+        let cases: &[(UserRole, UserRole, bool)] = &[
+            (Admin, Admin, true),
+            (Admin, User, true),
+            (Admin, Readonly, true),
+            (Admin, Guest, true),
+            (User, Admin, false),
+            (User, User, true),
+            (User, Readonly, true),
+            (User, Guest, true),
+            (Readonly, Admin, false),
+            (Readonly, User, false),
+            (Readonly, Readonly, true),
+            (Readonly, Guest, true),
+            (Guest, Admin, false),
+            (Guest, User, false),
+            (Guest, Readonly, false),
+            (Guest, Guest, true),
+        ];
+        // Sanity: we covered every (actual, minimum) pair.
+        assert_eq!(cases.len(), all.len() * all.len());
+        for (actual, minimum, expected) in cases {
+            let got = actual >= minimum;
+            assert_eq!(
+                got, *expected,
+                "role hierarchy mismatch: actual={actual:?}, minimum={minimum:?}"
+            );
+        }
     }
 
     #[tokio::test]
