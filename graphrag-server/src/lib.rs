@@ -8,15 +8,18 @@ pub mod multi_model_embeddings;
 pub mod observability;
 pub mod qdrant_store;
 
+/// LanceDB vector store backend. Requires the `lancedb` feature.
 #[cfg(feature = "lancedb")]
 pub mod lancedb_store;
 
+/// JWT and API-key authentication middleware. Requires the `auth` feature.
 #[cfg(feature = "auth")]
 pub mod auth;
 
 // Re-export common types
 pub use qdrant_store::{QdrantError, QdrantStore};
 
+/// LanceDB store re-exports (requires the `lancedb` feature).
 #[cfg(feature = "lancedb")]
 pub use lancedb_store::{LanceDBError, LanceDBStore};
 
@@ -34,5 +37,6 @@ pub use multi_model_embeddings::{
     ModelRegistry, OpenAIProvider,
 };
 
+/// Auth re-exports (requires the `auth` feature).
 #[cfg(feature = "auth")]
 pub use auth::{AuthState, Claims};
