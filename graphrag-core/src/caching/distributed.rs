@@ -269,7 +269,16 @@ where
 /// Lock-free counters for `DistributedCache` get/put hot paths.
 ///
 /// Replaces the previous `RwLock<DistributedCacheStats>` so concurrent
-/// gets and puts no longer serialize on a write-lock to bump counters.
+/// gets and puts no longer serialize on a write-lock just to bump
+/// counters — counters are now plain atomics.
+///
+/// Scope note (post-merge review): this only removes the *stats* lock.
+/// L1 hits still serialize on `L1Cache::cache.write()` because the
+/// underlying `lru::LruCache` requires `&mut` to promote an entry to
+/// most-recently-used (see `L1Cache::get`). Eliminating that
+/// serialization is a separate follow-up — e.g., switching the L1
+/// backend to a concurrent LRU like `moka` — and is out of scope for
+/// this change.
 #[derive(Debug, Default)]
 struct AtomicCacheStats {
     l1_hits: AtomicU64,
