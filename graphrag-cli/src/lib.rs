@@ -462,7 +462,7 @@ async fn run_tui(config_path: Option<PathBuf>, workspace: Option<String>) -> Res
 }
 
 async fn handle_workspace_commands(action: WorkspaceCommands) -> Result<()> {
-    let workspace_manager = workspace::WorkspaceManager::new()?;
+    let workspace_manager = workspace::CliWorkspaceManager::new()?;
 
     match action {
         WorkspaceCommands::List => {
@@ -514,10 +514,12 @@ async fn handle_workspace_commands(action: WorkspaceCommands) -> Result<()> {
                     println!("  Config: {}", cfg.display());
                 }
 
-                let history_path = workspace_manager.query_history_path(&id);
-                if history_path.exists() {
-                    if let Ok(history) = query_history::QueryHistory::load(&history_path).await {
-                        println!("\n  Total queries: {}", history.total_queries());
+                if let Ok(history_path) = workspace_manager.query_history_path(&id) {
+                    if history_path.exists() {
+                        if let Ok(history) = query_history::QueryHistory::load(&history_path).await
+                        {
+                            println!("\n  Total queries: {}", history.total_queries());
+                        }
                     }
                 }
             },

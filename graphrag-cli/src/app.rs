@@ -8,7 +8,7 @@ use crate::{
     theme::Theme,
     tui::{Event, Tui},
     ui::{HelpOverlay, InfoPanel, QueryInput, RawResultsViewer, ResultsViewer, StatusBar},
-    workspace::{WorkspaceManager, WorkspaceMetadata},
+    workspace::{cli_workspaces_dir, CliWorkspaceManager, WorkspaceMetadata},
 };
 use chrono::Utc;
 use color_eyre::eyre::Result;
@@ -45,7 +45,7 @@ pub struct App {
     query_history: QueryHistory,
     /// Workspace manager
     #[allow(dead_code)]
-    workspace_manager: WorkspaceManager,
+    workspace_manager: CliWorkspaceManager,
     /// Current workspace metadata
     #[allow(dead_code)]
     workspace_metadata: Option<WorkspaceMetadata>,
@@ -65,7 +65,7 @@ impl App {
     pub fn new(config_path: Option<PathBuf>, _workspace: Option<String>) -> Result<Self> {
         let (action_tx, action_rx) = mpsc::unbounded_channel();
 
-        let workspace_manager = WorkspaceManager::new()?;
+        let workspace_manager = CliWorkspaceManager::new()?;
 
         Ok(Self {
             should_quit: false,
@@ -691,7 +691,14 @@ impl App {
         match SlashCommand::parse(&cmd_str) {
             Ok(cmd) => match cmd {
                 SlashCommand::Config(path) => {
-                    let expanded = FileOperations::expand_tilde(&path);
+                    let expanded = match FileOperations::expand_tilde(&path) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            self.action_tx
+                                .send(Action::SetStatus(StatusType::Error, format!("{}", e)))?;
+                            return Ok(());
+                        },
+                    };
                     self.action_tx.send(Action::LoadConfig(expanded))?;
                 },
                 SlashCommand::Load(path, rebuild) => {
@@ -785,7 +792,14 @@ impl App {
             return Ok(());
         }
 
-        let expanded = FileOperations::expand_tilde(&path);
+        let expanded = match FileOperations::expand_tilde(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.action_tx
+                    .send(Action::SetStatus(StatusType::Error, format!("{}", e)))?;
+                return Ok(());
+            },
+        };
 
         let progress_msg = if rebuild {
             format!("Loading document (rebuild): {}", expanded.display())
@@ -1010,19 +1024,38 @@ impl App {
             .add_query(entry.query, entry.duration_ms, entry.results_count);
     }
 
-    /// Resolve the per-platform XDG workspaces dir, surfacing a TUI error
-    /// instead of silently writing to `./workspaces` if the platform doesn't
-    /// expose a data dir. Returns `None` and emits a status error when the
-    /// caller should bail out (closes #60 on the workspace path).
+    /// Resolve the canonical workspaces dir, surfacing a TUI error instead
+    /// of silently falling back when the data dir can't be determined.
+    /// Routes through [`cli_workspaces_dir`] so the TUI's `/workspace ...`
+    /// commands and the `graphrag workspace ...` subcommands always look at
+    /// the same place (#52).
     fn resolve_workspace_dir(&self) -> Option<PathBuf> {
-        if let Some(base) = dirs::data_dir() {
-            Some(base.join("graphrag").join("workspaces"))
-        } else {
-            let _ = self.action_tx.send(Action::SetStatus(
-                StatusType::Error,
-                "Cannot determine data directory; set $XDG_DATA_HOME".to_string(),
-            ));
-            None
+        match cli_workspaces_dir() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                let _ = self
+                    .action_tx
+                    .send(Action::SetStatus(StatusType::Error, format!("{}", e)));
+                None
+            },
+        }
+    }
+
+    /// Resolve the canonical workspaces dir as a UTF-8 string for handlers
+    /// that take `&str` paths. Returns `None` (and emits a status error)
+    /// when the path is non-UTF-8 or the data dir can't be determined.
+    /// Closes the `to_str().unwrap()` panic in #55.
+    fn resolve_workspace_dir_str(&self) -> Option<String> {
+        let dir = self.resolve_workspace_dir()?;
+        match dir.to_str() {
+            Some(s) => Some(s.to_string()),
+            None => {
+                let _ = self.action_tx.send(Action::SetStatus(
+                    StatusType::Error,
+                    format!("Workspace directory is not valid UTF-8: {}", dir.display()),
+                ));
+                None
+            },
         }
     }
 
@@ -1041,16 +1074,12 @@ impl App {
             name
         )))?;
 
-        let workspace_dir = match self.resolve_workspace_dir() {
+        let workspace_dir = match self.resolve_workspace_dir_str() {
             Some(p) => p,
             None => return Ok(()),
         };
 
-        match self
-            .graphrag
-            .load_workspace(workspace_dir.to_str().unwrap(), &name)
-            .await
-        {
+        match self.graphrag.load_workspace(&workspace_dir, &name).await {
             Ok(message) => {
                 self.action_tx.send(Action::StopProgress)?;
 
@@ -1086,16 +1115,12 @@ impl App {
 
     /// Handle listing workspaces
     async fn handle_list_workspaces(&mut self) -> Result<()> {
-        let workspace_dir = match self.resolve_workspace_dir() {
+        let workspace_dir = match self.resolve_workspace_dir_str() {
             Some(p) => p,
             None => return Ok(()),
         };
 
-        match self
-            .graphrag
-            .list_workspaces(workspace_dir.to_str().unwrap())
-            .await
-        {
+        match self.graphrag.list_workspaces(&workspace_dir).await {
             Ok(list_output) => {
                 self.results_viewer
                     .set_content(list_output.lines().map(|s| s.to_string()).collect());
@@ -1130,16 +1155,12 @@ impl App {
             name
         )))?;
 
-        let workspace_dir = match self.resolve_workspace_dir() {
+        let workspace_dir = match self.resolve_workspace_dir_str() {
             Some(p) => p,
             None => return Ok(()),
         };
 
-        match self
-            .graphrag
-            .save_workspace(workspace_dir.to_str().unwrap(), &name)
-            .await
-        {
+        match self.graphrag.save_workspace(&workspace_dir, &name).await {
             Ok(message) => {
                 self.action_tx.send(Action::StopProgress)?;
 
@@ -1150,7 +1171,7 @@ impl App {
                     String::new(),
                     message,
                     String::new(),
-                    format!("Workspace location: {}", workspace_dir.display()),
+                    format!("Workspace location: {}", workspace_dir),
                     String::new(),
                     "You can load this workspace later with:".to_string(),
                     format!("  /workspace {}", name),
@@ -1180,16 +1201,12 @@ impl App {
             name
         )))?;
 
-        let workspace_dir = match self.resolve_workspace_dir() {
+        let workspace_dir = match self.resolve_workspace_dir_str() {
             Some(p) => p,
             None => return Ok(()),
         };
 
-        match self
-            .graphrag
-            .delete_workspace(workspace_dir.to_str().unwrap(), &name)
-            .await
-        {
+        match self.graphrag.delete_workspace(&workspace_dir, &name).await {
             Ok(message) => {
                 self.action_tx.send(Action::StopProgress)?;
 
@@ -1278,7 +1295,14 @@ impl App {
             ));
         }
 
-        let expanded = FileOperations::expand_tilde(&path);
+        let expanded = match FileOperations::expand_tilde(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.action_tx
+                    .send(Action::SetStatus(StatusType::Error, format!("{}", e)))?;
+                return Ok(());
+            },
+        };
         match tokio::fs::write(&expanded, md.as_bytes()).await {
             Ok(()) => {
                 let msg = format!(
