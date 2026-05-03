@@ -199,10 +199,11 @@ impl HierarchicalChunker {
             let bytes = bpe._decode_native(slice);
             let decoded = String::from_utf8_lossy(&bytes).into_owned();
             let token_count = slice.len();
-            if token_count >= self.min_chunk_size || end >= tokens.len() {
-                if !decoded.trim().is_empty() {
-                    chunks.push(decoded);
-                }
+            // Apply `min_chunk_size` strictly, matching char-mode semantics.
+            // The trailing window is dropped if it falls below the threshold
+            // rather than emitted unconditionally.
+            if token_count >= self.min_chunk_size && !decoded.trim().is_empty() {
+                chunks.push(decoded);
             }
 
             if end >= tokens.len() {
@@ -564,6 +565,39 @@ mod tests {
             "too many U+FFFD replacements ({}) across {} chunks: {:?}",
             total_replacements,
             chunks.len(),
+            chunks
+        );
+    }
+
+    /// Token mode drops a trailing window whose token count is below
+    /// `min_chunk_size`, matching the strict filter applied in char mode.
+    #[test]
+    fn chunk_text_with_token_mode_drops_undersized_final_window() {
+        // Build text with a known token count (15 tokens) and configure
+        // chunk_size=10, overlap=2, min_chunk_size=8. Stride=8, so windows
+        // start at token offsets 0 and 8. Window 0 spans tokens [0..10]
+        // (10 tokens, kept). Window 1 spans tokens [8..15] (7 tokens,
+        // below min_chunk_size and must be dropped).
+        let bpe = cl100k_base().unwrap();
+        // "word ".repeat(14) encodes to exactly 15 cl100k_base tokens (one
+        // per occurrence plus a trailing-space token).
+        let raw = "word ".repeat(14);
+        let token_count = bpe.encode_ordinary(&raw).len();
+        assert_eq!(
+            token_count, 15,
+            "fixture must encode to exactly 15 tokens; got {}",
+            token_count
+        );
+
+        let chunker = HierarchicalChunker::new()
+            .with_mode(ChunkingMode::Tokens)
+            .with_min_size(8);
+        let chunks = chunker.chunk_text(&raw, 10, 2);
+
+        assert_eq!(
+            chunks.len(),
+            1,
+            "expected the 7-token trailing window to be dropped under min_chunk_size=8; got {:?}",
             chunks
         );
     }
