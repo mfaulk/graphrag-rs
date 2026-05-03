@@ -425,15 +425,14 @@ impl ParquetPersistence {
                     None
                 };
 
-                let entity = Entity {
-                    id: EntityId::new(ids.value(i).to_string()),
-                    name: names.value(i).to_string(),
-                    entity_type: types.value(i).to_string(),
-                    confidence: confidences.value(i),
-                    mentions: Vec::new(), // Will be populated later if needed
-                    embedding,
-                };
-
+                let mut entity = Entity::new(
+                    EntityId::new(ids.value(i).to_string()),
+                    names.value(i).to_string(),
+                    types.value(i).to_string(),
+                    confidences.value(i),
+                );
+                entity.embedding = embedding;
+                // mentions are not yet persisted (see issue #24).
                 entities.push(entity);
             }
         }
@@ -627,13 +626,13 @@ impl ParquetPersistence {
                     }
                 }
 
-                let relationship = Relationship {
-                    source: EntityId::new(sources.value(i).to_string()),
-                    target: EntityId::new(targets.value(i).to_string()),
-                    relation_type: types.value(i).to_string(),
-                    confidence: confidences.value(i),
-                    context,
-                };
+                let relationship = Relationship::new(
+                    EntityId::new(sources.value(i).to_string()),
+                    EntityId::new(targets.value(i).to_string()),
+                    types.value(i).to_string(),
+                    confidences.value(i),
+                )
+                .with_context(context);
 
                 relationships.push(relationship);
             }
