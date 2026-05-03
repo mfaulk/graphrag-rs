@@ -68,6 +68,11 @@ pub struct AsyncGraphRAG {
     document_trees: Arc<RwLock<HashMap<DocumentId, DocumentTree>>>,
     hierarchical_config: HierarchicalConfig,
     language_model: Option<Arc<BoxedAsyncLanguageModel>>,
+    /// Test-only hooks for observing/perturbing entity extraction. None in
+    /// release builds; tests opt-in per-instance to avoid cross-test pollution
+    /// that a `static` would cause when `cargo test` runs concurrently.
+    #[cfg(test)]
+    test_hooks: Option<Arc<tests::ExtractionHooks>>,
 }
 
 impl AsyncGraphRAG {
@@ -80,6 +85,8 @@ impl AsyncGraphRAG {
             document_trees: Arc::new(RwLock::new(HashMap::new())),
             hierarchical_config,
             language_model: None,
+            #[cfg(test)]
+            test_hooks: None,
         })
     }
 
@@ -94,6 +101,8 @@ impl AsyncGraphRAG {
             document_trees: Arc::new(RwLock::new(HashMap::new())),
             hierarchical_config,
             language_model: None,
+            #[cfg(test)]
+            test_hooks: None,
         })
     }
 
@@ -181,32 +190,60 @@ impl AsyncGraphRAG {
 
     /// Build the knowledge graph from documents asynchronously
     pub async fn build_graph(&mut self) -> Result<()> {
+        use futures::stream::{self, StreamExt, TryStreamExt};
+
+        tracing::info!("Building knowledge graph asynchronously");
+
+        // Snapshot the chunks under a read-equivalent borrow, then release the
+        // write lock before launching extraction futures so the &self borrow used
+        // by extract_entities_async doesn't conflict with the &mut graph borrow.
+        let chunks: Vec<TextChunk> = {
+            let graph_guard = self.knowledge_graph.read().await;
+            let graph = graph_guard.as_ref().ok_or_else(|| GraphRAGError::Config {
+                message: "Knowledge graph not initialized".to_string(),
+            })?;
+            graph.chunks().cloned().collect()
+        };
+
+        // Concurrency cap for entity extraction. Default 8 balances OpenAI-class
+        // remote LLMs (which can take more) and local Ollama (typically 4-8).
+        // TODO: surface as a Config field (`entity_extraction_concurrency`).
+        const ENTITY_EXTRACTION_CONCURRENCY: usize = 8;
+
+        // Run extractions concurrently, bounded. `buffered` (vs buffer_unordered)
+        // preserves input order so the same set of chunks always yields the same
+        // graph (deterministic when entity ids collide across chunks). `try_collect`
+        // gives fail-fast cancellation: if any extraction errors, in-flight futures
+        // beyond the cap are dropped and not started, and the mutation loop never
+        // observes partial successes — avoiding partial graph updates on failure.
+        let this: &Self = self;
+        let extractions: Vec<(crate::core::ChunkId, Vec<Entity>)> = stream::iter(chunks.iter())
+            .map(|chunk| {
+                let chunk_id = chunk.id.clone();
+                async move {
+                    this.extract_entities_async(chunk)
+                        .await
+                        .map(|entities| (chunk_id, entities))
+                }
+            })
+            .buffered(ENTITY_EXTRACTION_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+        // Serially apply results to the graph. All extractions succeeded by here.
         let mut graph_guard = self.knowledge_graph.write().await;
         let graph = graph_guard.as_mut().ok_or_else(|| GraphRAGError::Config {
             message: "Knowledge graph not initialized".to_string(),
         })?;
-
-        tracing::info!("Building knowledge graph asynchronously");
-
-        // Extract entities from all chunks asynchronously
-        let chunks: Vec<_> = graph.chunks().cloned().collect();
         let mut total_entities = 0;
-
-        // For each chunk, extract entities (would use AsyncEntityExtractor in full implementation)
-        for chunk in &chunks {
-            // Simulate async entity extraction
-            let entities = self.extract_entities_async(chunk).await?;
-
-            // Add entities to the graph
+        for (chunk_id, entities) in extractions {
             let mut chunk_entity_ids = Vec::new();
             for entity in entities {
                 chunk_entity_ids.push(entity.id.clone());
                 graph.add_entity(entity)?;
                 total_entities += 1;
             }
-
-            // Update chunk with entity references
-            if let Some(existing_chunk) = graph.get_chunk_mut(&chunk.id) {
+            if let Some(existing_chunk) = graph.get_chunk_mut(&chunk_id) {
                 existing_chunk.entities = chunk_entity_ids;
             }
         }
@@ -222,6 +259,29 @@ impl AsyncGraphRAG {
     async fn extract_entities_async(&self, chunk: &TextChunk) -> Result<Vec<Entity>> {
         // Simulate async processing delay
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Test-only hooks: per-instance (no globals) so concurrent tests don't
+        // collide. `started` counts entry into the post-barrier section, letting
+        // tests assert how many extractions actually ran. `barrier` blocks until
+        // N parties arrive — sequential code deadlocks. `fail_after` returns an
+        // error once `started` exceeds the threshold.
+        #[cfg(test)]
+        if let Some(hooks) = &self.test_hooks {
+            if let Some(barrier) = &hooks.barrier {
+                barrier.wait().await;
+            }
+            let started = hooks
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if let Some(threshold) = hooks.fail_after {
+                if started > threshold {
+                    return Err(GraphRAGError::EntityExtraction {
+                        message: format!("test-injected failure at extraction #{started}"),
+                    });
+                }
+            }
+        }
 
         // Simple entity extraction for demo (would use actual async implementation)
         let content = chunk.content.to_lowercase();
@@ -604,6 +664,32 @@ impl Default for AsyncGraphRAGBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ChunkId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Barrier;
+
+    /// Per-instance test hooks for `extract_entities_async`. Lives on the
+    /// AsyncGraphRAG instance under test (no static/global state) so concurrent
+    /// `cargo test` workers can't collide.
+    pub(super) struct ExtractionHooks {
+        /// Optional N-party barrier; every extraction awaits it before returning,
+        /// so sequential extraction deadlocks while concurrent extraction proceeds.
+        pub(super) barrier: Option<Arc<Barrier>>,
+        /// Increments once per extraction that reached the post-barrier point.
+        pub(super) started: AtomicUsize,
+        /// If Some(N), the (N+1)-th and later extractions return an error.
+        pub(super) fail_after: Option<usize>,
+    }
+
+    impl ExtractionHooks {
+        fn new() -> Self {
+            Self {
+                barrier: None,
+                started: AtomicUsize::new(0),
+                fail_after: None,
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_async_graphrag_creation() {
@@ -661,5 +747,104 @@ mod tests {
         let stats = graphrag.get_performance_stats().await;
         assert_eq!(stats.total_documents, 0);
         assert_eq!(stats.health_status, AsyncHealthStatus::Healthy);
+    }
+
+    /// Seeds the knowledge graph on `graphrag` with `n_chunks` chunks under one
+    /// document. Skips `initialize()` so tests don't require the async-traits
+    /// feature for the mock LLM.
+    async fn seed_chunks(graphrag: &mut AsyncGraphRAG, n_chunks: usize) {
+        let mut graph_guard = graphrag.knowledge_graph.write().await;
+        let mut graph = KnowledgeGraph::new();
+        let doc_id = DocumentId::new("doc-0".to_string());
+        let chunks: Vec<TextChunk> = (0..n_chunks)
+            .map(|i| {
+                TextChunk::new(
+                    ChunkId::new(format!("chunk-{i}")),
+                    doc_id.clone(),
+                    format!("Tom and Huck were here in chunk {i}"),
+                    0,
+                    32,
+                )
+            })
+            .collect();
+        let document = Document {
+            id: doc_id,
+            title: "test".to_string(),
+            content: "test".to_string(),
+            metadata: Default::default(),
+            chunks,
+        };
+        graph.add_document(document).unwrap();
+        *graph_guard = Some(graph);
+    }
+
+    /// Verifies build_graph runs entity extraction concurrently across chunks
+    /// (sequential code deadlocks on an N-party barrier; concurrent code clears it).
+    #[tokio::test]
+    async fn test_build_graph_extracts_entities_concurrently() {
+        const N_CHUNKS: usize = 8;
+
+        let config = Config::default();
+        let mut graphrag = AsyncGraphRAG::new(config).await.unwrap();
+
+        // Per-instance barrier (no globals): only this graphrag's extractions wait.
+        let mut hooks = ExtractionHooks::new();
+        hooks.barrier = Some(Arc::new(Barrier::new(N_CHUNKS)));
+        graphrag.test_hooks = Some(Arc::new(hooks));
+
+        seed_chunks(&mut graphrag, N_CHUNKS).await;
+
+        // Sequential code can only have one extraction in flight at a time, so the
+        // N-party barrier never clears and build_graph hangs. We give it a generous
+        // timeout to fail fast on regression.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), graphrag.build_graph()).await;
+
+        assert!(
+            result.is_ok(),
+            "build_graph deadlocked or timed out — extractions ran sequentially"
+        );
+        result.unwrap().expect("build_graph returned error");
+    }
+
+    /// Asserts build_graph is fail-fast: once one chunk's extraction errors, the
+    /// remaining chunks beyond the concurrency window must not run. With the
+    /// previous `buffer_unordered + collect` impl, all 64 chunks would run before
+    /// the error was observed. With `buffered + try_collect`, only chunks within
+    /// roughly one concurrency window past the failure threshold are started.
+    #[tokio::test]
+    async fn test_build_graph_fail_fast_cancels_pending_extractions() {
+        const N_CHUNKS: usize = 64;
+        const FAIL_AFTER: usize = 4;
+        // Concurrency cap inside build_graph. Starts beyond this past the failure
+        // are bounded by the cap (in-flight at the moment of error), not unbounded.
+        const CONCURRENCY: usize = 8;
+
+        let config = Config::default();
+        let mut graphrag = AsyncGraphRAG::new(config).await.unwrap();
+
+        let mut hooks = ExtractionHooks::new();
+        hooks.fail_after = Some(FAIL_AFTER);
+        let hooks = Arc::new(hooks);
+        graphrag.test_hooks = Some(Arc::clone(&hooks));
+
+        seed_chunks(&mut graphrag, N_CHUNKS).await;
+
+        let result = graphrag.build_graph().await;
+        assert!(result.is_err(), "build_graph should propagate the error");
+
+        // Fail-fast contract: once an extraction errors, only those already in
+        // flight may finish. The total started count must not approach N_CHUNKS;
+        // it must be bounded by FAIL_AFTER + CONCURRENCY (with slack for scheduling).
+        let started = hooks.started.load(Ordering::SeqCst);
+        let upper_bound = FAIL_AFTER + CONCURRENCY + 4;
+        assert!(
+            started <= upper_bound,
+            "expected fail-fast (started <= {upper_bound}); got {started} of {N_CHUNKS}",
+        );
+        assert!(
+            started < N_CHUNKS,
+            "all {N_CHUNKS} extractions ran — fail-fast cancellation regressed",
+        );
     }
 }
