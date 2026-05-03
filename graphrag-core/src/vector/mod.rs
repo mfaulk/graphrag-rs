@@ -337,67 +337,25 @@ impl VectorIndex {
             return Ok(());
         }
 
-        #[cfg(feature = "parallel-processing")]
-        {
-            use rayon::prelude::*;
-            use std::collections::HashMap;
+        use rayon::prelude::*;
 
-            // Pre-validate all vectors in parallel
-            let validation_results: std::result::Result<Vec<_>, crate::GraphRAGError> = vectors
-                .par_iter()
-                .map(|(id, embedding)| {
-                    if embedding.is_empty() {
-                        Err(crate::GraphRAGError::VectorSearch {
-                            message: format!("Empty embedding vector for ID: {id}"),
-                        })
-                    } else {
-                        Ok((id.clone(), embedding.clone()))
-                    }
-                })
-                .collect();
-
-            let validated_vectors = match validation_results {
-                Ok(vectors) => vectors,
-                Err(e) => {
-                    eprintln!("Vector validation failed: {e}");
-                    // Fall back to sequential processing with validation
-                    for (id, embedding) in vectors {
-                        self.add_vector(id, embedding)?;
-                    }
-                    return Ok(());
-                },
-            };
-
-            // Check for duplicate IDs and resolve conflicts
-            let mut unique_vectors = HashMap::new();
-            for (id, embedding) in validated_vectors {
-                if unique_vectors.contains_key(&id) {
-                    eprintln!("Warning: Duplicate vector ID '{id}' - using latest");
-                }
-                unique_vectors.insert(id, embedding);
-            }
-
-            // Convert to vector pairs for sequential insertion
-            let vector_pairs: Vec<_> = unique_vectors.into_iter().collect();
-
-            // Vector pairs are already validated and deduplicated
-
-            // Apply the validated vectors to the embeddings map sequentially
-            for (id, embedding) in vector_pairs {
-                self.embeddings.insert(id, embedding);
-            }
-
-            println!("Added {} vectors in parallel batch", vectors.len());
+        // Validate without cloning: short-circuit on the first empty embedding.
+        if let Some((bad_id, _)) = vectors.par_iter().find_any(|(_, e)| e.is_empty()) {
+            return Err(GraphRAGError::VectorSearch {
+                message: format!("Empty embedding vector for ID: {bad_id}"),
+            });
         }
 
-        #[cfg(not(feature = "parallel-processing"))]
-        {
-            // Sequential fallback when parallel processing is not available
-            for (id, embedding) in vectors {
-                self.add_vector(id, embedding)?;
-            }
+        let inserted = vectors.len();
+        // Move the original vectors directly into the embeddings map — no extra clone.
+        // Later duplicates within the batch overwrite earlier ones, matching the
+        // previous "use latest" behavior.
+        for (id, embedding) in vectors {
+            self.tombstones.remove(&id);
+            self.embeddings.insert(id, embedding);
         }
 
+        println!("Added {inserted} vectors in parallel batch");
         Ok(())
     }
 
@@ -1097,4 +1055,52 @@ mod tests {
         }
     }
 
+    /// Verifies `batch_add_vectors_parallel` surfaces a `VectorSearch` error mentioning the empty id.
+    #[cfg(feature = "parallel-processing")]
+    #[test]
+    fn test_batch_add_vectors_parallel_empty_embedding_returns_error() {
+        use crate::parallel::ParallelProcessor;
+
+        // 4 threads + 16+ items satisfies should_use_parallel (count > 10 && threads > 1).
+        let processor = ParallelProcessor::new(4);
+        let mut index = VectorIndex::with_parallel_processing(processor);
+
+        let mut vectors: Vec<(String, Vec<f32>)> = (0..16)
+            .map(|i| (format!("doc{i}"), vec![i as f32, 0.0, 0.0]))
+            .collect();
+        vectors.push(("bad".to_string(), Vec::new()));
+
+        let err = index
+            .batch_add_vectors(vectors)
+            .expect_err("empty embedding should error");
+        match err {
+            GraphRAGError::VectorSearch { message } => {
+                assert!(
+                    message.contains("bad"),
+                    "error message should mention failing id, got: {message}"
+                );
+            },
+            other => panic!("expected VectorSearch error, got {other:?}"),
+        }
+    }
+
+    /// Verifies `batch_add_vectors_parallel` inserts every entry on the no-clone validation path.
+    #[cfg(feature = "parallel-processing")]
+    #[test]
+    fn test_batch_add_vectors_parallel_inserts_all() {
+        use crate::parallel::ParallelProcessor;
+
+        let processor = ParallelProcessor::new(4);
+        let mut index = VectorIndex::with_parallel_processing(processor);
+
+        let vectors: Vec<(String, Vec<f32>)> = (0..32)
+            .map(|i| (format!("doc{i}"), vec![i as f32, (i + 1) as f32]))
+            .collect();
+
+        index.batch_add_vectors(vectors).unwrap();
+        assert_eq!(index.len(), 32);
+        for i in 0..32 {
+            assert!(index.contains(&format!("doc{i}")));
+        }
+    }
 }
