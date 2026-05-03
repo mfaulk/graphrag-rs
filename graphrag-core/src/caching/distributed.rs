@@ -5,8 +5,10 @@
 //! - L2: Redis cache (distributed)
 //! - L3: Persistent storage (fallback)
 
+use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -62,9 +64,15 @@ impl<T: Clone> CacheEntry<T> {
     }
 }
 
-/// L1 Cache: In-memory LRU cache
+/// L1 Cache: In-memory LRU cache.
+///
+/// Backed by `lru::LruCache` for O(1) get/put/eviction. The previous
+/// `HashMap` + `min_by_key` scan was O(n) per eviction under the write
+/// lock. The `RwLock` is preserved (rather than a `Mutex`) for parity with
+/// the rest of the file, but readers cannot share access — every operation
+/// (including `get`, which bumps recency) needs a write guard.
 pub struct L1Cache<K, V> {
-    cache: Arc<RwLock<HashMap<K, CacheEntry<V>>>>,
+    cache: Arc<RwLock<LruCache<K, CacheEntry<V>>>>,
     max_size: usize,
     default_ttl: Option<Duration>,
 }
@@ -76,49 +84,46 @@ where
 {
     /// Create a new L1 (in-memory) cache with the given maximum size and default TTL
     pub fn new(max_size: usize, default_ttl: Option<Duration>) -> Self {
+        // LruCache requires NonZeroUsize; clamp 0 → 1 so a misconfigured
+        // max_size doesn't panic.
+        let cap = NonZeroUsize::new(max_size.max(1)).expect("max(1) is non-zero");
         Self {
-            cache: Arc::new(RwLock::new(HashMap::with_capacity(max_size))),
+            cache: Arc::new(RwLock::new(LruCache::new(cap))),
             max_size,
             default_ttl,
         }
     }
 
-    /// Get a value from the cache, returning None if not found or expired
+    /// Get a value from the cache, returning None if not found or expired.
+    ///
+    /// Resolves the entry once under a single write-lock borrow: a single
+    /// `get_mut` both promotes recency and lets us read TTL/value, so there
+    /// is no window between the expiry check and the access in which the
+    /// entry could become stale. If expired, we pop and return None. The
+    /// previous peek-then-get_mut shape worked but did two hash lookups
+    /// per call and is more fragile if the lock scope is ever loosened.
     pub fn get(&self, key: &K) -> Option<V> {
         let mut cache = self.cache.write();
-        if let Some(entry) = cache.get_mut(key) {
-            if entry.is_expired() {
-                cache.remove(key);
-                None
-            } else {
-                Some(entry.access())
-            }
-        } else {
-            None
+        // Single lookup: `get_mut` both finds the entry and bumps it to MRU.
+        let entry = cache.get_mut(key)?;
+        if entry.is_expired() {
+            // End the mutable borrow before mutating the cache via `pop`.
+            cache.pop(key);
+            return None;
         }
+        Some(entry.access())
     }
 
-    /// Put a value into the cache, evicting the oldest entry if at capacity
+    /// Put a value into the cache, evicting the LRU entry if at capacity
     pub fn put(&self, key: K, value: V) {
         let mut cache = self.cache.write();
-
-        // Evict oldest entries if at capacity
-        if cache.len() >= self.max_size && !cache.contains_key(&key) {
-            if let Some(oldest_key) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed)
-                .map(|(k, _)| k.clone())
-            {
-                cache.remove(&oldest_key);
-            }
-        }
-
-        cache.insert(key, CacheEntry::new(value, self.default_ttl));
+        // `LruCache::put` handles capacity-driven eviction internally.
+        cache.put(key, CacheEntry::new(value, self.default_ttl));
     }
 
     /// Invalidate (remove) a specific entry from the cache
     pub fn invalidate(&self, key: &K) {
-        self.cache.write().remove(key);
+        self.cache.write().pop(key);
     }
 
     /// Clear all entries from the cache
@@ -134,7 +139,7 @@ where
     /// Get cache statistics including size, capacity, and access count
     pub fn stats(&self) -> CacheStats {
         let cache = self.cache.read();
-        let total_accesses: u64 = cache.values().map(|e| e.access_count).sum();
+        let total_accesses: u64 = cache.iter().map(|(_, e)| e.access_count).sum();
         CacheStats {
             size: cache.len(),
             capacity: self.max_size,
@@ -258,7 +263,29 @@ where
     #[cfg(not(feature = "redis_storage"))]
     #[allow(dead_code)]
     l2: Option<()>,
-    stats: Arc<RwLock<DistributedCacheStats>>,
+    stats: Arc<AtomicCacheStats>,
+}
+
+/// Lock-free counters for `DistributedCache` get/put hot paths.
+///
+/// Replaces the previous `RwLock<DistributedCacheStats>` so concurrent
+/// gets and puts no longer serialize on a write-lock just to bump
+/// counters — counters are now plain atomics.
+///
+/// Scope note (post-merge review): this only removes the *stats* lock.
+/// L1 hits still serialize on `L1Cache::cache.write()` because the
+/// underlying `lru::LruCache` requires `&mut` to promote an entry to
+/// most-recently-used (see `L1Cache::get`). Eliminating that
+/// serialization is a separate follow-up — e.g., switching the L1
+/// backend to a concurrent LRU like `moka` — and is out of scope for
+/// this change.
+#[derive(Debug, Default)]
+struct AtomicCacheStats {
+    l1_hits: AtomicU64,
+    l1_misses: AtomicU64,
+    l2_hits: AtomicU64,
+    l2_misses: AtomicU64,
+    l2_deserialize_failures: AtomicU64,
 }
 
 impl<K, V> DistributedCache<K, V>
@@ -289,7 +316,7 @@ where
         Ok(Self {
             l1,
             l2,
-            stats: Arc::new(RwLock::new(DistributedCacheStats::default())),
+            stats: Arc::new(AtomicCacheStats::default()),
         })
     }
 
@@ -297,11 +324,11 @@ where
     pub fn get(&self, key: &K) -> Option<V> {
         // Try L1 first
         if let Some(value) = self.l1.get(key) {
-            self.stats.write().l1_hits += 1;
+            self.stats.l1_hits.fetch_add(1, Ordering::Relaxed);
             return Some(value);
         }
 
-        self.stats.write().l1_misses += 1;
+        self.stats.l1_misses.fetch_add(1, Ordering::Relaxed);
 
         // Try L2 (Redis) if available
         #[cfg(feature = "redis_storage")]
@@ -315,12 +342,14 @@ where
                     // miss, masking format drift in metrics. (#23)
                     match Self::try_deserialize(&bytes) {
                         Ok(value) => {
-                            self.stats.write().l2_hits += 1;
+                            self.stats.l2_hits.fetch_add(1, Ordering::Relaxed);
                             self.l1.put(key.clone(), value.clone());
                             return Some(value);
                         },
                         Err(_e) => {
-                            self.stats.write().l2_deserialize_failures += 1;
+                            self.stats
+                                .l2_deserialize_failures
+                                .fetch_add(1, Ordering::Relaxed);
                             #[cfg(feature = "tracing")]
                             tracing::warn!(
                                 key = %key.to_string(),
@@ -332,12 +361,12 @@ where
                     }
                 },
                 Ok(None) => {
-                    self.stats.write().l2_misses += 1;
+                    self.stats.l2_misses.fetch_add(1, Ordering::Relaxed);
                 },
                 Err(_e) => {
                     // Connection / transport error against Redis. Count as
                     // a miss but log so the operator sees it.
-                    self.stats.write().l2_misses += 1;
+                    self.stats.l2_misses.fetch_add(1, Ordering::Relaxed);
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         key = %key.to_string(),
@@ -403,11 +432,16 @@ where
 
     /// Get comprehensive cache statistics
     pub fn stats(&self) -> DistributedCacheStats {
-        let mut stats = self.stats.read().clone();
         let l1_stats = self.l1.stats();
-        stats.l1_size = l1_stats.size;
-        stats.l1_capacity = l1_stats.capacity;
-        stats
+        DistributedCacheStats {
+            l1_hits: self.stats.l1_hits.load(Ordering::Relaxed),
+            l1_misses: self.stats.l1_misses.load(Ordering::Relaxed),
+            l1_size: l1_stats.size,
+            l1_capacity: l1_stats.capacity,
+            l2_hits: self.stats.l2_hits.load(Ordering::Relaxed),
+            l2_misses: self.stats.l2_misses.load(Ordering::Relaxed),
+            l2_deserialize_failures: self.stats.l2_deserialize_failures.load(Ordering::Relaxed),
+        }
     }
 }
 
@@ -502,6 +536,63 @@ mod tests {
         assert!(entry.is_expired());
     }
 
+    // Regression for #106 review: L1Cache::get must check expiry under the
+    // same write-lock borrow as the recency promotion. A peek-then-get_mut
+    // split (or any code path that re-resolves the entry between TTL check
+    // and access) leaves a window where an entry that was live during peek
+    // can expire before access. Inserting with a 1ms TTL and reading after
+    // 5ms must always return None — never the stale value.
+    #[test]
+    fn l1_cache_get_does_not_return_expired_entry() {
+        let cache: L1Cache<&'static str, &'static str> =
+            L1Cache::new(4, Some(Duration::from_millis(1)));
+
+        cache.put("k", "v");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            cache.get(&"k"),
+            None,
+            "an entry past its TTL must never be returned"
+        );
+    }
+
+    // Inserting beyond max_size evicts the least-recently-used entry, not
+    // an arbitrary one — guards against regression to a non-LRU eviction.
+    #[test]
+    fn l1_cache_evicts_least_recently_used_entry() {
+        let cache: L1Cache<&'static str, &'static str> =
+            L1Cache::new(2, Some(Duration::from_secs(60)));
+
+        cache.put("a", "1");
+        cache.put("b", "2");
+        // Insert a third; "a" is LRU and should be evicted.
+        cache.put("c", "3");
+
+        assert_eq!(cache.size(), 2);
+        assert_eq!(cache.get(&"a"), None, "a was LRU and should be evicted");
+        assert_eq!(cache.get(&"b"), Some("2"));
+        assert_eq!(cache.get(&"c"), Some("3"));
+    }
+
+    // Calling get() on an existing entry must mark it as most-recently-used
+    // so a subsequent capacity-triggered eviction targets the next-oldest,
+    // not the just-touched key.
+    #[test]
+    fn l1_cache_get_marks_entry_as_most_recently_used() {
+        let cache: L1Cache<&'static str, &'static str> =
+            L1Cache::new(2, Some(Duration::from_secs(60)));
+
+        cache.put("a", "1");
+        cache.put("b", "2");
+        // Touch "a"; now "b" is the LRU.
+        assert_eq!(cache.get(&"a"), Some("1"));
+        cache.put("c", "3");
+
+        assert_eq!(cache.get(&"a"), Some("1"), "a was touched, must survive");
+        assert_eq!(cache.get(&"b"), None, "b became LRU and should be evicted");
+        assert_eq!(cache.get(&"c"), Some("3"));
+    }
+
     // Regression for #23: bincode garbage in the L2 byte stream must surface
     // as a deserialize failure (caller can count it separately from miss).
     #[cfg(feature = "redis_storage")]
@@ -553,5 +644,77 @@ mod tests {
         );
         // 1 hit / (1 hit + 1 miss + 1 deserialize failure) = 1/3.
         assert!((with_failure.hit_rate() - (1.0 / 3.0)).abs() < f64::EPSILON);
+    }
+
+    // Concurrent gets across many threads must produce an exact l1_hits
+    // count in the snapshot — atomic counters, not lock-protected, must not
+    // lose increments.
+    #[test]
+    fn stats_l1_hits_accumulate_under_concurrent_gets() {
+        let cache: Arc<DistributedCache<String, String>> = Arc::new(
+            DistributedCache::new(
+                32,
+                Some(Duration::from_secs(60)),
+                #[cfg(feature = "redis_storage")]
+                None,
+                #[cfg(not(feature = "redis_storage"))]
+                None,
+                None,
+            )
+            .expect("cache construction"),
+        );
+
+        cache
+            .put("k".to_string(), "v".to_string())
+            .expect("put succeeds");
+
+        const THREADS: usize = 8;
+        const GETS_PER_THREAD: u64 = 250;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let c = Arc::clone(&cache);
+                std::thread::spawn(move || {
+                    for _ in 0..GETS_PER_THREAD {
+                        assert_eq!(c.get(&"k".to_string()), Some("v".to_string()));
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+
+        let snap = cache.stats();
+        assert_eq!(snap.l1_hits, THREADS as u64 * GETS_PER_THREAD);
+        assert_eq!(snap.l1_misses, 0);
+    }
+
+    // Snapshot returned by stats() reflects the current atomic counters
+    // and is a plain (non-atomic) struct safe to clone and inspect.
+    #[test]
+    fn stats_snapshot_reflects_accumulated_counts() {
+        let cache: DistributedCache<String, String> = DistributedCache::new(
+            8,
+            Some(Duration::from_secs(60)),
+            #[cfg(feature = "redis_storage")]
+            None,
+            #[cfg(not(feature = "redis_storage"))]
+            None,
+            None,
+        )
+        .expect("cache construction");
+
+        cache
+            .put("present".to_string(), "v".to_string())
+            .expect("put succeeds");
+        let _ = cache.get(&"present".to_string()); // hit
+        let _ = cache.get(&"absent".to_string()); // miss
+        let _ = cache.get(&"present".to_string()); // hit
+
+        let snap = cache.stats();
+        assert_eq!(snap.l1_hits, 2);
+        assert_eq!(snap.l1_misses, 1);
     }
 }

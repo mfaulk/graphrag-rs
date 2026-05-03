@@ -131,7 +131,7 @@ graphml-import = ["quick-xml"]  # GraphML format support
 rdf-import = ["oxrdf", "oxttl"] # RDF/Turtle format support
 
 # Caching features
-caching = ["moka", "tracing"]
+caching = ["moka", "tracing", "lru", "parking_lot"]
 
 # Incremental updates feature
 incremental = ["parking_lot", "dashmap"]
@@ -309,6 +309,15 @@ moka = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 sha2 = { workspace = true }
+# Cache key derivation. Blake3 is faster than SHA-256 (~1-3 GB/s on modern
+# CPUs), produces a stable digest across architectures and crate versions
+# (cryptographic spec — unlike ahash, whose AES-NI vs software-fallback
+# output is architecture-dependent), and gives a 256-bit space we can
+# truncate to 128 bits for compact cache keys without realistic collision
+# risk. Stability matters because cache keys travel between processes
+# (L2/Redis), so any architecture- or version-dependent hash would cause
+# silent cache misses across heterogeneous nodes.
+blake3 = "1"
 flate2 = { workspace = true }
 indicatif = "0.17"                              # Progress bars for long-running operations
 
