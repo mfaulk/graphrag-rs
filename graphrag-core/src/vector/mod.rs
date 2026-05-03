@@ -111,8 +111,14 @@ impl VectorIndex {
         }
 
         // Re-adding an id revives it from the tombstone set so search can return it again.
-        self.tombstones.remove(&id);
+        // If the id was tombstoned and the index has already been built, the HNSW graph
+        // still contains the OLD node for this id. We must rebuild before the next search
+        // or callers would see stale embeddings/scores.
+        let revived = self.tombstones.remove(&id);
         self.embeddings.insert(id, embedding);
+        if revived && self.index.is_some() {
+            self.build_index()?;
+        }
         Ok(())
     }
 
@@ -350,9 +356,18 @@ impl VectorIndex {
         // Move the original vectors directly into the embeddings map — no extra clone.
         // Later duplicates within the batch overwrite earlier ones, matching the
         // previous "use latest" behavior.
+        let mut revived_any = false;
         for (id, embedding) in vectors {
-            self.tombstones.remove(&id);
+            if self.tombstones.remove(&id) {
+                revived_any = true;
+            }
             self.embeddings.insert(id, embedding);
+        }
+
+        // Reviving a tombstoned id leaves a stale node in the HNSW graph, so rebuild once
+        // at the end of the batch to coalesce all revivals into a single rebuild.
+        if revived_any && self.index.is_some() {
+            self.build_index()?;
         }
 
         println!("Added {inserted} vectors in parallel batch");
@@ -1082,6 +1097,50 @@ mod tests {
             },
             other => panic!("expected VectorSearch error, got {other:?}"),
         }
+    }
+
+    /// Re-adding a tombstoned id with a new embedding must surface the new embedding in search,
+    /// not the stale HNSW node from before removal.
+    #[test]
+    fn test_readd_after_tombstone_returns_new_embedding() {
+        let mut index = VectorIndex::new();
+        // 10 vectors so that removing one stays below the 20% rebuild threshold and the
+        // tombstone path is exercised on the next add.
+        for i in 0..10 {
+            index
+                .add_vector(format!("doc{i}"), vec![i as f32, 0.0, 0.0])
+                .unwrap();
+        }
+        // Add the target id with an obviously-distinct original embedding.
+        index
+            .add_vector("target".to_string(), vec![100.0, 0.0, 0.0])
+            .unwrap();
+        index.build_index().unwrap();
+
+        // Tombstone the target. 1/11 < 20%, so no rebuild fires; HNSW still holds the old node.
+        index.remove_vector("target").unwrap();
+        assert_eq!(index.tombstone_count(), 1);
+
+        // Re-add target with an embedding far from the original.
+        let new_embedding = vec![0.0, 0.0, 1.0];
+        index
+            .add_vector("target".to_string(), new_embedding.clone())
+            .unwrap();
+
+        // Query with the NEW embedding. The result for "target" must reflect the new
+        // coordinates (distance ~ 0, similarity ~ 1.0), not the stale node.
+        let results = index.search(&new_embedding, 11).unwrap();
+        let target_score = results
+            .iter()
+            .find_map(|(id, score)| (id == "target").then_some(*score))
+            .expect("target must appear in results after re-add");
+
+        // With the stale-node bug, target_score reflects distance from [100,0,0] to [0,0,1]
+        // (~100), giving similarity ~ 0. With the fix, distance is ~ 0 and similarity ~ 1.
+        assert!(
+            target_score > 0.9,
+            "re-added id should reflect the new embedding (similarity ~1.0), got {target_score}"
+        );
     }
 
     /// Verifies `batch_add_vectors_parallel` inserts every entry on the no-clone validation path.
