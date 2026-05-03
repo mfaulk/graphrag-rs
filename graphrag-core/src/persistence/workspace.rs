@@ -178,25 +178,39 @@ impl WorkspaceManager {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Load metadata. If it's missing or unreadable, skip the
-                // workspace from the listing rather than synthesize fresh
-                // defaults — the previous behaviour silently surfaced
-                // corrupt or partially-initialized directories as healthy
-                // workspaces with `modified_at = now`, which then sorted to
-                // the top of the list. Surface the failure in the log so
-                // operators can investigate (#23).
-                let metadata = match self.load_metadata(&workspace_name) {
-                    Ok(m) => m,
-                    Err(_e) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            workspace = %workspace_name,
-                            error = %_e,
-                            "Skipping workspace from listing: metadata unreadable. \
-                             Inspect metadata.toml or remove the directory."
-                        );
-                        continue;
-                    },
+                // Load metadata. Distinguish two failure modes:
+                //   * metadata.toml missing entirely → legacy workspace
+                //     written before metadata existed. `load_graph` already
+                //     tolerates this, so synthesize defaults and surface
+                //     the workspace in the listing; otherwise UIs / CLIs
+                //     hide loadable data.
+                //   * metadata.toml present but unreadable (corrupt TOML,
+                //     unrecognized schema, IO failure) → skip and warn.
+                //     Surfacing it as healthy with `modified_at = now`
+                //     would float a corrupt directory to the top of the
+                //     list (#23).
+                let metadata_path = path.join("metadata.toml");
+                let metadata = if !metadata_path.exists() {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        workspace = %workspace_name,
+                        "metadata.toml missing — synthesizing defaults for legacy workspace"
+                    );
+                    WorkspaceMetadata::new(workspace_name.clone())
+                } else {
+                    match self.load_metadata(&workspace_name) {
+                        Ok(m) => m,
+                        Err(_e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                workspace = %workspace_name,
+                                error = %_e,
+                                "Skipping workspace from listing: metadata unreadable. \
+                                 Inspect metadata.toml or remove the directory."
+                            );
+                            continue;
+                        },
+                    }
                 };
 
                 // Calculate size
@@ -509,6 +523,29 @@ mod tests {
             "error message should mention the version mismatch, got: {}",
             msg
         );
+    }
+
+    // Legacy workspaces written before metadata.toml existed must still
+    // appear in `list_workspaces` with synthesized defaults; otherwise
+    // they become invisible to UIs/CLIs even though `load_graph` can
+    // still read them (#23 follow-up).
+    #[test]
+    fn list_workspaces_includes_legacy_dir_with_missing_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+
+        // Create a bare legacy workspace directory with no metadata.toml.
+        let legacy_path = temp_dir.path().join("legacy");
+        fs::create_dir_all(&legacy_path).unwrap();
+
+        let listed = workspace.list_workspaces().unwrap();
+        let legacy = listed
+            .iter()
+            .find(|w| w.name == "legacy")
+            .expect("legacy workspace must appear in listing even without metadata.toml");
+        assert_eq!(legacy.metadata.name, "legacy");
+        assert_eq!(legacy.metadata.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(legacy.metadata.entity_count, 0);
     }
 
     // Regression for #23: a workspace dir whose metadata.toml is unreadable
