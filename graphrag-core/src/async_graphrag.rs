@@ -190,7 +190,7 @@ impl AsyncGraphRAG {
 
     /// Build the knowledge graph from documents asynchronously
     pub async fn build_graph(&mut self) -> Result<()> {
-        use futures::stream::{self, StreamExt};
+        use futures::stream::{self, StreamExt, TryStreamExt};
 
         tracing::info!("Building knowledge graph asynchronously");
 
@@ -210,29 +210,33 @@ impl AsyncGraphRAG {
         // TODO: surface as a Config field (`entity_extraction_concurrency`).
         const ENTITY_EXTRACTION_CONCURRENCY: usize = 8;
 
-        // Run extractions concurrently, bounded. Each future returns its chunk id
-        // alongside the result so the serial graph-mutation loop can find the
-        // right chunk regardless of completion order. Reborrow self as &Self so
-        // the closure captures a shared reference (extract_entities_async is &self).
+        // Run extractions concurrently, bounded. `buffered` (vs buffer_unordered)
+        // preserves input order so the same set of chunks always yields the same
+        // graph (deterministic when entity ids collide across chunks). `try_collect`
+        // gives fail-fast cancellation: if any extraction errors, in-flight futures
+        // beyond the cap are dropped and not started, and the mutation loop never
+        // observes partial successes — avoiding partial graph updates on failure.
         let this: &Self = self;
-        let extractions: Vec<(crate::core::ChunkId, Result<Vec<Entity>>)> =
-            stream::iter(chunks.iter())
-                .map(|chunk| async move {
-                    let result = this.extract_entities_async(chunk).await;
-                    (chunk.id.clone(), result)
-                })
-                .buffer_unordered(ENTITY_EXTRACTION_CONCURRENCY)
-                .collect()
-                .await;
+        let extractions: Vec<(crate::core::ChunkId, Vec<Entity>)> = stream::iter(chunks.iter())
+            .map(|chunk| {
+                let chunk_id = chunk.id.clone();
+                async move {
+                    this.extract_entities_async(chunk)
+                        .await
+                        .map(|entities| (chunk_id, entities))
+                }
+            })
+            .buffered(ENTITY_EXTRACTION_CONCURRENCY)
+            .try_collect()
+            .await?;
 
-        // Serially apply results to the graph. `?` preserves fail-fast semantics.
+        // Serially apply results to the graph. All extractions succeeded by here.
         let mut graph_guard = self.knowledge_graph.write().await;
         let graph = graph_guard.as_mut().ok_or_else(|| GraphRAGError::Config {
             message: "Knowledge graph not initialized".to_string(),
         })?;
         let mut total_entities = 0;
         for (chunk_id, entities) in extractions {
-            let entities = entities?;
             let mut chunk_entity_ids = Vec::new();
             for entity in entities {
                 chunk_entity_ids.push(entity.id.clone());
@@ -257,12 +261,25 @@ impl AsyncGraphRAG {
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
         // Test-only hooks: per-instance (no globals) so concurrent tests don't
-        // collide. When `barrier` is set, every extraction awaits it before
-        // continuing — sequential code deadlocks on an N-party barrier.
+        // collide. `started` counts entry into the post-barrier section, letting
+        // tests assert how many extractions actually ran. `barrier` blocks until
+        // N parties arrive — sequential code deadlocks. `fail_after` returns an
+        // error once `started` exceeds the threshold.
         #[cfg(test)]
         if let Some(hooks) = &self.test_hooks {
             if let Some(barrier) = &hooks.barrier {
                 barrier.wait().await;
+            }
+            let started = hooks
+                .started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if let Some(threshold) = hooks.fail_after {
+                if started > threshold {
+                    return Err(GraphRAGError::EntityExtraction {
+                        message: format!("test-injected failure at extraction #{started}"),
+                    });
+                }
             }
         }
 
@@ -648,6 +665,7 @@ impl Default for AsyncGraphRAGBuilder {
 mod tests {
     use super::*;
     use crate::core::ChunkId;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Barrier;
 
     /// Per-instance test hooks for `extract_entities_async`. Lives on the
@@ -657,11 +675,19 @@ mod tests {
         /// Optional N-party barrier; every extraction awaits it before returning,
         /// so sequential extraction deadlocks while concurrent extraction proceeds.
         pub(super) barrier: Option<Arc<Barrier>>,
+        /// Increments once per extraction that reached the post-barrier point.
+        pub(super) started: AtomicUsize,
+        /// If Some(N), the (N+1)-th and later extractions return an error.
+        pub(super) fail_after: Option<usize>,
     }
 
     impl ExtractionHooks {
         fn new() -> Self {
-            Self { barrier: None }
+            Self {
+                barrier: None,
+                started: AtomicUsize::new(0),
+                fail_after: None,
+            }
         }
     }
 
@@ -723,9 +749,9 @@ mod tests {
         assert_eq!(stats.health_status, AsyncHealthStatus::Healthy);
     }
 
-    /// Seeds `graphrag` with `n_chunks` chunks under one document, skipping
-    /// `initialize()` so tests don't require the async-traits feature for the
-    /// mock LLM.
+    /// Seeds the knowledge graph on `graphrag` with `n_chunks` chunks under one
+    /// document. Skips `initialize()` so tests don't require the async-traits
+    /// feature for the mock LLM.
     async fn seed_chunks(graphrag: &mut AsyncGraphRAG, n_chunks: usize) {
         let mut graph_guard = graphrag.knowledge_graph.write().await;
         let mut graph = KnowledgeGraph::new();
@@ -779,5 +805,46 @@ mod tests {
             "build_graph deadlocked or timed out — extractions ran sequentially"
         );
         result.unwrap().expect("build_graph returned error");
+    }
+
+    /// Asserts build_graph is fail-fast: once one chunk's extraction errors, the
+    /// remaining chunks beyond the concurrency window must not run. With the
+    /// previous `buffer_unordered + collect` impl, all 64 chunks would run before
+    /// the error was observed. With `buffered + try_collect`, only chunks within
+    /// roughly one concurrency window past the failure threshold are started.
+    #[tokio::test]
+    async fn test_build_graph_fail_fast_cancels_pending_extractions() {
+        const N_CHUNKS: usize = 64;
+        const FAIL_AFTER: usize = 4;
+        // Concurrency cap inside build_graph. Starts beyond this past the failure
+        // are bounded by the cap (in-flight at the moment of error), not unbounded.
+        const CONCURRENCY: usize = 8;
+
+        let config = Config::default();
+        let mut graphrag = AsyncGraphRAG::new(config).await.unwrap();
+
+        let mut hooks = ExtractionHooks::new();
+        hooks.fail_after = Some(FAIL_AFTER);
+        let hooks = Arc::new(hooks);
+        graphrag.test_hooks = Some(Arc::clone(&hooks));
+
+        seed_chunks(&mut graphrag, N_CHUNKS).await;
+
+        let result = graphrag.build_graph().await;
+        assert!(result.is_err(), "build_graph should propagate the error");
+
+        // Fail-fast contract: once an extraction errors, only those already in
+        // flight may finish. The total started count must not approach N_CHUNKS;
+        // it must be bounded by FAIL_AFTER + CONCURRENCY (with slack for scheduling).
+        let started = hooks.started.load(Ordering::SeqCst);
+        let upper_bound = FAIL_AFTER + CONCURRENCY + 4;
+        assert!(
+            started <= upper_bound,
+            "expected fail-fast (started <= {upper_bound}); got {started} of {N_CHUNKS}",
+        );
+        assert!(
+            started < N_CHUNKS,
+            "all {N_CHUNKS} extractions ran — fail-fast cancellation regressed",
+        );
     }
 }
