@@ -173,11 +173,14 @@ impl VectorIndex {
             let query_point = Vector::new(query_embedding.to_vec());
             let mut search = Search::default();
 
+            // `instant-distance` returns up to `ef_search` (default 100) candidates; we
+            // walk that pool and skip tombstoned ids so they do not consume slots from the
+            // requested top-k. The break only fires once we have collected `top_k`
+            // non-tombstoned items, so tombstones at the head of the iterator never cause
+            // the result to come up short as long as the iterator yields enough live
+            // candidates beneath them.
             let results = _index.search(&query_point, &mut search);
-
-            // Tombstoned ids still live in the HNSW graph until the next rebuild — skip
-            // them here so callers never see soft-deleted entries.
-            let mut scored_results = Vec::new();
+            let mut scored_results = Vec::with_capacity(top_k);
             for item in results {
                 if scored_results.len() >= top_k {
                     break;
@@ -1133,6 +1136,42 @@ mod tests {
             },
             other => panic!("expected VectorSearch error, got {other:?}"),
         }
+    }
+
+    /// `search(_, k)` must still return `k` non-tombstoned results when there are `k + T`
+    /// live vectors and `T` tombstones (`T` below rebuild threshold). Tombstones must
+    /// not consume slots from the requested top-k.
+    #[test]
+    fn test_search_returns_full_top_k_when_tombstones_present() {
+        let mut index = VectorIndex::new();
+        // 12 live + 1 tombstoned. Tombstone ratio (1/13 ≈ 7.7%) stays below 20% so no
+        // rebuild fires, forcing the post-search filter path.
+        for i in 0..12 {
+            index
+                .add_vector(format!("live{i}"), vec![i as f32, 0.0, 0.0])
+                .unwrap();
+        }
+        index
+            .add_vector("dead".to_string(), vec![0.5, 0.5, 0.5])
+            .unwrap();
+        index.build_index().unwrap();
+        index.remove_vector("dead").unwrap();
+        assert_eq!(
+            index.tombstone_count(),
+            1,
+            "tombstone must persist for test"
+        );
+
+        let results = index.search(&[0.5, 0.5, 0.5], 10).unwrap();
+        assert_eq!(
+            results.len(),
+            10,
+            "search must return exactly top_k results despite a tombstone in the candidate set: {results:?}"
+        );
+        assert!(
+            results.iter().all(|(id, _)| id != "dead"),
+            "tombstoned id must be filtered: {results:?}"
+        );
     }
 
     /// Re-adding a tombstoned id with a new embedding must surface the new embedding in search,
