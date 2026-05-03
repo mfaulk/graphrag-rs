@@ -16,11 +16,27 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Canonical `iss` claim placed on every JWT we mint and required on
+/// every JWT we accept (#31). Pinning a fixed issuer keeps tokens
+/// minted by other services that happen to share our HS256 secret out
+/// of our trust boundary.
+pub const JWT_ISSUER: &str = "graphrag-server";
+
+/// Canonical `aud` claim. Keeps tokens issued for a different API
+/// (e.g. an admin console reusing the same secret) from being accepted
+/// here (#31).
+pub const JWT_AUDIENCE: &str = "graphrag-api";
+
+/// Minimum acceptable JWT secret length, in bytes. HS256 signatures
+/// are only as strong as the shared secret; sub-32-byte secrets are
+/// brute-forceable with commodity hardware (#31).
+pub const JWT_SECRET_MIN_BYTES: usize = 32;
 
 /// JWT claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +47,12 @@ pub struct Claims {
     pub iat: u64,
     /// Expiration time (timestamp)
     pub exp: u64,
+    /// Issuer — pinned to `JWT_ISSUER` on mint, required on validate (#31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    /// Audience — pinned to `JWT_AUDIENCE` on mint, required on validate (#31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
     /// User role
     pub role: UserRole,
     /// Custom claims
@@ -136,6 +158,10 @@ impl AuthState {
     ///
     /// # Arguments
     /// * `jwt_secret` - Secret key for JWT signing (should be 32+ characters)
+    ///
+    /// Prefer [`AuthState::try_new`] in production wiring; this
+    /// constructor is kept for backwards compatibility and accepts any
+    /// length, including the empty string. Tests still use it.
     pub fn new(jwt_secret: String) -> Self {
         Self {
             jwt_secret,
@@ -143,6 +169,20 @@ impl AuthState {
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
             jwt_rate_limits: HashMap::new(),
         }
+    }
+
+    /// Construct an `AuthState` while enforcing the minimum JWT secret
+    /// length (`JWT_SECRET_MIN_BYTES`). Returns
+    /// `AuthError::TokenGenerationFailed` with an operator-facing
+    /// message that *does not* include the secret value (#31).
+    pub fn try_new(jwt_secret: String) -> Result<Self, AuthError> {
+        let len = jwt_secret.len();
+        if len < JWT_SECRET_MIN_BYTES {
+            return Err(AuthError::TokenGenerationFailed(format!(
+                "JWT secret too short: {len} bytes; minimum is {JWT_SECRET_MIN_BYTES}"
+            )));
+        }
+        Ok(Self::new(jwt_secret))
     }
 
     /// Override the JWT-path rate limit for a specific role.
@@ -157,10 +197,7 @@ impl AuthState {
     /// Look up the JWT-path rate limit for a role, falling back to the
     /// global `RateLimit::default()` (1000 req/hr).
     fn jwt_rate_limit_for(&self, role: UserRole) -> RateLimit {
-        self.jwt_rate_limits
-            .get(&role)
-            .cloned()
-            .unwrap_or_default()
+        self.jwt_rate_limits.get(&role).cloned().unwrap_or_default()
     }
 
     /// Generate a JWT token
@@ -181,24 +218,32 @@ impl AuthState {
             sub: user_id.to_string(),
             iat: now,
             exp: now + (duration_hours * 3600),
+            iss: Some(JWT_ISSUER.to_string()),
+            aud: Some(JWT_AUDIENCE.to_string()),
             role,
             custom: HashMap::new(),
         };
 
         encode(
-            &Header::default(),
+            &Header::new(Algorithm::HS256),
             &claims,
             &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
         )
         .map_err(|e| AuthError::TokenGenerationFailed(e.to_string()))
     }
 
-    /// Validate a JWT token
+    /// Validate a JWT token. Requires `exp`, `iss`, `aud` and pins
+    /// `iss == JWT_ISSUER`, `aud == JWT_AUDIENCE` (#31).
     pub fn validate_token(&self, token: &str) -> Result<Claims, AuthError> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[JWT_ISSUER]);
+        validation.set_audience(&[JWT_AUDIENCE]);
+
         decode::<Claims>(
             token,
             &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
-            &Validation::default(),
+            &validation,
         )
         .map(|data| data.claims)
         .map_err(|e| AuthError::InvalidToken(e.to_string()))
@@ -283,7 +328,9 @@ impl AuthState {
 fn unix_secs(t: std::time::SystemTime) -> Result<u64, AuthError> {
     t.duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|e| AuthError::TokenGenerationFailed(format!("system clock before UNIX epoch: {e}")))
+        .map_err(|e| {
+            AuthError::TokenGenerationFailed(format!("system clock before UNIX epoch: {e}"))
+        })
 }
 
 /// Authentication errors
@@ -538,6 +585,112 @@ mod tests {
         assert!(matches!(result, Err(AuthError::RateLimitExceeded { .. })));
     }
 
+    // AuthState::try_new must reject a missing or under-32-byte JWT secret
+    // (#31). Anything weaker than 32 bytes is brute-forceable for HS256 and
+    // makes the previous hardcoded "graphrag_secret_key_change_in_production"
+    // default a security landmine.
+    #[test]
+    fn try_new_rejects_short_secret() {
+        // Use a distinctive non-English value so we can assert the secret
+        // bytes don't leak into the operator-facing error.
+        let secret = "xq8z!".to_string();
+        let result = AuthState::try_new(secret.clone());
+        let msg = match result {
+            Err(AuthError::TokenGenerationFailed(s)) => s,
+            Err(other) => panic!("expected TokenGenerationFailed, got {other:?}"),
+            Ok(_) => panic!("short secret must reject"),
+        };
+        // Length and threshold should appear in the operator-facing message,
+        // but the secret itself must NOT be logged.
+        assert!(msg.contains("32"), "msg should cite the threshold: {msg}");
+        assert!(!msg.contains(&secret), "secret value must not leak: {msg}");
+    }
+
+    // Empty secrets are also rejected, with no panic.
+    #[test]
+    fn try_new_rejects_empty_secret() {
+        let result = AuthState::try_new(String::new());
+        assert!(matches!(result, Err(AuthError::TokenGenerationFailed(_))));
+    }
+
+    // try_new accepts an exactly-32-byte secret.
+    #[test]
+    fn try_new_accepts_secret_at_threshold() {
+        let secret = "a".repeat(32);
+        assert!(
+            AuthState::try_new(secret).is_ok(),
+            "32-byte secret must be accepted"
+        );
+    }
+
+    // Issued tokens carry the canonical iss/aud claims and validate end-to-end.
+    #[test]
+    fn generate_and_validate_token_round_trip_with_iss_aud() {
+        let auth_state = AuthState::try_new("a".repeat(32)).expect("state");
+        let token = auth_state
+            .generate_token("u1", UserRole::User, 1)
+            .expect("token");
+        let claims = auth_state.validate_token(&token).expect("validate");
+        assert_eq!(claims.iss.as_deref(), Some(JWT_ISSUER));
+        assert_eq!(claims.aud.as_deref(), Some(JWT_AUDIENCE));
+    }
+
+    // A token with the wrong issuer must be rejected even if the signature
+    // verifies — protects against same-secret tokens minted by another
+    // service in the same trust boundary (#31).
+    #[test]
+    fn validate_token_rejects_wrong_issuer() {
+        let auth_state = AuthState::try_new("a".repeat(32)).expect("state");
+        // Hand-roll a token with a foreign `iss` but the right secret.
+        let now = unix_secs(std::time::SystemTime::now()).unwrap();
+        let claims = Claims {
+            sub: "u1".into(),
+            iat: now,
+            exp: now + 3600,
+            iss: Some("other-service".into()),
+            aud: Some(JWT_AUDIENCE.into()),
+            role: UserRole::User,
+            custom: HashMap::new(),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret("a".repeat(32).as_bytes()),
+        )
+        .unwrap();
+        let err = auth_state
+            .validate_token(&token)
+            .expect_err("foreign iss must reject");
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    // A token with the wrong audience must be rejected even if the
+    // signature verifies (#31).
+    #[test]
+    fn validate_token_rejects_wrong_audience() {
+        let auth_state = AuthState::try_new("a".repeat(32)).expect("state");
+        let now = unix_secs(std::time::SystemTime::now()).unwrap();
+        let claims = Claims {
+            sub: "u1".into(),
+            iat: now,
+            exp: now + 3600,
+            iss: Some(JWT_ISSUER.into()),
+            aud: Some("other-api".into()),
+            role: UserRole::User,
+            custom: HashMap::new(),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret("a".repeat(32).as_bytes()),
+        )
+        .unwrap();
+        let err = auth_state
+            .validate_token(&token)
+            .expect_err("foreign aud must reject");
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
     // JWT-authenticated callers must be rate-limited too (#32). The Bearer
     // branch of `extract_auth_user` previously returned the user without
     // ever calling `check_rate_limit`, so a stolen JWT had no per-user
@@ -560,10 +713,7 @@ mod tests {
             .expect("token");
 
         let mut headers = axum::http::HeaderMap::new();
-        headers.insert(
-            "Authorization",
-            format!("Bearer {token}").parse().unwrap(),
-        );
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
 
         // First two extractions succeed.
         extract_auth_user(&auth_state, &headers).await.expect("1st");

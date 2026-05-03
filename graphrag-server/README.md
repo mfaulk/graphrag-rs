@@ -109,7 +109,9 @@ cargo run --bin graphrag-server --features "lancedb,ollama"
 # Minimal (hash-based embeddings, in-memory storage)
 cargo run --bin graphrag-server --no-default-features
 
-# With authentication
+# With authentication (requires JWT_SECRET >= 32 bytes; server refuses
+# to start otherwise — see #31)
+JWT_SECRET="$(openssl rand -hex 32)" \
 cargo run --bin graphrag-server --features "qdrant,ollama,auth"
 ```
 

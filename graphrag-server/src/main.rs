@@ -97,6 +97,36 @@ struct AppState {
     query_count: Arc<RwLock<usize>>,
 }
 
+/// Build an `AuthState` from `JWT_SECRET`, exiting the process if the
+/// env var is missing or the value is shorter than the HS256 minimum
+/// (#31). Centralised so all three `AppState::new` arms — Qdrant
+/// connected, Qdrant unavailable, Qdrant feature off — share one rule
+/// and can't drift out of sync.
+#[cfg(feature = "auth")]
+fn load_auth_state() -> AuthState {
+    let secret = match std::env::var("JWT_SECRET") {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::error!(
+                "❌ JWT_SECRET is not set. Refusing to start the auth-enabled \
+                 server with a default secret. Set JWT_SECRET to a value of \
+                 at least {} bytes.",
+                auth::JWT_SECRET_MIN_BYTES
+            );
+            std::process::exit(1);
+        },
+    };
+    match AuthState::try_new(secret) {
+        Ok(state) => state,
+        Err(e) => {
+            // `try_new`'s error message names the threshold and the
+            // observed length — never the secret value itself (#31).
+            tracing::error!("❌ JWT_SECRET rejected: {}. Refusing to start.", e);
+            std::process::exit(1);
+        },
+    }
+}
+
 impl AppState {
     async fn new() -> Self {
         // Initialize embedding service
@@ -159,8 +189,9 @@ impl AppState {
                         // collection's stored vector size (#37). A silent
                         // mismatch otherwise corrupts the index one upsert
                         // at a time. Mirrors the LanceDB per-row dim check.
-                        if let Err(e) =
-                            store.verify_collection_dimension(embedding_dim as u64).await
+                        if let Err(e) = store
+                            .verify_collection_dimension(embedding_dim as u64)
+                            .await
                         {
                             tracing::error!(
                                 "❌ Qdrant collection dimension check failed: {}. \
@@ -186,9 +217,7 @@ impl AppState {
                         graphrag: Arc::new(RwLock::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
                         #[cfg(feature = "auth")]
-                        auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
-                            |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
-                        ))),
+                        auth: Arc::new(load_auth_state()),
                         documents: Arc::new(RwLock::new(Vec::new())),
                         graph_built: Arc::new(RwLock::new(false)),
                         query_count: Arc::new(RwLock::new(0)),
@@ -205,9 +234,7 @@ impl AppState {
                         graphrag: Arc::new(RwLock::new(None)),
                         config_manager: Arc::new(ConfigManager::new()),
                         #[cfg(feature = "auth")]
-                        auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
-                            |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
-                        ))),
+                        auth: Arc::new(load_auth_state()),
                         documents: Arc::new(RwLock::new(Vec::new())),
                         graph_built: Arc::new(RwLock::new(false)),
                         query_count: Arc::new(RwLock::new(0)),
@@ -224,9 +251,7 @@ impl AppState {
                 graphrag: Arc::new(RwLock::new(None)),
                 config_manager: Arc::new(ConfigManager::new()),
                 #[cfg(feature = "auth")]
-                auth: Arc::new(AuthState::new(std::env::var("JWT_SECRET").unwrap_or_else(
-                    |_| "graphrag_secret_key_change_in_production_32chars".to_string(),
-                ))),
+                auth: Arc::new(load_auth_state()),
                 documents: Arc::new(RwLock::new(Vec::new())),
                 graph_built: Arc::new(RwLock::new(false)),
                 query_count: Arc::new(RwLock::new(0)),
@@ -1119,13 +1144,10 @@ async fn main() -> std::io::Result<()> {
         ..Default::default()
     };
 
-    // JWT secret warning (item 3.4)
-    #[cfg(feature = "auth")]
-    if std::env::var("JWT_SECRET").is_err() {
-        tracing::warn!(
-            "⚠️  JWT_SECRET not set! Using insecure default. Set JWT_SECRET env var in production."
-        );
-    }
+    // JWT_SECRET is now validated up front in `load_auth_state`, which
+    // exits the process if the var is missing or under
+    // `JWT_SECRET_MIN_BYTES` bytes (#31). The previous "using insecure
+    // default" warning is gone because there is no longer a default.
 
     tracing::info!("🚀 GraphRAG Server starting...");
     tracing::info!("📡 Listening on http://0.0.0.0:8080");
