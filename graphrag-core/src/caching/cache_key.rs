@@ -2,8 +2,21 @@
 
 use super::CacheResult;
 use crate::core::traits::GenerationParams;
-use sha2::{Digest, Sha256};
+use ahash::RandomState;
 use std::collections::HashMap;
+use std::hash::{BuildHasher, Hasher};
+
+/// Fixed-seed `RandomState` so `hash_string` produces the same digest
+/// for the same input across runs and processes. Cache key derivation
+/// must be deterministic; the seeds are not security-sensitive.
+const HASH_SEED_K0: u64 = 0x517c_c1b7_2722_0a95;
+const HASH_SEED_K1: u64 = 0xc6dd_8d61_3a73_19a3;
+const HASH_SEED_K2: u64 = 0x9e37_79b9_7f4a_7c15;
+const HASH_SEED_K3: u64 = 0x2545_f491_4f6c_dd1d;
+
+fn key_hasher() -> ahash::AHasher {
+    RandomState::with_seeds(HASH_SEED_K0, HASH_SEED_K1, HASH_SEED_K2, HASH_SEED_K3).build_hasher()
+}
 
 /// A cache key that uniquely identifies a request-response pair
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -301,11 +314,16 @@ impl CacheKeyGenerator {
         Ok(param_parts.join(";"))
     }
 
-    /// Create a hash of the input string
+    /// Create a hash of the input string.
+    ///
+    /// Uses `ahash::AHasher` with fixed seeds — non-cryptographic, but
+    /// fast and stable across runs. Cache key derivation has no security
+    /// relevance; the previous SHA-256 + 64-char hex was ~10-20x slower
+    /// per call. The 16-char hex output keeps the public `String` type.
     fn hash_string(&self, input: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(input.as_bytes());
-        format!("{:x}", hasher.finalize())
+        let mut hasher = key_hasher();
+        hasher.write(input.as_bytes());
+        format!("{:016x}", hasher.finish())
     }
 
     /// Create a human-readable display key
@@ -509,5 +527,26 @@ mod tests {
         assert_eq!(stats.total_keys, 3);
         assert_eq!(stats.unique_keys, 2);
         assert!(stats.collision_rate > 0.0);
+    }
+
+    // Regression guard for #105: hash_string must produce a 16-char
+    // (u64-hex) digest, not the SHA-256 64-char digest, and must be
+    // stable for a fixed input.
+    #[test]
+    fn hash_string_is_stable_short_non_sha256_digest() {
+        let generator = CacheKeyGenerator::new();
+        let a = generator.hash_string("graphrag-cache-key");
+        let b = generator.hash_string("graphrag-cache-key");
+
+        assert_eq!(a, b, "hash_string must be deterministic");
+        assert_eq!(
+            a.len(),
+            16,
+            "hash_string must return a 16-char u64 hex, not a 64-char SHA-256 hex"
+        );
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "hash_string output must be hex"
+        );
     }
 }

@@ -309,6 +309,9 @@ moka = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 bincode = { workspace = true, optional = true }
 sha2 = { workspace = true }
+# Non-cryptographic hasher for cache key derivation. Cache lookups have
+# no security relevance; ahash is ~10-20x faster than sha2.
+ahash = "0.8"
 flate2 = { workspace = true }
 indicatif = "0.17"                              # Progress bars for long-running operations
 

@@ -3956,6 +3956,7 @@ dependencies = [
 name = "graphrag-core"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "arrow",
  "arrow-array 57.3.0",
  "arrow-schema 57.3.0",
