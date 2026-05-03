@@ -165,10 +165,12 @@ impl EnhancedToolRegistry {
     /// the duration of `f`, which keeps lock scope a single block and prevents
     /// holding a `std::sync::Mutex` guard across an `.await` point.
     pub fn with_function_caller<R>(&self, f: impl FnOnce(&mut FunctionCaller) -> R) -> R {
+        // Recover from prior panics rather than propagating; FunctionCaller has
+        // no poison-sensitive invariants (worst case: a stale registry entry).
         let mut caller = self
             .function_caller
             .lock()
-            .expect("FunctionCaller mutex poisoned");
+            .unwrap_or_else(|e| e.into_inner());
         f(&mut caller)
     }
 }
@@ -621,5 +623,21 @@ mod tests {
                 .collect()
         });
         assert!(names.iter().any(|n| n == "context_analysis"));
+    }
+
+    // A poisoned FunctionCaller mutex from a prior panic does not block subsequent calls.
+    #[test]
+    fn test_with_function_caller_recovers_from_poison() {
+        let registry = EnhancedToolRegistry::new();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.with_function_caller(|_| {
+                panic!("intentional");
+            })
+        }));
+
+        // Subsequent call must not panic despite the mutex being poisoned.
+        let count = registry.with_function_caller(|c| c.get_function_definitions().len());
+        let _ = count;
     }
 }
