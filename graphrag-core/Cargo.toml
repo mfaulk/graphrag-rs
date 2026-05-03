@@ -204,7 +204,10 @@ wasm = [
     "js-sys",
     "serde-wasm-bindgen",
     "getrandom",
-] # Browser WASM compatibility
+    "tracing",
+] # Browser WASM compatibility. `tracing` is included because graphrag-core
+  # uses `tracing::*` macros unconditionally throughout the crate; without it
+  # wasm builds fail with E0433.
 cuda = ["neural-embeddings", "candle-core/cuda"] # NVIDIA GPU acceleration
 metal = [
     "neural-embeddings",

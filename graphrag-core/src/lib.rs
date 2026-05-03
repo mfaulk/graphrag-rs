@@ -1174,6 +1174,10 @@ impl GraphRAG {
                         relation_type: relation_type.clone(),
                         confidence: self.config.graph.relationship_confidence_threshold,
                         context: vec![chunk.id.clone()],
+                        embedding: None,
+                        temporal_type: None,
+                        temporal_range: None,
+                        causal_strength: None,
                     };
 
                     if let Err(_e) = graph.add_relationship(relationship) {
@@ -1346,6 +1350,10 @@ impl GraphRAG {
     }
 
     /// Query the system for relevant information (synchronous version)
+    ///
+    /// The hybrid retrieval pipeline is async-only, so this fallback delegates
+    /// to `RetrievalSystem::query`, which performs a placeholder lookup. Builds
+    /// that need real retrieval should enable the `async` feature.
     #[cfg(not(feature = "async"))]
     pub fn ask(&mut self, query: &str) -> Result<String> {
         self.ensure_initialized()?;
@@ -1354,7 +1362,13 @@ impl GraphRAG {
             self.build_graph()?;
         }
 
-        let results = self.query_internal(query)?;
+        let retrieval = self
+            .retrieval_system
+            .as_ref()
+            .ok_or_else(|| GraphRAGError::Config {
+                message: "Retrieval system not initialized".to_string(),
+            })?;
+        let results = retrieval.query(query)?;
         Ok(results.join("\n"))
     }
 

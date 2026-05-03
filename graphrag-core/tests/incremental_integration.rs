@@ -48,10 +48,6 @@ fn test_incremental_manager_with_lazy_propagation() {
     // Force propagate pending updates
     let result = manager.force_propagate_updates().unwrap();
     assert_eq!(result.updates_failed, 0);
-
-    // Get propagation statistics
-    let propagation_stats = manager.get_propagation_stats();
-    assert!(propagation_stats.total_propagated >= 0);
 }
 
 #[test]
@@ -236,12 +232,6 @@ fn test_lazy_propagation_auto_trigger() {
             })
             .unwrap();
     }
-
-    // Check that auto-propagation occurred
-    let stats = manager.get_propagation_stats();
-    // With threshold of 3, we should have at least 1 auto-propagation
-    // (5 nodes / 3 threshold = 1+ propagations)
-    assert!(stats.auto_propagations >= 0); // May or may not have triggered depending on timing
 }
 
 #[test]
@@ -307,9 +297,6 @@ fn test_combined_lazy_and_delta() {
     // Verify both features worked
     let stats = manager.stats();
     assert_eq!(stats.node_count, 5);
-
-    let prop_stats = manager.get_propagation_stats();
-    assert!(prop_stats.total_propagated >= 0);
 }
 
 #[test]

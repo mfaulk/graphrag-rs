@@ -539,6 +539,11 @@ impl BoundaryAwareChunkingStrategy {
     }
 }
 
+// The sync trait impl below bridges into async coherence scoring via a tokio
+// runtime, so it is only available when the `async` feature is enabled. On
+// targets without async (e.g. wasm32) `BoundaryAwareChunkingStrategy` is still
+// constructible, but cannot be used through the `ChunkingStrategy` trait.
+#[cfg(feature = "async")]
 impl ChunkingStrategy for BoundaryAwareChunkingStrategy {
     fn chunk(&self, text: &str) -> Vec<TextChunk> {
         // The sync trait must drive async coherence scoring. Bridge by
