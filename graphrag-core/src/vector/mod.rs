@@ -362,7 +362,12 @@ impl VectorIndex {
         // Later duplicates within the batch overwrite earlier ones, matching the
         // previous "use latest" behavior.
         let mut revived_any = false;
+        let mut seen_ids: HashSet<String> = HashSet::with_capacity(inserted);
+        let mut duplicate_ids: Vec<String> = Vec::new();
         for (id, embedding) in vectors {
+            if !seen_ids.insert(id.clone()) {
+                duplicate_ids.push(id.clone());
+            }
             if self.tombstones.remove(&id) {
                 revived_any = true;
             }
@@ -375,7 +380,14 @@ impl VectorIndex {
             self.build_index()?;
         }
 
-        println!("Added {inserted} vectors in parallel batch");
+        if !duplicate_ids.is_empty() {
+            tracing::warn!(
+                duplicates = ?duplicate_ids,
+                "duplicate vector IDs in parallel batch; later entries overwrote earlier ones"
+            );
+        }
+
+        tracing::debug!("added {inserted} vectors in parallel batch");
         Ok(())
     }
 
