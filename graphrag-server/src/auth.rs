@@ -1,23 +1,14 @@
 //! Authentication and Authorization Middleware
 //!
-//! **STATUS: Not yet ported to actix-web (issue #40).** This module
-//! still imports from `axum::{extract, http, middleware, response}`
-//! while the rest of the server is built on `actix-web`. The `auth`
-//! Cargo feature is currently disabled in `default = ["qdrant"]` for
-//! exactly this reason — turning it on produces ~30 unrelated-looking
-//! compile errors about an unresolved `axum` crate.
-//!
-//! The `compile_error!` below makes that failure mode loud: anyone
-//! enabling `--features auth` gets one clear message instead of a wall
-//! of "use of unresolved module or unlinked crate `axum`" errors.
-//! Remove it once auth.rs is ported to `actix-web-httpauth`-style
-//! middleware (or, alternatively, once `axum` is added as a dep and
-//! the Apistos integration is reworked).
-
-compile_error!(
-    "the `auth` Cargo feature is not yet ported to actix-web — see issue #40. \
-     Disable the feature (it is off by default) until the port lands."
-);
+//! **STATUS: Not yet ported to actix-web (issue #40).** The HTTP-glue
+//! parts of this module still import from `axum::{extract, http,
+//! middleware, response}` while the rest of the server is on actix-web.
+//! The `auth` Cargo feature pulls `axum` in as an optional dep so the
+//! module compiles and its security-critical logic (JWT issuance/
+//! validation, RBAC, rate limiting, secret loading) can be unit-tested
+//! ahead of the port. The auth routes are still NOT wired into
+//! `main.rs` (`/auth/*` is commented out), so toggling the feature
+//! does not expose any new HTTP surface.
 
 use axum::{
     extract::{Extension, Request, State},

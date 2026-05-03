@@ -892,14 +892,13 @@ async fn graph_stats(state: Data<AppState>) -> Json<GraphStatsResponse> {
 // Authentication Endpoints (feature-gated)
 // ============================================================================
 
+// Note: `#[api_operation]` deliberately omitted on the auth handlers. The
+// `error_code` arm of the macro doesn't currently resolve against
+// `ApiError`'s `ApiErrorComponent` schema, and these routes are not
+// mounted (see the commented-out `/auth/*` block in `main()`). Re-add
+// the macro alongside the actix port (issue #40).
 #[cfg(feature = "auth")]
-#[api_operation(
-    tag = "auth",
-    summary = "User login",
-    description = "Authenticate user and receive JWT token",
-    error_code = 401,
-    error_code = 500
-)]
+#[allow(dead_code)]
 async fn login(
     _state: Data<AppState>,
     body: Json<LoginRequest>,
@@ -925,12 +924,7 @@ async fn login(
 }
 
 #[cfg(feature = "auth")]
-#[api_operation(
-    tag = "auth",
-    summary = "Create API key",
-    description = "Generate an API key for programmatic access",
-    error_code = 500
-)]
+#[allow(dead_code)]
 async fn create_api_key(
     state: Data<AppState>,
     body: Json<ApiKeyRequest>,
