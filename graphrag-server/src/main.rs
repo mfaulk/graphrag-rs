@@ -155,9 +155,26 @@ impl AppState {
                             },
                         }
                     } else {
+                        // Refuse to start if EMBEDDING_DIM disagrees with the
+                        // collection's stored vector size (#37). A silent
+                        // mismatch otherwise corrupts the index one upsert
+                        // at a time. Mirrors the LanceDB per-row dim check.
+                        if let Err(e) =
+                            store.verify_collection_dimension(embedding_dim as u64).await
+                        {
+                            tracing::error!(
+                                "❌ Qdrant collection dimension check failed: {}. \
+                                 Set EMBEDDING_DIM to match the existing collection, \
+                                 use a different COLLECTION_NAME, or recreate the \
+                                 collection.",
+                                e
+                            );
+                            std::process::exit(1);
+                        }
                         tracing::info!(
-                            "✅ Connected to existing Qdrant collection: {}",
-                            collection_name
+                            "✅ Connected to existing Qdrant collection: {} ({} dims)",
+                            collection_name,
+                            embedding_dim
                         );
                     }
 

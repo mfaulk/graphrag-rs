@@ -135,6 +135,67 @@ impl QdrantStore {
         }
     }
 
+    /// Fetch the configured vector dimension of the existing collection.
+    ///
+    /// Returns `CollectionError` if the collection cannot be inspected or
+    /// its `vectors_config` is missing the expected single-vector
+    /// `params.size` field. Used by `verify_collection_dimension` so we
+    /// can refuse to start a server whose `EMBEDDING_DIM` doesn't match
+    /// the persisted collection (#37).
+    pub async fn collection_vector_dim(&self) -> Result<u64, QdrantError> {
+        use qdrant_client::qdrant::{vectors_config::Config, VectorsConfig};
+
+        let info = self
+            .client
+            .collection_info(&self.collection_name)
+            .await
+            .map_err(|e| QdrantError::CollectionError(e.to_string()))?;
+
+        let params = info
+            .result
+            .and_then(|r| r.config)
+            .and_then(|c| c.params)
+            .ok_or_else(|| {
+                QdrantError::CollectionError(format!(
+                    "collection '{}' has no params",
+                    self.collection_name
+                ))
+            })?;
+
+        let cfg: VectorsConfig = params.vectors_config.ok_or_else(|| {
+            QdrantError::CollectionError(format!(
+                "collection '{}' has no vectors_config",
+                self.collection_name
+            ))
+        })?;
+
+        match cfg.config {
+            Some(Config::Params(p)) => Ok(p.size),
+            Some(Config::ParamsMap(_)) => Err(QdrantError::CollectionError(format!(
+                "collection '{}' uses named-vector ParamsMap; \
+                 dimension check expects a single unnamed vector",
+                self.collection_name
+            ))),
+            None => Err(QdrantError::CollectionError(format!(
+                "collection '{}' vectors_config is empty",
+                self.collection_name
+            ))),
+        }
+    }
+
+    /// Refuse to use the collection if its persisted vector dimension
+    /// disagrees with `expected` (#37).
+    ///
+    /// Mirrors `LanceDBStore::add_document`'s per-row dimension check
+    /// (`graphrag-server/src/lancedb_store.rs:153`), but is invoked once
+    /// at startup so a misconfigured `EMBEDDING_DIM` produces a clear
+    /// fatal log instead of silently corrupting the collection one
+    /// upsert at a time.
+    pub async fn verify_collection_dimension(&self, expected: u64) -> Result<(), QdrantError> {
+        let actual = self.collection_vector_dim().await?;
+        check_collection_dimension(expected, actual, &self.collection_name)
+    }
+
     /// Delete the collection
     #[allow(dead_code)]
     pub async fn delete_collection(&self) -> Result<(), QdrantError> {
@@ -298,6 +359,25 @@ impl QdrantStore {
     #[allow(dead_code)]
     pub fn collection_name(&self) -> &str {
         &self.collection_name
+    }
+}
+
+/// Pure dimension-mismatch check, factored out of
+/// `verify_collection_dimension` so it can be unit-tested without a
+/// live Qdrant server (#37).
+fn check_collection_dimension(
+    expected: u64,
+    actual: u64,
+    collection: &str,
+) -> Result<(), QdrantError> {
+    if expected == actual {
+        Ok(())
+    } else {
+        Err(QdrantError::CollectionError(format!(
+            "vector dimension mismatch on collection '{collection}': \
+             EMBEDDING_DIM={expected} but stored vectors are {actual}-dim. \
+             Refuse to start to avoid corrupting the collection."
+        )))
     }
 }
 
@@ -484,6 +564,30 @@ mod tests {
         );
         let err = try_decode_search_result(point).expect_err("should fail, not panic");
         assert!(matches!(err, QdrantError::OperationError(_)));
+    }
+
+    // check_collection_dimension passes when expected == actual (#37).
+    #[test]
+    fn check_collection_dimension_accepts_match() {
+        check_collection_dimension(384, 384, "graphrag").expect("matching dims must pass");
+    }
+
+    // check_collection_dimension surfaces a CollectionError when the
+    // configured EMBEDDING_DIM differs from the live collection's stored
+    // vector size, with the actual/expected values in the message so the
+    // operator can act on it. (#37 — previously a 768-dim embedding shipped
+    // against a 384-dim collection silently corrupted the index.)
+    #[test]
+    fn check_collection_dimension_errors_on_mismatch() {
+        let err = check_collection_dimension(768, 384, "graphrag")
+            .expect_err("mismatched dims must error");
+        let msg = match err {
+            QdrantError::CollectionError(s) => s,
+            other => panic!("expected CollectionError, got {other:?}"),
+        };
+        assert!(msg.contains("graphrag"), "msg should name collection: {msg}");
+        assert!(msg.contains("384"), "msg should include actual dim: {msg}");
+        assert!(msg.contains("768"), "msg should include expected dim: {msg}");
     }
 
     // metadata_to_payload round-trips a normal DocumentMetadata.

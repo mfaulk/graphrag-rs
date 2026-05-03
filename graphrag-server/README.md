@@ -629,6 +629,19 @@ curl http://localhost:6333/healthz
 cargo run --bin graphrag-server 2>&1 | grep collection
 ```
 
+### "Qdrant collection dimension check failed"
+
+**Cause:** `EMBEDDING_DIM` (default `384`) disagrees with the vector
+dimension of the existing Qdrant collection. The server now refuses to
+start in that case to avoid silently corrupting the collection one
+upsert at a time.
+
+**Solutions:**
+1. Set `EMBEDDING_DIM` to match the existing collection (e.g. `768` or
+   `1024` if you previously created one with a different model).
+2. Use a different `COLLECTION_NAME` to start fresh.
+3. Drop and recreate the collection if its data is no longer needed.
+
 ### Slow query performance
 
 **Cause:** Large dataset without proper indexing.
