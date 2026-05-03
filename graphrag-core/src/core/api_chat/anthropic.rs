@@ -418,6 +418,9 @@ mod tests {
     /// `AnthropicChat::from_env` reads `ANTHROPIC_API_KEY`.
     #[test]
     fn anthropic_chat_from_env_reads_api_key() {
+        // Serialize against any other test in the process that mutates
+        // OPENAI_API_KEY / ANTHROPIC_API_KEY (see `super::super::test_env_lock`).
+        let _guard = crate::core::api_chat::test_env_lock::lock();
         let prev = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-from-env");
         let backend = AnthropicChat::from_env_default().expect("env-based ctor ok");

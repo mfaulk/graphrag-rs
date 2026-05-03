@@ -382,8 +382,9 @@ mod tests {
     /// `OpenAiChat::from_env` reads `OPENAI_API_KEY` and errors when unset.
     #[test]
     fn openai_chat_from_env_reads_api_key() {
-        // Use a unique env var setup to avoid clobbering other tests.
-        // Save and restore.
+        // Serialize against any other test in the process that mutates
+        // OPENAI_API_KEY / ANTHROPIC_API_KEY (see `super::super::test_env_lock`).
+        let _guard = crate::core::api_chat::test_env_lock::lock();
         let prev = std::env::var("OPENAI_API_KEY").ok();
         std::env::set_var("OPENAI_API_KEY", "sk-from-env");
         let backend = OpenAiChat::from_env_default().expect("env-based ctor ok");

@@ -223,6 +223,9 @@ mod tests {
     /// instead of attempting an unauthenticated request.
     #[test]
     fn build_errors_when_no_api_key_and_no_env() {
+        // Serialize against any other test in the process that mutates
+        // OPENAI_API_KEY / ANTHROPIC_API_KEY (see `super::super::test_env_lock`).
+        let _guard = crate::core::api_chat::test_env_lock::lock();
         let prev = std::env::var("OPENAI_API_KEY").ok();
         std::env::remove_var("OPENAI_API_KEY");
         let cfg = ChatProviderConfig {
@@ -305,6 +308,9 @@ mod tests {
     /// with an empty bearer token.
     #[test]
     fn build_errors_on_empty_api_key_in_env() {
+        // Serialize against any other test in the process that mutates
+        // OPENAI_API_KEY / ANTHROPIC_API_KEY (see `super::super::test_env_lock`).
+        let _guard = crate::core::api_chat::test_env_lock::lock();
         let prev = std::env::var("OPENAI_API_KEY").ok();
         std::env::set_var("OPENAI_API_KEY", "");
         let cfg = ChatProviderConfig {
