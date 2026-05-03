@@ -94,19 +94,24 @@ where
         }
     }
 
-    /// Get a value from the cache, returning None if not found or expired
+    /// Get a value from the cache, returning None if not found or expired.
+    ///
+    /// Resolves the entry once under a single write-lock borrow: a single
+    /// `get_mut` both promotes recency and lets us read TTL/value, so there
+    /// is no window between the expiry check and the access in which the
+    /// entry could become stale. If expired, we pop and return None. The
+    /// previous peek-then-get_mut shape worked but did two hash lookups
+    /// per call and is more fragile if the lock scope is ever loosened.
     pub fn get(&self, key: &K) -> Option<V> {
         let mut cache = self.cache.write();
-        // Check TTL via `peek` first so an expired entry doesn't get
-        // promoted to most-recently-used before being evicted.
-        if let Some(entry) = cache.peek(key) {
-            if entry.is_expired() {
-                cache.pop(key);
-                return None;
-            }
+        // Single lookup: `get_mut` both finds the entry and bumps it to MRU.
+        let entry = cache.get_mut(key)?;
+        if entry.is_expired() {
+            // End the mutable borrow before mutating the cache via `pop`.
+            cache.pop(key);
+            return None;
         }
-        // `get_mut` bumps the entry to most-recently-used.
-        cache.get_mut(key).map(|entry| entry.access())
+        Some(entry.access())
     }
 
     /// Put a value into the cache, evicting the LRU entry if at capacity
@@ -520,6 +525,26 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(15));
         assert!(entry.is_expired());
+    }
+
+    // Regression for #106 review: L1Cache::get must check expiry under the
+    // same write-lock borrow as the recency promotion. A peek-then-get_mut
+    // split (or any code path that re-resolves the entry between TTL check
+    // and access) leaves a window where an entry that was live during peek
+    // can expire before access. Inserting with a 1ms TTL and reading after
+    // 5ms must always return None — never the stale value.
+    #[test]
+    fn l1_cache_get_does_not_return_expired_entry() {
+        let cache: L1Cache<&'static str, &'static str> =
+            L1Cache::new(4, Some(Duration::from_millis(1)));
+
+        cache.put("k", "v");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            cache.get(&"k"),
+            None,
+            "an entry past its TTL must never be returned"
+        );
     }
 
     // Inserting beyond max_size evicts the least-recently-used entry, not
