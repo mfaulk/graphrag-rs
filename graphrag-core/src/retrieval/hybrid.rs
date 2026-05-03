@@ -557,20 +557,25 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // Mimic the real semantic_search content: a placeholder string derived
+    // from the id (see `semantic_search` which uses the id as content).
     fn semantic(id: &str, score: f32) -> (String, f32, String) {
-        (id.to_string(), score, format!("content of {id}"))
+        (id.to_string(), score, format!("semantic-placeholder-{id}"))
     }
 
+    // Mimic real BM25 results carrying the actual document text.
     fn keyword(id: &str, score: f32) -> BM25Result {
         BM25Result {
             doc_id: id.to_string(),
             score,
-            content: format!("content of {id}"),
+            content: format!("real-bm25-text-{id}"),
         }
     }
 
     // RRF fusion preserves expected scores and content while consuming
-    // its inputs (regression for #108: drained, not cloned).
+    // its inputs (regression for #108: drained, not cloned). For ids that
+    // appear in both inputs the keyword (BM25) content must win, since
+    // the semantic side carries only an id-derived placeholder.
     #[test]
     fn rrf_fusion_consumes_inputs_and_preserves_output() {
         let mut retriever = HybridRetriever::with_config(HybridConfig {
@@ -587,9 +592,12 @@ mod tests {
 
         let by_id: HashMap<_, _> = results.iter().map(|r| (r.id.clone(), r)).collect();
         assert_eq!(by_id.len(), 3, "expected ids a, b, c");
-        assert_eq!(by_id["a"].content, "content of a");
-        assert_eq!(by_id["b"].content, "content of b");
-        assert_eq!(by_id["c"].content, "content of c");
+        assert_eq!(by_id["a"].content, "semantic-placeholder-a");
+        assert_eq!(
+            by_id["b"].content, "real-bm25-text-b",
+            "overlapping id must keep keyword content, not semantic placeholder"
+        );
+        assert_eq!(by_id["c"].content, "real-bm25-text-c");
         assert!(
             by_id["b"].score >= by_id["a"].score,
             "b appears in both lists"
@@ -597,7 +605,8 @@ mod tests {
     }
 
     // Weighted fusion preserves expected scores and content while
-    // consuming its inputs (regression for #108).
+    // consuming its inputs (regression for #108). Keyword content must
+    // win for ids present in both input sets.
     #[test]
     fn weighted_fusion_consumes_inputs_and_preserves_output() {
         let mut retriever = HybridRetriever::with_config(HybridConfig {
@@ -615,8 +624,11 @@ mod tests {
 
         let by_id: HashMap<_, _> = results.iter().map(|r| (r.id.clone(), r)).collect();
         assert_eq!(by_id.len(), 3, "expected ids a, b, c");
-        assert_eq!(by_id["a"].content, "content of a");
-        assert_eq!(by_id["b"].content, "content of b");
-        assert_eq!(by_id["c"].content, "content of c");
+        assert_eq!(by_id["a"].content, "semantic-placeholder-a");
+        assert_eq!(
+            by_id["b"].content, "real-bm25-text-b",
+            "overlapping id must keep keyword content, not semantic placeholder"
+        );
+        assert_eq!(by_id["c"].content, "real-bm25-text-c");
     }
 }
