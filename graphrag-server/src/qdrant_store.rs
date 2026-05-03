@@ -585,9 +585,15 @@ mod tests {
             QdrantError::CollectionError(s) => s,
             other => panic!("expected CollectionError, got {other:?}"),
         };
-        assert!(msg.contains("graphrag"), "msg should name collection: {msg}");
+        assert!(
+            msg.contains("graphrag"),
+            "msg should name collection: {msg}"
+        );
         assert!(msg.contains("384"), "msg should include actual dim: {msg}");
-        assert!(msg.contains("768"), "msg should include expected dim: {msg}");
+        assert!(
+            msg.contains("768"),
+            "msg should include expected dim: {msg}"
+        );
     }
 
     // metadata_to_payload round-trips a normal DocumentMetadata.
