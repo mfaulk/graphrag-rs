@@ -10,6 +10,12 @@ pub mod metadata;
 #[cfg(feature = "async")]
 pub mod backend;
 
+// Native HTTP chat backends for OpenAI and Anthropic. Requires `async` for
+// the `ChatBackend` async trait and `ureq` for the sync HTTP client (the
+// same combination used by `embeddings::api_providers`).
+#[cfg(all(feature = "async", feature = "ureq"))]
+pub mod api_chat;
+
 // Registry requires async feature (uses storage)
 #[cfg(feature = "async")]
 pub mod registry;
