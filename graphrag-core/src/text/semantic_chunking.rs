@@ -446,8 +446,18 @@ mod tests {
         assert_eq!(result, 0.0, "empty diffs should yield default threshold");
     }
 
-    // embed_sentences must use a single batch call, producing the same
-    // vectors as EmbeddingGenerator::batch_generate (regression for #103).
+    // embed_sentences must produce the same vectors as
+    // EmbeddingGenerator::batch_generate (regression for #103).
+    //
+    // LIMITATION: this test cannot prove that `embed_sentences` actually
+    // uses the batched code path. `EmbeddingGenerator::batch_generate`
+    // currently delegates to `generate_embedding` per item, so a
+    // hypothetical regression that re-introduces a per-sentence loop
+    // would still produce identical output and pass this test. Verifying
+    // call-count behavior would require either making the embedder
+    // injectable behind a trait or adding a counting wrapper, both of
+    // which are out of scope here. The test still guards against output
+    // shape/content drift between the chunker and the embedder.
     #[test]
     fn embed_sentences_uses_batch_call() {
         let config = SemanticChunkerConfig::default();
