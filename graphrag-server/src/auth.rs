@@ -117,10 +117,7 @@ impl AuthState {
         role: UserRole,
         duration_hours: u64,
     ) -> Result<String, AuthError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_secs(std::time::SystemTime::now())?;
 
         let claims = Claims {
             sub: user_id.to_string(),
@@ -192,10 +189,7 @@ impl AuthState {
         user_id: &str,
         limit: &RateLimit,
     ) -> Result<(), AuthError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_secs(std::time::SystemTime::now())?;
 
         let mut rate_limits = self.rate_limits.write().await;
 
@@ -220,6 +214,18 @@ impl AuthState {
 
         Ok(())
     }
+}
+
+/// Convert a `SystemTime` to seconds since the UNIX epoch.
+///
+/// Returns `AuthError::TokenGenerationFailed` instead of panicking when
+/// the clock is set before 1970 — both `generate_token` and
+/// `check_rate_limit` previously called `.unwrap()` on the result and
+/// would crash the worker thread (#45).
+fn unix_secs(t: std::time::SystemTime) -> Result<u64, AuthError> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| AuthError::TokenGenerationFailed(format!("system clock before UNIX epoch: {e}")))
 }
 
 /// Authentication errors
@@ -395,6 +401,26 @@ mod tests {
 
         assert_eq!(api_key.user_id, "user123");
         assert_eq!(api_key.role, UserRole::User);
+    }
+
+    // Pre-UNIX-epoch SystemTime values must surface as TokenGenerationFailed
+    // instead of panicking via .unwrap() (regression for #45).
+    #[test]
+    fn unix_secs_returns_err_on_pre_epoch_clock() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let result = unix_secs(before_epoch);
+        assert!(
+            matches!(result, Err(AuthError::TokenGenerationFailed(_))),
+            "expected TokenGenerationFailed, got {result:?}"
+        );
+    }
+
+    // Sanity check: a normal post-epoch SystemTime returns the seconds value.
+    #[test]
+    fn unix_secs_returns_seconds_for_post_epoch_clock() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let result = unix_secs(t).expect("post-epoch time must succeed");
+        assert_eq!(result, 1_700_000_000);
     }
 
     #[tokio::test]
