@@ -21,6 +21,21 @@ pub struct HttpEmbeddingProvider {
     client: ureq::Agent,
 }
 
+/// Owned snapshot of an `HttpEmbeddingProvider`'s HTTP-relevant fields.
+///
+/// Constructed by [`HttpEmbeddingProvider::request_ctx`] so the sync `ureq`
+/// HTTP path can be moved into `tokio::task::spawn_blocking`, which requires
+/// a `'static` closure (no borrows of `&self`).
+#[cfg(feature = "ureq")]
+#[derive(Clone)]
+struct HttpRequestCtx {
+    provider_type: EmbeddingProviderType,
+    api_key: String,
+    model: String,
+    endpoint: String,
+    client: ureq::Agent,
+}
+
 impl HttpEmbeddingProvider {
     /// Create OpenAI embeddings provider
     ///
@@ -215,8 +230,39 @@ impl HttpEmbeddingProvider {
         Ok(provider)
     }
 
+    /// Override the HTTP endpoint. Intended for redirecting requests to a
+    /// local mock server in integration tests.
+    #[doc(hidden)]
+    pub fn with_endpoint_for_tests(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// Snapshot of the fields needed by the sync HTTP path. Cloned out of
+    /// `&self` before crossing into `tokio::task::spawn_blocking`, which
+    /// requires a `'static` closure.
     #[cfg(feature = "ureq")]
-    fn make_request(&self, input: &str) -> Result<Vec<f32>> {
+    fn request_ctx(&self) -> HttpRequestCtx {
+        HttpRequestCtx {
+            provider_type: self.provider_type.clone(),
+            api_key: self.api_key.clone(),
+            model: self.model.clone(),
+            endpoint: self.endpoint.clone(),
+            client: self.client.clone(),
+        }
+    }
+
+    #[cfg(not(feature = "ureq"))]
+    fn unsupported_without_ureq<T>() -> Result<T> {
+        Err(GraphRAGError::Embedding {
+            message: "ureq feature required for HTTP-based embeddings".to_string(),
+        })
+    }
+}
+
+#[cfg(feature = "ureq")]
+impl HttpRequestCtx {
+    fn make_request(self, input: &str) -> Result<Vec<f32>> {
         // Build request body based on provider
         let request_body = match self.provider_type {
             EmbeddingProviderType::OpenAI => {
@@ -312,35 +358,28 @@ impl HttpEmbeddingProvider {
         Ok(embedding)
     }
 
-    #[cfg(not(feature = "ureq"))]
-    fn make_request(&self, _input: &str) -> Result<Vec<f32>> {
-        Err(GraphRAGError::Embedding {
-            message: "ureq feature required for HTTP-based embeddings".to_string(),
-        })
-    }
+    fn make_batch_request(self, inputs: Vec<String>) -> Result<Vec<Vec<f32>>> {
+        let input_refs: Vec<&str> = inputs.iter().map(|s| s.as_str()).collect();
 
-    /// Make batch embedding request for multiple texts
-    #[cfg(feature = "ureq")]
-    fn make_batch_request(&self, inputs: &[&str]) -> Result<Vec<Vec<f32>>> {
         // Build request body based on provider
         let request_body = match self.provider_type {
             EmbeddingProviderType::OpenAI => {
                 serde_json::json!({
                     "model": self.model.clone(),
-                    "input": inputs,
+                    "input": &input_refs,
                 })
             },
             EmbeddingProviderType::VoyageAI => {
                 serde_json::json!({
                     "model": self.model.clone(),
-                    "input": inputs,
+                    "input": &input_refs,
                     "input_type": "document",
                 })
             },
             EmbeddingProviderType::Cohere => {
                 serde_json::json!({
                     "model": self.model.clone(),
-                    "texts": inputs,
+                    "texts": &input_refs,
                     "input_type": "search_document",
                     "embedding_types": vec!["float"],
                 })
@@ -350,7 +389,7 @@ impl HttpEmbeddingProvider {
             | EmbeddingProviderType::TogetherAI => {
                 serde_json::json!({
                     "model": self.model.clone(),
-                    "input": inputs,
+                    "input": &input_refs,
                 })
             },
             _ => {
@@ -447,13 +486,6 @@ impl HttpEmbeddingProvider {
 
         Ok(embeddings)
     }
-
-    #[cfg(not(feature = "ureq"))]
-    fn make_batch_request(&self, _inputs: &[&str]) -> Result<Vec<Vec<f32>>> {
-        Err(GraphRAGError::Embedding {
-            message: "ureq feature required for batch embeddings".to_string(),
-        })
-    }
 }
 
 #[async_trait::async_trait]
@@ -464,7 +496,24 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
     }
 
     async fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        self.make_request(text)
+        #[cfg(feature = "ureq")]
+        {
+            // `ureq` is synchronous; dispatch to the blocking pool so the
+            // running tokio worker is not parked for the entire HTTP
+            // round-trip (issue #4).
+            let ctx = self.request_ctx();
+            let owned = text.to_string();
+            tokio::task::spawn_blocking(move || ctx.make_request(&owned))
+                .await
+                .map_err(|e| GraphRAGError::Embedding {
+                    message: format!("HTTP worker task panicked or was cancelled: {}", e),
+                })?
+        }
+
+        #[cfg(not(feature = "ureq"))]
+        {
+            Self::unsupported_without_ureq()
+        }
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -480,8 +529,16 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
 
         #[cfg(feature = "ureq")]
         {
-            // Try batch request for supported providers
-            match self.make_batch_request(texts) {
+            // Try batch request for supported providers; like `embed`, dispatch
+            // the sync HTTP call to the blocking pool (issue #4).
+            let ctx = self.request_ctx();
+            let owned: Vec<String> = texts.iter().map(|s| s.to_string()).collect();
+            let batch_result = tokio::task::spawn_blocking(move || ctx.make_batch_request(owned))
+                .await
+                .map_err(|e| GraphRAGError::Embedding {
+                    message: format!("HTTP worker task panicked or was cancelled: {}", e),
+                })?;
+            match batch_result {
                 Ok(embeddings) => return Ok(embeddings),
                 Err(_) => {
                     // Fallback to sequential requests if batch fails
