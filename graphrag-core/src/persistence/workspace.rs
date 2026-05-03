@@ -178,10 +178,26 @@ impl WorkspaceManager {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Load metadata
-                let metadata = self
-                    .load_metadata(&workspace_name)
-                    .unwrap_or_else(|_| WorkspaceMetadata::new(workspace_name.clone()));
+                // Load metadata. If it's missing or unreadable, skip the
+                // workspace from the listing rather than synthesize fresh
+                // defaults — the previous behaviour silently surfaced
+                // corrupt or partially-initialized directories as healthy
+                // workspaces with `modified_at = now`, which then sorted to
+                // the top of the list. Surface the failure in the log so
+                // operators can investigate (#23).
+                let metadata = match self.load_metadata(&workspace_name) {
+                    Ok(m) => m,
+                    Err(_e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            workspace = %workspace_name,
+                            error = %_e,
+                            "Skipping workspace from listing: metadata unreadable. \
+                             Inspect metadata.toml or remove the directory."
+                        );
+                        continue;
+                    },
+                };
 
                 // Calculate size
                 let size_bytes = Self::calculate_dir_size(&path).unwrap_or(0);
@@ -438,5 +454,29 @@ mod tests {
     fn new_metadata_carries_current_format_version() {
         let m = WorkspaceMetadata::new("fresh".to_string());
         assert_eq!(m.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    // Regression for #23: a workspace dir whose metadata.toml is unreadable
+    // (corrupt TOML) must not be silently surfaced as a fresh, healthy
+    // workspace by list_workspaces. It should be skipped from the listing.
+    #[test]
+    fn list_workspaces_skips_workspace_with_corrupt_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+
+        workspace.create_workspace("good").unwrap();
+        workspace.create_workspace("broken").unwrap();
+
+        // Stomp on the broken workspace's metadata with garbage TOML.
+        let bad_meta_path = temp_dir.path().join("broken").join("metadata.toml");
+        fs::write(&bad_meta_path, "this is :: not :: valid :: toml @@@").unwrap();
+
+        let listed = workspace.list_workspaces().unwrap();
+        let names: Vec<&str> = listed.iter().map(|w| w.name.as_str()).collect();
+        assert!(names.contains(&"good"), "good workspace should be listed");
+        assert!(
+            !names.contains(&"broken"),
+            "broken workspace must not be silently listed with synthesized defaults"
+        );
     }
 }
