@@ -181,32 +181,56 @@ impl AsyncGraphRAG {
 
     /// Build the knowledge graph from documents asynchronously
     pub async fn build_graph(&mut self) -> Result<()> {
+        use futures::stream::{self, StreamExt};
+
+        tracing::info!("Building knowledge graph asynchronously");
+
+        // Snapshot the chunks under a read-equivalent borrow, then release the
+        // write lock before launching extraction futures so the &self borrow used
+        // by extract_entities_async doesn't conflict with the &mut graph borrow.
+        let chunks: Vec<TextChunk> = {
+            let graph_guard = self.knowledge_graph.read().await;
+            let graph = graph_guard.as_ref().ok_or_else(|| GraphRAGError::Config {
+                message: "Knowledge graph not initialized".to_string(),
+            })?;
+            graph.chunks().cloned().collect()
+        };
+
+        // Concurrency cap for entity extraction. Default 8 balances OpenAI-class
+        // remote LLMs (which can take more) and local Ollama (typically 4-8).
+        // TODO: surface as a Config field (`entity_extraction_concurrency`).
+        const ENTITY_EXTRACTION_CONCURRENCY: usize = 8;
+
+        // Run extractions concurrently, bounded. Each future returns its chunk id
+        // alongside the result so the serial graph-mutation loop can find the
+        // right chunk regardless of completion order. Reborrow self as &Self so
+        // the closure captures a shared reference (extract_entities_async is &self).
+        let this: &Self = self;
+        let extractions: Vec<(crate::core::ChunkId, Result<Vec<Entity>>)> =
+            stream::iter(chunks.iter())
+                .map(|chunk| async move {
+                    let result = this.extract_entities_async(chunk).await;
+                    (chunk.id.clone(), result)
+                })
+                .buffer_unordered(ENTITY_EXTRACTION_CONCURRENCY)
+                .collect()
+                .await;
+
+        // Serially apply results to the graph. `?` preserves fail-fast semantics.
         let mut graph_guard = self.knowledge_graph.write().await;
         let graph = graph_guard.as_mut().ok_or_else(|| GraphRAGError::Config {
             message: "Knowledge graph not initialized".to_string(),
         })?;
-
-        tracing::info!("Building knowledge graph asynchronously");
-
-        // Extract entities from all chunks asynchronously
-        let chunks: Vec<_> = graph.chunks().cloned().collect();
         let mut total_entities = 0;
-
-        // For each chunk, extract entities (would use AsyncEntityExtractor in full implementation)
-        for chunk in &chunks {
-            // Simulate async entity extraction
-            let entities = self.extract_entities_async(chunk).await?;
-
-            // Add entities to the graph
+        for (chunk_id, entities) in extractions {
+            let entities = entities?;
             let mut chunk_entity_ids = Vec::new();
             for entity in entities {
                 chunk_entity_ids.push(entity.id.clone());
                 graph.add_entity(entity)?;
                 total_entities += 1;
             }
-
-            // Update chunk with entity references
-            if let Some(existing_chunk) = graph.get_chunk_mut(&chunk.id) {
+            if let Some(existing_chunk) = graph.get_chunk_mut(&chunk_id) {
                 existing_chunk.entities = chunk_entity_ids;
             }
         }
@@ -222,6 +246,13 @@ impl AsyncGraphRAG {
     async fn extract_entities_async(&self, chunk: &TextChunk) -> Result<Vec<Entity>> {
         // Simulate async processing delay
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+
+        // Test-only barrier injection point: lets tests assert that all chunk
+        // extractions can be in flight simultaneously. Sequential code deadlocks here.
+        #[cfg(test)]
+        if let Some(barrier) = tests::TEST_EXTRACTION_BARRIER.get() {
+            barrier.wait().await;
+        }
 
         // Simple entity extraction for demo (would use actual async implementation)
         let content = chunk.content.to_lowercase();
@@ -604,6 +635,14 @@ impl Default for AsyncGraphRAGBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ChunkId;
+    use std::sync::OnceLock;
+    use tokio::sync::Barrier;
+
+    /// Test hook: when set, every `extract_entities_async` call awaits this barrier
+    /// before returning. Tests use it to assert that build_graph runs extractions
+    /// concurrently — sequential code deadlocks when the barrier expects N parties.
+    pub(super) static TEST_EXTRACTION_BARRIER: OnceLock<Arc<Barrier>> = OnceLock::new();
 
     #[tokio::test]
     async fn test_async_graphrag_creation() {
@@ -661,5 +700,61 @@ mod tests {
         let stats = graphrag.get_performance_stats().await;
         assert_eq!(stats.total_documents, 0);
         assert_eq!(stats.health_status, AsyncHealthStatus::Healthy);
+    }
+
+    /// Verifies build_graph runs entity extraction concurrently across chunks
+    /// (sequential code deadlocks on an N-party barrier; concurrent code clears it).
+    #[tokio::test]
+    async fn test_build_graph_extracts_entities_concurrently() {
+        const N_CHUNKS: usize = 8;
+
+        // Install a barrier expecting all N extractions to be in flight at once.
+        let barrier = Arc::new(Barrier::new(N_CHUNKS));
+        TEST_EXTRACTION_BARRIER
+            .set(barrier)
+            .expect("barrier already set; tests must not run twice in same process");
+
+        let config = Config::default();
+        let mut graphrag = AsyncGraphRAG::new(config).await.unwrap();
+
+        // Manually seed the knowledge graph (skip initialize() which requires
+        // async-traits feature for the mock LLM).
+        {
+            let mut graph_guard = graphrag.knowledge_graph.write().await;
+            let mut graph = KnowledgeGraph::new();
+            let doc_id = DocumentId::new("doc-0".to_string());
+            let chunks: Vec<TextChunk> = (0..N_CHUNKS)
+                .map(|i| {
+                    TextChunk::new(
+                        ChunkId::new(format!("chunk-{i}")),
+                        doc_id.clone(),
+                        format!("Tom and Huck were here in chunk {i}"),
+                        0,
+                        32,
+                    )
+                })
+                .collect();
+            let document = Document {
+                id: doc_id,
+                title: "test".to_string(),
+                content: "test".to_string(),
+                metadata: Default::default(),
+                chunks,
+            };
+            graph.add_document(document).unwrap();
+            *graph_guard = Some(graph);
+        }
+
+        // Sequential code can only have one extraction in flight at a time, so the
+        // N-party barrier never clears and build_graph hangs. We give it a generous
+        // timeout to fail fast on regression.
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), graphrag.build_graph()).await;
+
+        assert!(
+            result.is_ok(),
+            "build_graph deadlocked or timed out — extractions ran sequentially"
+        );
+        result.unwrap().expect("build_graph returned error");
     }
 }
