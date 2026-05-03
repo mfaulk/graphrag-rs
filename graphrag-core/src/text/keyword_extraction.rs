@@ -1,7 +1,4 @@
-//! Real TF-IDF keyword extraction
-//!
-//! This module implements actual TF-IDF (Term Frequency-Inverse Document Frequency)
-//! algorithm for keyword extraction, not mock/placeholder implementations.
+//! TF-IDF keyword extraction.
 
 use std::collections::HashMap;
 

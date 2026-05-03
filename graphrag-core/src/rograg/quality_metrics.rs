@@ -1,7 +1,4 @@
-//! Quality metrics and performance tracking for ROGRAG system
-//!
-//! Provides comprehensive metrics collection and analysis to measure
-//! the effectiveness and improvement of the ROGRAG system over baseline GraphRAG.
+//! Quality metrics for ROGRAG runs (per-query and aggregate).
 
 #[cfg(feature = "rograg")]
 use crate::rograg::{DecompositionResult, RogragResponse};

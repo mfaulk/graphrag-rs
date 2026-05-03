@@ -1,29 +1,6 @@
-//! GraphRAG REST API Server with Actix-web and Apistos OpenAPI
+//! GraphRAG REST API server (Actix-web + Apistos OpenAPI).
 //!
-//! Production-ready REST API for GraphRAG operations with automatic OpenAPI documentation.
-//!
-//! ## Features
-//! - Automatic OpenAPI 3.0.3 documentation via Apistos
-//! - Interactive Swagger UI at /swagger
-//! - Qdrant vector database integration (optional)
-//! - JWT and API key authentication (optional)
-//! - Request validation and rate limiting
-//!
-//! ## Quick Start
-//!
-//! ```bash
-//! # 1. Start Qdrant (Docker)
-//! docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
-//!
-//! # 2. Start server with Qdrant
-//! cargo run --bin graphrag-server --features qdrant
-//!
-//! # 3. Or without Qdrant (mock mode)
-//! cargo run --bin graphrag-server --no-default-features
-//!
-//! # 4. View Swagger UI
-//! # Browser: http://localhost:8080/swagger
-//! ```
+//! See the README for setup, feature flags, and Swagger UI usage.
 
 use actix_cors::Cors;
 use actix_web::{

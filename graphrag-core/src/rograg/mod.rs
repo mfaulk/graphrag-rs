@@ -1,46 +1,7 @@
-//! ROGRAG (Robustly Optimized GraphRAG) module - Reasoning on Graphs for RAG
+//! ROGRAG (Robustly Optimized GraphRAG): logic-form, fuzzy, and decomposition-based query strategies.
 //!
-//! This module implements a sophisticated query processing system that combines
-//! structured reasoning with graph-based retrieval for enhanced accuracy and robustness.
-//!
-//! # Architecture
-//!
-//! ROGRAG introduces three primary retrieval strategies:
-//!
-//! 1. **Logic Form Retrieval** - Parses queries into structured logic forms for precise graph traversal
-//! 2. **Fuzzy Matching** - Provides semantic similarity-based fallback when logic forms fail
-//! 3. **Query Decomposition** - Breaks complex queries into manageable subqueries
-//!
-//! # Key Components
-//!
-//! - [`decomposer`] - Query decomposition using semantic/syntactic/hybrid strategies
-//! - [`fuzzy_matcher`] - Semantic similarity matching for entities and content chunks
-//! - [`intent_classifier`] - Query intent detection with refusal capabilities
-//! - [`logic_form`] - Structured query representation and execution
-//! - [`processor`] - Main ROGRAG processing pipeline orchestration
-//! - [`validator`] - Query validation and quality assessment
-//! - [`quality_metrics`] - Performance and quality tracking
-//! - [`streaming`] - Streaming response generation
-//!
-//! # Usage Example
-//!
-//! ```rust,ignore
-//! use graphrag_core::rograg::{RogragProcessor, RogragConfig};
-//!
-//! // Initialize the ROGRAG processor
-//! let processor = RogragProcessor::new(RogragConfig::default())?;
-//!
-//! // Process a query
-//! let result = processor.process_query(
-//!     "How are Entity A and Entity B related?",
-//!     &knowledge_graph
-//! ).await?;
-//! ```
-//!
-//! # Quality Assurance
-//!
-//! The ROGRAG module includes built-in validation, quality metrics, and intent
-//! classification to ensure reliable operation and prevent inappropriate responses.
+//! Strategies fall back in order — logic-form parsing, then fuzzy matching, then query decomposition.
+//! See [`processor`] for the orchestration entry point.
 
 #[cfg(feature = "rograg")]
 pub mod decomposer;

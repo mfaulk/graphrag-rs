@@ -1,39 +1,4 @@
-//! Distributed Caching with Redis
-//!
-//! This module provides distributed caching for GraphRAG using Redis. It enables:
-//! - Multi-level caching (L1/L2/L3)
-//! - Cache coherence across multiple server instances
-//! - Predictive prefetching
-//! - Cache warming strategies
-//!
-//! ## Architecture
-//!
-//! ```text
-//! ┌─────────────────────────────────────┐
-//! │          Application                │
-//! └──────────────┬──────────────────────┘
-//!                │
-//! ┌──────────────▼──────────────────────┐
-//! │       Cache Manager                 │
-//! │  ┌────────────────────────────┐     │
-//! │  │ L1: In-Memory (Fast)       │     │
-//! │  │ - LRU eviction            │     │
-//! │  │ - 100ms TTL               │     │
-//! │  └────────────┬───────────────┘     │
-//! │               │                     │
-//! │  ┌────────────▼───────────────┐     │
-//! │  │ L2: Redis (Distributed)    │     │
-//! │  │ - Shared across servers   │     │
-//! │  │ - 1h TTL                  │     │
-//! │  └────────────┬───────────────┘     │
-//! │               │                     │
-//! │  ┌────────────▼───────────────┐     │
-//! │  │ L3: Persistent Storage     │     │
-//! │  │ - Long-term cache         │     │
-//! │  │ - 24h+ TTL                │     │
-//! │  └────────────────────────────┘     │
-//! └─────────────────────────────────────┘
-//! ```
+//! Three-tier cache (L1 in-memory LRU, L2 Redis, L3 persistent) with cross-instance coherence.
 
 use lru::LruCache;
 use parking_lot::RwLock;
