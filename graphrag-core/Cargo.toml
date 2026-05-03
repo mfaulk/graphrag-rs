@@ -131,7 +131,7 @@ graphml-import = ["quick-xml"]  # GraphML format support
 rdf-import = ["oxrdf", "oxttl"] # RDF/Turtle format support
 
 # Caching features
-caching = ["moka", "tracing"]
+caching = ["moka", "tracing", "lru", "parking_lot"]
 
 # Incremental updates feature
 incremental = ["parking_lot", "dashmap"]

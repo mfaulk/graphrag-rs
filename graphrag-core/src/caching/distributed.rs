@@ -5,8 +5,9 @@
 //! - L2: Redis cache (distributed)
 //! - L3: Persistent storage (fallback)
 
+use lru::LruCache;
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -63,9 +64,15 @@ impl<T: Clone> CacheEntry<T> {
     }
 }
 
-/// L1 Cache: In-memory LRU cache
+/// L1 Cache: In-memory LRU cache.
+///
+/// Backed by `lru::LruCache` for O(1) get/put/eviction. The previous
+/// `HashMap` + `min_by_key` scan was O(n) per eviction under the write
+/// lock. The `RwLock` is preserved (rather than a `Mutex`) for parity with
+/// the rest of the file, but readers cannot share access — every operation
+/// (including `get`, which bumps recency) needs a write guard.
 pub struct L1Cache<K, V> {
-    cache: Arc<RwLock<HashMap<K, CacheEntry<V>>>>,
+    cache: Arc<RwLock<LruCache<K, CacheEntry<V>>>>,
     max_size: usize,
     default_ttl: Option<Duration>,
 }
@@ -77,8 +84,11 @@ where
 {
     /// Create a new L1 (in-memory) cache with the given maximum size and default TTL
     pub fn new(max_size: usize, default_ttl: Option<Duration>) -> Self {
+        // LruCache requires NonZeroUsize; clamp 0 → 1 so a misconfigured
+        // max_size doesn't panic.
+        let cap = NonZeroUsize::new(max_size.max(1)).expect("max(1) is non-zero");
         Self {
-            cache: Arc::new(RwLock::new(HashMap::with_capacity(max_size))),
+            cache: Arc::new(RwLock::new(LruCache::new(cap))),
             max_size,
             default_ttl,
         }
@@ -87,39 +97,28 @@ where
     /// Get a value from the cache, returning None if not found or expired
     pub fn get(&self, key: &K) -> Option<V> {
         let mut cache = self.cache.write();
-        if let Some(entry) = cache.get_mut(key) {
+        // Check TTL via `peek` first so an expired entry doesn't get
+        // promoted to most-recently-used before being evicted.
+        if let Some(entry) = cache.peek(key) {
             if entry.is_expired() {
-                cache.remove(key);
-                None
-            } else {
-                Some(entry.access())
+                cache.pop(key);
+                return None;
             }
-        } else {
-            None
         }
+        // `get_mut` bumps the entry to most-recently-used.
+        cache.get_mut(key).map(|entry| entry.access())
     }
 
-    /// Put a value into the cache, evicting the oldest entry if at capacity
+    /// Put a value into the cache, evicting the LRU entry if at capacity
     pub fn put(&self, key: K, value: V) {
         let mut cache = self.cache.write();
-
-        // Evict oldest entries if at capacity
-        if cache.len() >= self.max_size && !cache.contains_key(&key) {
-            if let Some(oldest_key) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_accessed)
-                .map(|(k, _)| k.clone())
-            {
-                cache.remove(&oldest_key);
-            }
-        }
-
-        cache.insert(key, CacheEntry::new(value, self.default_ttl));
+        // `LruCache::put` handles capacity-driven eviction internally.
+        cache.put(key, CacheEntry::new(value, self.default_ttl));
     }
 
     /// Invalidate (remove) a specific entry from the cache
     pub fn invalidate(&self, key: &K) {
-        self.cache.write().remove(key);
+        self.cache.write().pop(key);
     }
 
     /// Clear all entries from the cache
@@ -135,7 +134,7 @@ where
     /// Get cache statistics including size, capacity, and access count
     pub fn stats(&self) -> CacheStats {
         let cache = self.cache.read();
-        let total_accesses: u64 = cache.values().map(|e| e.access_count).sum();
+        let total_accesses: u64 = cache.iter().map(|(_, e)| e.access_count).sum();
         CacheStats {
             size: cache.len(),
             capacity: self.max_size,
@@ -521,6 +520,43 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(15));
         assert!(entry.is_expired());
+    }
+
+    // Inserting beyond max_size evicts the least-recently-used entry, not
+    // an arbitrary one — guards against regression to a non-LRU eviction.
+    #[test]
+    fn l1_cache_evicts_least_recently_used_entry() {
+        let cache: L1Cache<&'static str, &'static str> =
+            L1Cache::new(2, Some(Duration::from_secs(60)));
+
+        cache.put("a", "1");
+        cache.put("b", "2");
+        // Insert a third; "a" is LRU and should be evicted.
+        cache.put("c", "3");
+
+        assert_eq!(cache.size(), 2);
+        assert_eq!(cache.get(&"a"), None, "a was LRU and should be evicted");
+        assert_eq!(cache.get(&"b"), Some("2"));
+        assert_eq!(cache.get(&"c"), Some("3"));
+    }
+
+    // Calling get() on an existing entry must mark it as most-recently-used
+    // so a subsequent capacity-triggered eviction targets the next-oldest,
+    // not the just-touched key.
+    #[test]
+    fn l1_cache_get_marks_entry_as_most_recently_used() {
+        let cache: L1Cache<&'static str, &'static str> =
+            L1Cache::new(2, Some(Duration::from_secs(60)));
+
+        cache.put("a", "1");
+        cache.put("b", "2");
+        // Touch "a"; now "b" is the LRU.
+        assert_eq!(cache.get(&"a"), Some("1"));
+        cache.put("c", "3");
+
+        assert_eq!(cache.get(&"a"), Some("1"), "a was touched, must survive");
+        assert_eq!(cache.get(&"b"), None, "b became LRU and should be evicted");
+        assert_eq!(cache.get(&"c"), Some("3"));
     }
 
     // Regression for #23: bincode garbage in the L2 byte stream must surface
