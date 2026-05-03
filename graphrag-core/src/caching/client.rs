@@ -15,18 +15,28 @@ use tokio::sync::RwLock;
 
 /// Drive an async future from a sync trait method.
 ///
-/// Inside an existing tokio runtime we use `block_in_place` + `Handle::block_on`
-/// (the only safe way; constructing a fresh `Runtime` from inside one panics).
-/// Outside any runtime we build an ad-hoc one. `block_in_place` requires the
-/// multi-threaded scheduler — calling this from a `current_thread` runtime
-/// would still panic, but we now report ad-hoc runtime construction failures
-/// as a `Generation` error rather than the previous `unwrap`/`expect` panics.
+/// Bridge strategy by tokio runtime context:
+/// * `MultiThread` runtime: `block_in_place` + `Handle::block_on`.
+/// * `CurrentThread` runtime: returns `Generation` error — `block_in_place`
+///   would panic and `Handle::block_on` on `CurrentThread` deadlocks.
+/// * No runtime: builds an ad-hoc `Runtime`; surfaces construction failure as
+///   `Generation` rather than panicking.
 fn run_sync<F, T>(work: F) -> Result<T>
 where
     F: Future<Output = Result<T>>,
 {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| handle.block_on(work)),
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(work))
+            },
+            _ => Err(crate::core::GraphRAGError::Generation {
+                message: "CachedLLMClient sync trait methods require a multi-thread \
+                          tokio runtime when called from inside an async context; \
+                          use the *_async variants or switch to a multi_thread runtime"
+                    .to_string(),
+            }),
+        },
         Err(_) => match tokio::runtime::Runtime::new() {
             Ok(rt) => rt.block_on(work),
             Err(e) => Err(crate::core::GraphRAGError::Generation {
@@ -615,6 +625,31 @@ mod tests {
 
             let response = client.complete("Test prompt").unwrap();
             assert!(!response.is_empty());
+        });
+    }
+
+    // Sync `complete` returns a typed Generation error (not a panic) when
+    // invoked from inside a tokio current_thread runtime. Regression for #16.
+    #[test]
+    fn complete_returns_error_on_current_thread_runtime() {
+        let mock_llm = MockLLM::new().unwrap();
+        let config = CacheConfig::development();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let client = CachedLLMClient::new(mock_llm, config).await.unwrap();
+            let err = client
+                .complete("Test prompt")
+                .expect_err("expected typed error on current_thread runtime");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("current_thread") || msg.contains("multi-thread"),
+                "error should mention runtime flavor mismatch, got: {msg}"
+            );
         });
     }
 }

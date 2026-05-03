@@ -333,8 +333,12 @@ impl BoundaryAwareChunkingStrategy {
         )
     }
 
-    /// Chunk text asynchronously (helper for async contexts)
-    async fn chunk_async(&self, text: &str) -> Vec<TextChunk> {
+    /// Chunk text asynchronously.
+    ///
+    /// Prefer this over the sync `ChunkingStrategy::chunk` impl when calling
+    /// from inside a tokio runtime; `chunk` only works on the multi_thread
+    /// flavor and returns an empty `Vec` on `current_thread`.
+    pub async fn chunk_async(&self, text: &str) -> Vec<TextChunk> {
         // 1. Detect all semantic boundaries
         let boundaries = self.boundary_detector.detect_boundaries(text);
 
@@ -537,21 +541,31 @@ impl BoundaryAwareChunkingStrategy {
 
 impl ChunkingStrategy for BoundaryAwareChunkingStrategy {
     fn chunk(&self, text: &str) -> Vec<TextChunk> {
-        // The sync trait impl needs to drive async coherence scoring. Pick the
-        // bridging strategy by inspecting the calling context:
+        // The sync trait must drive async coherence scoring. Bridge by
+        // tokio runtime context:
         //
-        //   * If we're inside an existing tokio runtime, `block_in_place` +
-        //     `Handle::block_on` is the only safe path. Constructing a fresh
-        //     `Runtime` from inside another runtime panics with
-        //     "Cannot start a runtime from within a runtime."
-        //   * If we're not in any runtime, build one ad-hoc.
-        //
-        // `block_in_place` requires the multi-threaded scheduler. Callers on
-        // a `current_thread` runtime will panic — that's a runtime-flavor
-        // contract we can't surface through the infallible trait signature,
-        // so the constraint is documented on the trait.
+        //   * MultiThread runtime: `block_in_place` + `Handle::block_on`.
+        //   * CurrentThread runtime: `block_in_place` would panic and
+        //     `Handle::block_on` would deadlock. The trait signature is
+        //     infallible, so we log and return an empty `Vec` — callers
+        //     needing chunks from a current_thread context must drive
+        //     `chunk_async` directly.
+        //   * No runtime: build one ad-hoc; on construction failure, log
+        //     and return an empty `Vec`.
         match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(self.chunk_async(text))),
+            Ok(handle) => match handle.runtime_flavor() {
+                tokio::runtime::RuntimeFlavor::MultiThread => {
+                    tokio::task::block_in_place(|| handle.block_on(self.chunk_async(text)))
+                },
+                _ => {
+                    tracing::warn!(
+                        "BoundaryAwareChunkingStrategy::chunk called from a tokio \
+                         current_thread runtime; the sync trait requires multi_thread. \
+                         Returning empty chunk list — call chunk_async directly instead."
+                    );
+                    Vec::new()
+                },
+            },
             Err(_) => match tokio::runtime::Runtime::new() {
                 Ok(rt) => rt.block_on(self.chunk_async(text)),
                 Err(e) => {
@@ -602,6 +616,80 @@ mod tests {
         // for chunk in &chunks {
         //     assert!(!chunk.content.is_empty());
         // }
+    }
+
+    // BoundaryAwareChunkingStrategy::chunk does not panic when invoked from
+    // inside a tokio current_thread runtime. Regression for #16 (block_in_place
+    // would otherwise panic with "can call blocking only when running on the
+    // multi-threaded runtime").
+    #[test]
+    fn boundary_aware_chunk_does_not_panic_on_current_thread_runtime() {
+        use crate::embeddings::EmbeddingProvider;
+        use crate::text::BoundaryAwareChunkingStrategy;
+        use async_trait::async_trait;
+        use std::sync::Arc;
+
+        struct MockEmbedder {
+            dimension: usize,
+        }
+
+        #[async_trait]
+        impl EmbeddingProvider for MockEmbedder {
+            async fn initialize(&mut self) -> crate::core::Result<()> {
+                Ok(())
+            }
+
+            async fn embed(&self, text: &str) -> crate::core::Result<Vec<f32>> {
+                let mut v = vec![0.0; self.dimension];
+                let h = text.len() as f32;
+                for (i, x) in v.iter_mut().enumerate() {
+                    *x = ((h + i as f32) * 0.1).sin();
+                }
+                let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for x in &mut v {
+                        *x /= norm;
+                    }
+                }
+                Ok(v)
+            }
+
+            async fn embed_batch(&self, texts: &[&str]) -> crate::core::Result<Vec<Vec<f32>>> {
+                let mut out = Vec::with_capacity(texts.len());
+                for t in texts {
+                    out.push(self.embed(t).await?);
+                }
+                Ok(out)
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dimension
+            }
+
+            fn is_available(&self) -> bool {
+                true
+            }
+
+            fn provider_name(&self) -> &str {
+                "mock"
+            }
+        }
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let provider = Arc::new(MockEmbedder { dimension: 16 });
+            let document_id = DocumentId::new("ct_test".to_string());
+            let strategy = BoundaryAwareChunkingStrategy::with_defaults(provider, document_id);
+
+            // The previous implementation would panic here via `block_in_place`
+            // on the current_thread runtime. We assert the call returns
+            // (any Vec, even empty, is acceptable — non-panic is the contract).
+            let _chunks = strategy.chunk("Paragraph one.\n\nParagraph two with more content.");
+        });
     }
 
     #[test]
