@@ -479,34 +479,62 @@ mod tests {
         }
     }
 
-    /// Token mode produces the expected number of windows for known token counts.
+    /// Token mode produces hand-counted window counts for small fixtures.
     #[test]
     fn chunk_text_with_token_mode_emits_expected_chunk_count() {
-        // 100 tokens of "word " repeats ≈ 100 BPE tokens for cl100k_base.
-        // Use a deterministic count: encode and slide manually to compute the
-        // expected chunk count, then compare.
+        // Each row pins a small, hand-counted scenario. With min_chunk_size=0
+        // the strict filter never drops a window, so the counts depend only
+        // on the sliding-window mechanics:
+        //
+        //   starts = {0, stride, 2*stride, ...} until start + chunk_size >= n
+        //   stride = max(chunk_size - overlap, 1)
+        //
+        // Cases (all use repeats of "word " which yields exactly N+1 tokens
+        // for N repeats with cl100k_base — see token-fixture comment in
+        // `chunk_text_with_token_mode_drops_undersized_final_window`):
+        //
+        //  - 11 repeats -> 12 tokens, chunk=10, overlap=2 (stride=8):
+        //      window 0 -> [0..10] kept, window 1 -> [8..12] kept => 2
+        //  - 14 repeats -> 15 tokens, chunk=10, overlap=2 (stride=8):
+        //      [0..10], [8..15] => 2
+        //  - 19 repeats -> 20 tokens, chunk=10, overlap=2 (stride=8):
+        //      [0..10], [8..18], [16..20] => 3
+        //  - 9 repeats -> 10 tokens, chunk=10, overlap=2:
+        //      [0..10] only (end == n on first iteration) => 1
+        //  - 4 repeats -> 5 tokens, chunk=10, overlap=2:
+        //      single window [0..5] => 1
+        let cases: &[(usize, usize, usize, usize)] = &[
+            // (repeat_count, chunk_size, overlap, expected_chunks)
+            (11, 10, 2, 2),
+            (14, 10, 2, 2),
+            (19, 10, 2, 3),
+            (9, 10, 2, 1),
+            (4, 10, 2, 1),
+        ];
         let bpe = cl100k_base().unwrap();
-        let raw = "lorem ipsum dolor sit amet ".repeat(60);
-        let tokens = bpe.encode_ordinary(&raw);
-        let n = tokens.len();
-        let chunk_size = 32usize;
-        let overlap = 8usize;
-        let stride = chunk_size - overlap;
-        // Sliding-window count: number of starts s ∈ {0, stride, 2*stride, ...}
-        // such that s < n.
-        let expected = (n + stride - 1) / stride;
         let chunker = HierarchicalChunker::new()
             .with_mode(ChunkingMode::Tokens)
             .with_min_size(0);
-        let chunks = chunker.chunk_text(&raw, chunk_size, overlap);
-        assert_eq!(
-            chunks.len(),
-            expected,
-            "chunk count mismatch for {} tokens, size={}, overlap={}",
-            n,
-            chunk_size,
-            overlap
-        );
+        for &(reps, chunk_size, overlap, expected) in cases {
+            let raw = "word ".repeat(reps);
+            let n = bpe.encode_ordinary(&raw).len();
+            assert_eq!(
+                n,
+                reps + 1,
+                "fixture sanity: {} repeats expected to yield {} tokens",
+                reps,
+                reps + 1
+            );
+            let chunks = chunker.chunk_text(&raw, chunk_size, overlap);
+            assert_eq!(
+                chunks.len(),
+                expected,
+                "chunk count mismatch for n={}, size={}, overlap={}",
+                n,
+                chunk_size,
+                overlap
+            );
+        }
     }
 
     /// Token mode round-trips simple English prose without garbage characters.
