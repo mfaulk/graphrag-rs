@@ -190,15 +190,18 @@ impl HierarchicalChunker {
             let end = (start + chunk_size).min(tokens.len());
             let slice = &tokens[start..end];
 
-            // Decode the token slice. cl100k_base round-trips token-aligned
-            // slices cleanly; any decode error here means a non-UTF-8 token
-            // boundary and we skip rather than panic.
-            if let Ok(decoded) = bpe.decode(slice.to_vec()) {
-                let token_count = slice.len();
-                if token_count >= self.min_chunk_size || end >= tokens.len() {
-                    if !decoded.trim().is_empty() {
-                        chunks.push(decoded);
-                    }
+            // cl100k_base BPE encodes UTF-8 byte-level: a single multi-byte
+            // codepoint may span multiple tokens, so a token-aligned slice
+            // CAN begin or end mid-codepoint. Use `_decode_native` to recover
+            // the raw bytes and `from_utf8_lossy` to replace any incomplete
+            // sequences at the boundaries with U+FFFD. This preserves all
+            // input rather than silently dropping chunks on rare boundaries.
+            let bytes = bpe._decode_native(slice);
+            let decoded = String::from_utf8_lossy(&bytes).into_owned();
+            let token_count = slice.len();
+            if token_count >= self.min_chunk_size || end >= tokens.len() {
+                if !decoded.trim().is_empty() {
+                    chunks.push(decoded);
                 }
             }
 
@@ -528,7 +531,9 @@ mod tests {
         }
     }
 
-    /// Token mode handles non-ASCII (CJK + emoji) without producing broken UTF-8.
+    /// Token mode produces valid UTF-8 strings even when multi-byte codepoints
+    /// straddle chunk boundaries (lossy decode replaces incomplete sequences
+    /// with U+FFFD rather than dropping or panicking).
     #[test]
     fn chunk_text_with_token_mode_handles_unicode_cleanly() {
         let chunker = HierarchicalChunker::new()
@@ -545,13 +550,21 @@ mod tests {
             // start/end at char boundaries.
             assert!(c.is_char_boundary(0));
             assert!(c.is_char_boundary(c.len()));
-            // Should not contain the U+FFFD replacement character: BPE
-            // round-trip on a token-aligned slice never inserts replacements.
-            assert!(
-                !c.contains('\u{FFFD}'),
-                "chunk contains replacement char: {:?}",
-                c
-            );
         }
+        // Replacement chars (U+FFFD) may appear at chunk boundaries because
+        // cl100k_base BPE is byte-level: a single multi-byte codepoint can
+        // span two tokens and a token-aligned slice can begin or end mid-
+        // codepoint. The previous implementation silently dropped those
+        // chunks; we now lossily decode so no input bytes are lost. Cap the
+        // total replacement-char count to a small, finite number to catch
+        // regressions where the whole stream becomes garbled.
+        let total_replacements: usize = chunks.iter().map(|c| c.matches('\u{FFFD}').count()).sum();
+        assert!(
+            total_replacements <= chunks.len() * 2,
+            "too many U+FFFD replacements ({}) across {} chunks: {:?}",
+            total_replacements,
+            chunks.len(),
+            chunks
+        );
     }
 }
