@@ -77,11 +77,18 @@ impl QueryHistory {
         self.entries.len()
     }
 
-    /// Save to file
-    #[allow(dead_code)]
+    /// Save to file (atomic via `.tmp` + rename — same pattern as
+    /// `CliWorkspaceManager::save_metadata`, see #53).
     pub async fn save(&self, path: &PathBuf) -> Result<()> {
+        // Ensure the parent dir exists; the data dir won't be there on a
+        // fresh install until something writes into it.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
         let json = serde_json::to_string_pretty(self)?;
-        tokio::fs::write(path, json).await?;
+        let tmp = path.with_extension("json.tmp");
+        tokio::fs::write(&tmp, json).await?;
+        tokio::fs::rename(&tmp, path).await?;
         Ok(())
     }
 

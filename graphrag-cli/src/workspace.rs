@@ -72,6 +72,20 @@ pub fn cli_workspaces_dir() -> Result<PathBuf> {
     Ok(base.join("graphrag").join("workspaces"))
 }
 
+/// Resolve the path for the global query history file (workspace-agnostic).
+///
+/// Lives in the data dir alongside the workspaces tree, *not* inside any
+/// workspace, so the TUI can persist its in-memory `App::query_history`
+/// without needing an active workspace context. (Workspace-scoped history
+/// is a separate enhancement that requires the active-workspace plumbing
+/// not currently in place — see #62.)
+pub fn global_query_history_path() -> Result<PathBuf> {
+    Ok(cli_workspaces_dir()?
+        .parent()
+        .ok_or_else(|| eyre!("workspaces dir has no parent"))?
+        .join("query_history.json"))
+}
+
 /// CLI workspace registry.
 pub struct CliWorkspaceManager {
     /// Base directory for workspaces
