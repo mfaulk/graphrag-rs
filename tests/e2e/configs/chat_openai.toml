@@ -1,0 +1,19 @@
+# Sample chat-provider config for the native OpenAI ChatBackend (issue #90).
+#
+# Maps onto graphrag_core::core::api_chat::ChatProviderConfig. Drop this
+# under a top-level [chat] table in any TOML config the application loads,
+# or load it directly via:
+#
+#   let cfg: graphrag_core::core::api_chat::ChatProviderConfig =
+#       toml::from_str(include_str!("chat_openai.toml")).unwrap();
+#   let backend = cfg.build()?;
+#
+# Auth:
+#   - `api_key` is intentionally unset; the loader will read OPENAI_API_KEY
+#     from the environment. Do NOT commit a real key to this repo.
+
+provider = "openai"
+model    = "gpt-4o-mini"
+
+# api_key = "sk-..."   # uncomment to override the env var
+# max_tokens = 2048    # ignored by OpenAI here; kept for symmetry
