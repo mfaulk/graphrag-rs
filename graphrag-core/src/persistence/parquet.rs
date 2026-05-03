@@ -8,6 +8,7 @@
 //! ```text
 //! workspace/
 //! ├── entities.parquet          # Entity nodes
+//! ├── entity_mentions.parquet   # EntityMention rows joined by entity_id
 //! ├── relationships.parquet     # Relationship edges
 //! ├── chunks.parquet            # Text chunks
 //! └── documents.parquet         # Document metadata
@@ -221,14 +222,12 @@ impl ParquetPersistence {
 
     /// Save entities to Parquet.
     ///
-    /// **Lossy round-trip warning:** the current schema persists only
-    /// `mention_count` (a `usize`), not the `EntityMention` payload itself.
-    /// On load, entities are reconstructed with `mentions: Vec::new()`. The
-    /// entity-to-chunk provenance used by retrieval (`source_chunks`) is
-    /// derived from mentions and is therefore lost across save+load. A
-    /// warning is logged at save time when any entity has non-empty mentions
-    /// so users see the signal. Persisting full mentions in a separate
-    /// `entity_mentions.parquet` is tracked in #24.
+    /// Entity rows go to `entities.parquet`. The `EntityMention` payload
+    /// (chunk id + offsets + per-mention confidence) is written to a
+    /// sidecar `entity_mentions.parquet` keyed by entity id, so that
+    /// entity-to-chunk provenance (`source_chunks`) survives a save/load
+    /// round trip. See `load_entities`/`load_entity_mentions` for the read
+    /// side. Fixes #24.
     #[cfg(feature = "persistent-storage")]
     fn save_entities(&self, graph: &KnowledgeGraph) -> Result<()> {
         let entities: Vec<_> = graph.entities().collect();
@@ -237,18 +236,6 @@ impl ParquetPersistence {
             #[cfg(feature = "tracing")]
             tracing::warn!("No entities to save");
             return Ok(());
-        }
-
-        let entities_with_mentions = entities.iter().filter(|e| !e.mentions.is_empty()).count();
-        if entities_with_mentions > 0 {
-            #[cfg(feature = "tracing")]
-            tracing::warn!(
-                "Parquet save: {} of {} entities have mentions, but the current schema \
-                 persists only `mention_count` — full mention payloads will be lost on \
-                 reload. See issue #24.",
-                entities_with_mentions,
-                entities.len()
-            );
         }
 
         // Build Arrow schema for entities
@@ -332,10 +319,97 @@ impl ParquetPersistence {
         #[cfg(feature = "tracing")]
         tracing::info!("Saved {} entities to {:?}", entities.len(), file_path);
 
+        // Persist the mention payload separately so retrieval has provenance
+        // back to source chunks after reload (#24).
+        self.save_entity_mentions(&entities)?;
+
         Ok(())
     }
 
-    /// Load entities from Parquet
+    /// Save entity mentions to a sidecar `entity_mentions.parquet`.
+    ///
+    /// One row per mention; entity_id is the join key back to entities.parquet.
+    /// Always (re)written — including as an empty file — so a stale sidecar
+    /// from a previous save with mentions doesn't get re-attached to a fresh
+    /// graph that has none.
+    #[cfg(feature = "persistent-storage")]
+    fn save_entity_mentions(&self, entities: &[&Entity]) -> Result<()> {
+        let file_path = self.base_dir.join("entity_mentions.parquet");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("entity_id", DataType::Utf8, false),
+            Field::new("chunk_id", DataType::Utf8, false),
+            Field::new("start_offset", DataType::UInt64, false),
+            Field::new("end_offset", DataType::UInt64, false),
+            Field::new("confidence", DataType::Float32, false),
+        ]));
+
+        let total_mentions: usize = entities.iter().map(|e| e.mentions.len()).sum();
+
+        let mut entity_ids: Vec<&str> = Vec::with_capacity(total_mentions);
+        let mut chunk_ids: Vec<&str> = Vec::with_capacity(total_mentions);
+        let mut starts: Vec<u64> = Vec::with_capacity(total_mentions);
+        let mut ends: Vec<u64> = Vec::with_capacity(total_mentions);
+        let mut confidences: Vec<f32> = Vec::with_capacity(total_mentions);
+
+        for entity in entities {
+            for mention in &entity.mentions {
+                entity_ids.push(entity.id.0.as_str());
+                chunk_ids.push(mention.chunk_id.0.as_str());
+                starts.push(mention.start_offset as u64);
+                ends.push(mention.end_offset as u64);
+                confidences.push(mention.confidence);
+            }
+        }
+
+        let entity_id_arr: StringArray = entity_ids.into_iter().map(Some).collect();
+        let chunk_id_arr: StringArray = chunk_ids.into_iter().map(Some).collect();
+        let start_arr: UInt64Array = starts.into_iter().map(Some).collect();
+        let end_arr: UInt64Array = ends.into_iter().map(Some).collect();
+        let confidence_arr: Float32Array = confidences.into_iter().map(Some).collect();
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(entity_id_arr),
+                Arc::new(chunk_id_arr),
+                Arc::new(start_arr),
+                Arc::new(end_arr),
+                Arc::new(confidence_arr),
+            ],
+        )
+        .map_err(|e| GraphRAGError::Config {
+            message: format!("Failed to create mentions RecordBatch: {}", e),
+        })?;
+
+        let file = std::fs::File::create(&file_path)?;
+        let props = WriterProperties::builder()
+            .set_compression(self.get_compression())
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(file, schema, Some(props)).map_err(|e| GraphRAGError::Config {
+                message: format!("Failed to create ArrowWriter: {}", e),
+            })?;
+
+        writer.write(&batch).map_err(|e| GraphRAGError::Config {
+            message: format!("Failed to write mentions batch: {}", e),
+        })?;
+
+        writer.close().map_err(|e| GraphRAGError::Config {
+            message: format!("Failed to close mentions writer: {}", e),
+        })?;
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            "Saved {} entity mentions to {:?}",
+            total_mentions,
+            file_path
+        );
+
+        Ok(())
+    }
+
+    /// Load entities from Parquet (rejoins mentions from the sidecar file).
     #[cfg(feature = "persistent-storage")]
     fn load_entities(&self) -> Result<Vec<Entity>> {
         let file_path = self.base_dir.join("entities.parquet");
@@ -425,16 +499,27 @@ impl ParquetPersistence {
                     None
                 };
 
-                let entity = Entity {
-                    id: EntityId::new(ids.value(i).to_string()),
-                    name: names.value(i).to_string(),
-                    entity_type: types.value(i).to_string(),
-                    confidence: confidences.value(i),
-                    mentions: Vec::new(), // Will be populated later if needed
-                    embedding,
-                };
-
+                let mut entity = Entity::new(
+                    EntityId::new(ids.value(i).to_string()),
+                    names.value(i).to_string(),
+                    types.value(i).to_string(),
+                    confidences.value(i),
+                );
+                entity.embedding = embedding;
                 entities.push(entity);
+            }
+        }
+
+        // Reattach mentions from the sidecar so retrieval has provenance back
+        // to source chunks (#24). Tolerate a missing sidecar file (legacy
+        // workspaces written before this fix). Use `remove` to take
+        // ownership of each `Vec<EntityMention>` rather than cloning.
+        let mut mentions_by_entity = self.load_entity_mentions()?;
+        if !mentions_by_entity.is_empty() {
+            for entity in entities.iter_mut() {
+                if let Some(mentions) = mentions_by_entity.remove(&entity.id) {
+                    entity.mentions = mentions;
+                }
             }
         }
 
@@ -442,6 +527,103 @@ impl ParquetPersistence {
         tracing::info!("Loaded {} entities from {:?}", entities.len(), file_path);
 
         Ok(entities)
+    }
+
+    /// Load entity mentions from `entity_mentions.parquet`, grouped by
+    /// entity id. Returns an empty map if the file is missing — legacy
+    /// workspaces written before issue #24 don't have it.
+    #[cfg(feature = "persistent-storage")]
+    fn load_entity_mentions(
+        &self,
+    ) -> Result<std::collections::HashMap<EntityId, Vec<crate::core::EntityMention>>> {
+        use crate::core::EntityMention;
+
+        let file_path = self.base_dir.join("entity_mentions.parquet");
+        let mut by_entity: std::collections::HashMap<EntityId, Vec<EntityMention>> =
+            std::collections::HashMap::new();
+
+        if !file_path.exists() {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "No entity_mentions.parquet found — mentions will be empty (legacy workspace)"
+            );
+            return Ok(by_entity);
+        }
+
+        let file = std::fs::File::open(&file_path)?;
+        let reader = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| GraphRAGError::Config {
+                message: format!("Failed to create mentions Parquet reader: {}", e),
+            })?
+            .build()
+            .map_err(|e| GraphRAGError::Config {
+                message: format!("Failed to build mentions reader: {}", e),
+            })?;
+
+        for batch in reader {
+            let batch = batch.map_err(|e| GraphRAGError::Config {
+                message: format!("Failed to read mentions batch: {}", e),
+            })?;
+
+            let entity_ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| GraphRAGError::Config {
+                    message: "Invalid entity_id column type in entity_mentions.parquet".to_string(),
+                })?;
+            let chunk_ids = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| GraphRAGError::Config {
+                    message: "Invalid chunk_id column type in entity_mentions.parquet".to_string(),
+                })?;
+            let starts = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| GraphRAGError::Config {
+                    message: "Invalid start_offset column type in entity_mentions.parquet"
+                        .to_string(),
+                })?;
+            let ends = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| GraphRAGError::Config {
+                    message: "Invalid end_offset column type in entity_mentions.parquet"
+                        .to_string(),
+                })?;
+            let confidences = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .ok_or_else(|| GraphRAGError::Config {
+                    message: "Invalid confidence column type in entity_mentions.parquet"
+                        .to_string(),
+                })?;
+
+            for i in 0..batch.num_rows() {
+                let entity_id = EntityId::new(entity_ids.value(i).to_string());
+                let mention = EntityMention {
+                    chunk_id: ChunkId::new(chunk_ids.value(i).to_string()),
+                    start_offset: starts.value(i) as usize,
+                    end_offset: ends.value(i) as usize,
+                    confidence: confidences.value(i),
+                };
+                by_entity.entry(entity_id).or_default().push(mention);
+            }
+        }
+
+        #[cfg(feature = "tracing")]
+        tracing::info!(
+            "Loaded mentions for {} entities from {:?}",
+            by_entity.len(),
+            file_path
+        );
+
+        Ok(by_entity)
     }
 
     /// Placeholder implementations for relationships, chunks, and documents
@@ -627,13 +809,13 @@ impl ParquetPersistence {
                     }
                 }
 
-                let relationship = Relationship {
-                    source: EntityId::new(sources.value(i).to_string()),
-                    target: EntityId::new(targets.value(i).to_string()),
-                    relation_type: types.value(i).to_string(),
-                    confidence: confidences.value(i),
-                    context,
-                };
+                let relationship = Relationship::new(
+                    EntityId::new(sources.value(i).to_string()),
+                    EntityId::new(targets.value(i).to_string()),
+                    types.value(i).to_string(),
+                    confidences.value(i),
+                )
+                .with_context(context);
 
                 relationships.push(relationship);
             }
@@ -1311,5 +1493,77 @@ mod tests {
         let entities = persistence.load_entities().unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Test Entity");
+    }
+
+    // Regression for #24: entity mentions must survive a save/load round
+    // trip so entity-to-chunk provenance is preserved for retrieval.
+    #[test]
+    #[cfg(feature = "persistent-storage")]
+    fn entity_mentions_survive_save_and_load_round_trip() {
+        use crate::core::EntityMention;
+
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ParquetPersistence::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        let mentions = vec![
+            EntityMention {
+                chunk_id: ChunkId::new("chunk-a".to_string()),
+                start_offset: 10,
+                end_offset: 17,
+                confidence: 0.91,
+            },
+            EntityMention {
+                chunk_id: ChunkId::new("chunk-b".to_string()),
+                start_offset: 22,
+                end_offset: 29,
+                confidence: 0.42,
+            },
+        ];
+        let entity = Entity::new(
+            EntityId::new("ent-1".to_string()),
+            "Alice".to_string(),
+            "PERSON".to_string(),
+            0.9,
+        )
+        .with_mentions(mentions.clone());
+        graph.add_entity(entity).unwrap();
+
+        persistence.save_entities(&graph).unwrap();
+
+        let entities = persistence.load_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        let loaded = &entities[0];
+        assert_eq!(loaded.mentions.len(), mentions.len());
+        for (got, want) in loaded.mentions.iter().zip(mentions.iter()) {
+            assert_eq!(got.chunk_id, want.chunk_id);
+            assert_eq!(got.start_offset, want.start_offset);
+            assert_eq!(got.end_offset, want.end_offset);
+            assert!((got.confidence - want.confidence).abs() < 1e-6);
+        }
+    }
+
+    // Regression for #24: an entity with no mentions still round-trips
+    // successfully (we shouldn't write a malformed sidecar file).
+    #[test]
+    #[cfg(feature = "persistent-storage")]
+    fn entities_without_mentions_round_trip_cleanly() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ParquetPersistence::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        graph
+            .add_entity(Entity::new(
+                EntityId::new("loner".to_string()),
+                "Loner".to_string(),
+                "THING".to_string(),
+                0.5,
+            ))
+            .unwrap();
+
+        persistence.save_entities(&graph).unwrap();
+        let entities = persistence.load_entities().unwrap();
+        assert_eq!(entities.len(), 1);
+        assert!(entities[0].mentions.is_empty());
     }
 }

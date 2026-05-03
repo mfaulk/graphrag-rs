@@ -498,7 +498,15 @@ impl KnowledgeGraph {
         self.graph.edge_weights().collect()
     }
 
-    /// Load knowledge graph from JSON file
+    /// Load knowledge graph from JSON file.
+    ///
+    /// Required identifier fields (`entities[].id`, `chunks[].id`,
+    /// `chunks[].document_id`, `documents[].id`) are validated up front:
+    /// missing or non-string values produce a typed
+    /// [`GraphRAGError::DataCorruption`] instead of being silently
+    /// substituted with empty strings (which collide). Dangling
+    /// relationships (endpoints not in the loaded entity set) are skipped
+    /// and counted; the count is logged as a warning. See issue #23.
     pub fn load_from_json(file_path: &str) -> Result<Self> {
         use std::fs;
 
@@ -508,12 +516,23 @@ impl KnowledgeGraph {
             message: format!("Failed to parse JSON: {}", e),
         })?;
 
+        // Helper: pull a required non-empty string field from a json::JsonValue
+        // and surface DataCorruption rather than silently substituting "".
+        fn required_str(obj: &json::JsonValue, field: &str, kind: &str) -> Result<String> {
+            match obj[field].as_str() {
+                Some(s) if !s.is_empty() => Ok(s.to_string()),
+                _ => Err(GraphRAGError::DataCorruption {
+                    message: format!("{} record missing required string field '{}'", kind, field),
+                }),
+            }
+        }
+
         let mut kg = KnowledgeGraph::new();
 
         // Load entities
         if json_data["entities"].is_array() {
             for entity_obj in json_data["entities"].members() {
-                let id = EntityId::new(entity_obj["id"].as_str().unwrap_or("").to_string());
+                let id = EntityId::new(required_str(entity_obj, "id", "entity")?);
                 let name = entity_obj["name"].as_str().unwrap_or("").to_string();
                 let entity_type = entity_obj["type"].as_str().unwrap_or("").to_string();
                 let confidence = entity_obj["confidence"].as_f32().unwrap_or(0.0);
@@ -551,10 +570,11 @@ impl KnowledgeGraph {
         }
 
         // Load relationships
+        let mut dropped_relationships: usize = 0;
         if json_data["relationships"].is_array() {
             for rel_obj in json_data["relationships"].members() {
-                let source = EntityId::new(rel_obj["source_id"].as_str().unwrap_or("").to_string());
-                let target = EntityId::new(rel_obj["target_id"].as_str().unwrap_or("").to_string());
+                let source = EntityId::new(required_str(rel_obj, "source_id", "relationship")?);
+                let target = EntityId::new(required_str(rel_obj, "target_id", "relationship")?);
                 let relation_type = rel_obj["relation_type"].as_str().unwrap_or("").to_string();
                 let confidence = rel_obj["confidence"].as_f32().unwrap_or(0.0);
 
@@ -567,29 +587,32 @@ impl KnowledgeGraph {
                     }
                 }
 
-                let relationship = Relationship {
-                    source,
-                    target,
-                    relation_type,
-                    confidence,
-                    context,
-                    embedding: None,
-                    temporal_type: None,
-                    temporal_range: None,
-                    causal_strength: None,
-                };
+                let relationship = Relationship::new(source, target, relation_type, confidence)
+                    .with_context(context);
 
-                // Ignore errors if entities don't exist
-                let _ = kg.add_relationship(relationship);
+                // A relationship can fail to attach if its endpoints reference
+                // entities that aren't in the graph (schema drift, partial
+                // corruption). Don't crash the load — but don't silently
+                // ignore either: count and log so users see a signal (#23).
+                if kg.add_relationship(relationship).is_err() {
+                    dropped_relationships += 1;
+                }
             }
+        }
+        if dropped_relationships > 0 {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                "JSON load: dropped {} relationship(s) whose endpoints are not present \
+                 in the loaded entity set (possible schema drift or partial corruption)",
+                dropped_relationships
+            );
         }
 
         // Load chunks with full content
         if json_data["chunks"].is_array() {
             for chunk_obj in json_data["chunks"].members() {
-                let id = ChunkId::new(chunk_obj["id"].as_str().unwrap_or("").to_string());
-                let document_id =
-                    DocumentId::new(chunk_obj["document_id"].as_str().unwrap_or("").to_string());
+                let id = ChunkId::new(required_str(chunk_obj, "id", "chunk")?);
+                let document_id = DocumentId::new(required_str(chunk_obj, "document_id", "chunk")?);
                 let start_offset = chunk_obj["start_offset"].as_usize().unwrap_or(0);
                 let end_offset = chunk_obj["end_offset"].as_usize().unwrap_or(0);
 
@@ -623,7 +646,7 @@ impl KnowledgeGraph {
         // Load documents with full content
         if json_data["documents"].is_array() {
             for doc_obj in json_data["documents"].members() {
-                let id = DocumentId::new(doc_obj["id"].as_str().unwrap_or("").to_string());
+                let id = DocumentId::new(required_str(doc_obj, "id", "document")?);
                 let title = doc_obj["title"].as_str().unwrap_or("").to_string();
                 let content = doc_obj["content"].as_str().unwrap_or("").to_string();
 
@@ -1462,5 +1485,105 @@ mod temporal_tests {
         assert!(!json.contains("temporal_type"));
         assert!(!json.contains("temporal_range"));
         assert!(!json.contains("causal_strength"));
+    }
+}
+
+#[cfg(test)]
+mod json_load_robustness_tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    fn write_json(value: &serde_json::Value) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(value.to_string().as_bytes()).unwrap();
+        f
+    }
+
+    // Regression for #23: load_from_json must reject entity records that are
+    // missing the `id` field instead of silently substituting an empty string
+    // (which collides across all such entities).
+    #[test]
+    fn load_from_json_rejects_entity_without_id() {
+        let payload = serde_json::json!({
+            "entities": [
+                { "name": "ghost", "type": "PERSON", "confidence": 0.5 }
+            ],
+            "relationships": [],
+            "chunks": [],
+            "documents": [],
+        });
+        let f = write_json(&payload);
+        let result = KnowledgeGraph::load_from_json(f.path().to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "missing entity id must surface as an error, not synthesize \"\""
+        );
+    }
+
+    // Regression for #23: load_from_json must reject chunk records that are
+    // missing the `id` field instead of silently substituting an empty string.
+    #[test]
+    fn load_from_json_rejects_chunk_without_id() {
+        let payload = serde_json::json!({
+            "entities": [],
+            "relationships": [],
+            "chunks": [
+                { "document_id": "doc-1", "content": "text", "start_offset": 0, "end_offset": 4 }
+            ],
+            "documents": [],
+        });
+        let f = write_json(&payload);
+        let result = KnowledgeGraph::load_from_json(f.path().to_str().unwrap());
+        assert!(result.is_err(), "missing chunk id must surface as an error");
+    }
+
+    // Regression for #23: load_from_json must reject document records that
+    // are missing the `id` field.
+    #[test]
+    fn load_from_json_rejects_document_without_id() {
+        let payload = serde_json::json!({
+            "entities": [],
+            "relationships": [],
+            "chunks": [],
+            "documents": [
+                { "title": "t", "content": "c" }
+            ],
+        });
+        let f = write_json(&payload);
+        let result = KnowledgeGraph::load_from_json(f.path().to_str().unwrap());
+        assert!(
+            result.is_err(),
+            "missing document id must surface as an error"
+        );
+    }
+
+    // Regression for #23: load_from_json must succeed (and not crash) when
+    // a relationship references an entity that isn't in the graph. The
+    // dangling relationship is dropped, but its drop should be visible
+    // (counted via tracing) rather than silenced via `let _ = ...`.
+    #[test]
+    fn load_from_json_tolerates_dangling_relationship() {
+        let payload = serde_json::json!({
+            "entities": [
+                { "id": "ent-1", "name": "Alice", "type": "PERSON", "confidence": 0.9 }
+            ],
+            "relationships": [
+                {
+                    "source_id": "ent-1",
+                    "target_id": "missing-target",
+                    "relation_type": "knows",
+                    "confidence": 0.8,
+                    "context_chunks": [],
+                }
+            ],
+            "chunks": [],
+            "documents": [],
+        });
+        let f = write_json(&payload);
+        let kg = KnowledgeGraph::load_from_json(f.path().to_str().unwrap()).unwrap();
+        // 1 entity loaded, 0 relationships attached (dangling skipped).
+        assert_eq!(kg.entities().count(), 1);
+        assert_eq!(kg.get_all_relationships().len(), 0);
     }
 }

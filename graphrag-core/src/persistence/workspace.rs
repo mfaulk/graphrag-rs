@@ -178,10 +178,40 @@ impl WorkspaceManager {
                     .unwrap_or("unknown")
                     .to_string();
 
-                // Load metadata
-                let metadata = self
-                    .load_metadata(&workspace_name)
-                    .unwrap_or_else(|_| WorkspaceMetadata::new(workspace_name.clone()));
+                // Load metadata. Distinguish two failure modes:
+                //   * metadata.toml missing entirely → legacy workspace
+                //     written before metadata existed. `load_graph` already
+                //     tolerates this, so synthesize defaults and surface
+                //     the workspace in the listing; otherwise UIs / CLIs
+                //     hide loadable data.
+                //   * metadata.toml present but unreadable (corrupt TOML,
+                //     unrecognized schema, IO failure) → skip and warn.
+                //     Surfacing it as healthy with `modified_at = now`
+                //     would float a corrupt directory to the top of the
+                //     list (#23).
+                let metadata_path = path.join("metadata.toml");
+                let metadata = if !metadata_path.exists() {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        workspace = %workspace_name,
+                        "metadata.toml missing — synthesizing defaults for legacy workspace"
+                    );
+                    WorkspaceMetadata::new(workspace_name.clone())
+                } else {
+                    match self.load_metadata(&workspace_name) {
+                        Ok(m) => m,
+                        Err(_e) => {
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                workspace = %workspace_name,
+                                error = %_e,
+                                "Skipping workspace from listing: metadata unreadable. \
+                                 Inspect metadata.toml or remove the directory."
+                            );
+                            continue;
+                        },
+                    }
+                };
 
                 // Calculate size
                 let size_bytes = Self::calculate_dir_size(&path).unwrap_or(0);
@@ -235,12 +265,34 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Load knowledge graph from workspace
+    /// Load knowledge graph from workspace.
+    ///
+    /// Refuses to load if the workspace's `metadata.toml` declares a
+    /// `format_version` that doesn't match [`CURRENT_FORMAT_VERSION`] —
+    /// continuing would silently couple a stale on-disk schema to in-memory
+    /// types. Recreate the workspace or write a migration before retrying.
+    /// (Workspaces without metadata.toml fall through to the existing
+    /// best-effort load path.) See issue #23.
     pub fn load_graph(&self, workspace_name: &str) -> Result<KnowledgeGraph> {
         if !self.workspace_exists(workspace_name) {
             return Err(GraphRAGError::Config {
                 message: format!("Workspace '{}' does not exist", workspace_name),
             });
+        }
+
+        // Refuse on format_version mismatch. Missing metadata.toml is
+        // treated as legacy and tolerated below.
+        if let Ok(meta) = self.load_metadata(workspace_name) {
+            if meta.format_version != CURRENT_FORMAT_VERSION {
+                return Err(GraphRAGError::Config {
+                    message: format!(
+                        "Workspace '{}' has metadata format_version '{}' but this build \
+                         expects '{}'. Refusing to load: no migration is implemented. \
+                         Recreate the workspace or downgrade graphrag-core.",
+                        workspace_name, meta.format_version, CURRENT_FORMAT_VERSION
+                    ),
+                });
+            }
         }
 
         let workspace_path = self.workspace_path(workspace_name);
@@ -438,5 +490,85 @@ mod tests {
     fn new_metadata_carries_current_format_version() {
         let m = WorkspaceMetadata::new("fresh".to_string());
         assert_eq!(m.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    // Regression for #23: load_graph must refuse to load a workspace whose
+    // metadata.toml declares an unrecognized `format_version`. Continuing
+    // would silently couple stale on-disk schemas to in-memory types and is
+    // a correctness footgun; surface it as an error so callers either
+    // migrate or recreate the workspace.
+    #[test]
+    fn load_graph_refuses_on_format_version_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+
+        let graph = KnowledgeGraph::new();
+        workspace.save_graph(&graph, "future").unwrap();
+
+        // Replace metadata with a version we don't understand.
+        let meta_path = temp_dir.path().join("future").join("metadata.toml");
+        let mut meta: WorkspaceMetadata =
+            toml::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.format_version = "9.9-from-the-future".to_string();
+        fs::write(&meta_path, toml::to_string_pretty(&meta).unwrap()).unwrap();
+
+        let result = workspace.load_graph("future");
+        assert!(
+            result.is_err(),
+            "load_graph must refuse to load a workspace with an incompatible format_version"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("format_version") || msg.contains("9.9-from-the-future"),
+            "error message should mention the version mismatch, got: {}",
+            msg
+        );
+    }
+
+    // Legacy workspaces written before metadata.toml existed must still
+    // appear in `list_workspaces` with synthesized defaults; otherwise
+    // they become invisible to UIs/CLIs even though `load_graph` can
+    // still read them (#23 follow-up).
+    #[test]
+    fn list_workspaces_includes_legacy_dir_with_missing_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+
+        // Create a bare legacy workspace directory with no metadata.toml.
+        let legacy_path = temp_dir.path().join("legacy");
+        fs::create_dir_all(&legacy_path).unwrap();
+
+        let listed = workspace.list_workspaces().unwrap();
+        let legacy = listed
+            .iter()
+            .find(|w| w.name == "legacy")
+            .expect("legacy workspace must appear in listing even without metadata.toml");
+        assert_eq!(legacy.metadata.name, "legacy");
+        assert_eq!(legacy.metadata.format_version, CURRENT_FORMAT_VERSION);
+        assert_eq!(legacy.metadata.entity_count, 0);
+    }
+
+    // Regression for #23: a workspace dir whose metadata.toml is unreadable
+    // (corrupt TOML) must not be silently surfaced as a fresh, healthy
+    // workspace by list_workspaces. It should be skipped from the listing.
+    #[test]
+    fn list_workspaces_skips_workspace_with_corrupt_metadata() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+
+        workspace.create_workspace("good").unwrap();
+        workspace.create_workspace("broken").unwrap();
+
+        // Stomp on the broken workspace's metadata with garbage TOML.
+        let bad_meta_path = temp_dir.path().join("broken").join("metadata.toml");
+        fs::write(&bad_meta_path, "this is :: not :: valid :: toml @@@").unwrap();
+
+        let listed = workspace.list_workspaces().unwrap();
+        let names: Vec<&str> = listed.iter().map(|w| w.name.as_str()).collect();
+        assert!(names.contains(&"good"), "good workspace should be listed");
+        assert!(
+            !names.contains(&"broken"),
+            "broken workspace must not be silently listed with synthesized defaults"
+        );
     }
 }
