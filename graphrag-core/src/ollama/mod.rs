@@ -360,23 +360,36 @@ impl OllamaClient {
             request_body["options"] = options;
         }
 
-        // Make HTTP request with retry logic
-        let mut last_error = None;
+        // Make HTTP request with retry logic.
+        //
+        // `ureq` is a synchronous HTTP client; calling it directly inside this
+        // `async fn` parks an entire tokio worker for the full round-trip.
+        // Dispatch each attempt to the blocking pool so async workers stay free
+        // for other in-flight tasks (issue #4).
+        let mut last_error: Option<String> = None;
         for attempt in 1..=self.config.max_retries {
-            match self
-                .client
-                .post(&endpoint)
-                .set("Content-Type", "application/json")
-                .send_json(&request_body)
-            {
-                Ok(response) => {
-                    let json_response: serde_json::Value =
+            let agent = self.client.clone();
+            let endpoint_owned = endpoint.clone();
+            let body_owned = request_body.clone();
+            let send_result = tokio::task::spawn_blocking(move || {
+                agent
+                    .post(&endpoint_owned)
+                    .set("Content-Type", "application/json")
+                    .send_json(&body_owned)
+                    .map_err(|e| e.to_string())
+                    .and_then(|response| {
                         response
-                            .into_json()
-                            .map_err(|e| GraphRAGError::Generation {
-                                message: format!("Failed to parse JSON response: {}", e),
-                            })?;
+                            .into_json::<serde_json::Value>()
+                            .map_err(|e| format!("Failed to parse JSON response: {}", e))
+                    })
+            })
+            .await
+            .map_err(|join_err| GraphRAGError::Generation {
+                message: format!("HTTP worker task panicked or was cancelled: {}", join_err),
+            })?;
 
+            match send_result {
+                Ok(json_response) => {
                     // Extract response text
                     if let Some(response_text) = json_response["response"].as_str() {
                         let response_string = response_text.to_string();
@@ -513,22 +526,32 @@ impl OllamaClient {
             request_body["options"] = options;
         }
 
-        let mut last_error = None;
+        // Same rationale as `generate_with_params`: the sync `ureq` call must
+        // run on the blocking pool, not on a tokio worker thread (issue #4).
+        let mut last_error: Option<String> = None;
         for attempt in 1..=self.config.max_retries {
-            match self
-                .client
-                .post(&endpoint)
-                .set("Content-Type", "application/json")
-                .send_json(&request_body)
-            {
-                Ok(response) => {
-                    let json_response: serde_json::Value =
+            let agent = self.client.clone();
+            let endpoint_owned = endpoint.clone();
+            let body_owned = request_body.clone();
+            let send_result = tokio::task::spawn_blocking(move || {
+                agent
+                    .post(&endpoint_owned)
+                    .set("Content-Type", "application/json")
+                    .send_json(&body_owned)
+                    .map_err(|e| e.to_string())
+                    .and_then(|response| {
                         response
-                            .into_json()
-                            .map_err(|e| GraphRAGError::Generation {
-                                message: format!("Failed to parse JSON response: {}", e),
-                            })?;
+                            .into_json::<serde_json::Value>()
+                            .map_err(|e| format!("Failed to parse JSON response: {}", e))
+                    })
+            })
+            .await
+            .map_err(|join_err| GraphRAGError::Generation {
+                message: format!("HTTP worker task panicked or was cancelled: {}", join_err),
+            })?;
 
+            match send_result {
+                Ok(json_response) => {
                     let text = json_response["response"]
                         .as_str()
                         .ok_or_else(|| GraphRAGError::Generation {
@@ -629,8 +652,14 @@ impl OllamaClient {
         let stats = self.stats.clone();
         let prompt_len = prompt.len();
 
-        // Spawn background task to read streaming response
-        tokio::spawn(async move {
+        // Spawn background task to read streaming response.
+        //
+        // The HTTP request and the line-by-line read loop are both synchronous
+        // (`ureq` blocks on `into_reader().read`), so they run on the blocking
+        // pool. `blocking_send` is the synchronous mpsc sender — it parks the
+        // current OS thread (a blocking-pool thread, not a tokio worker) when
+        // the channel is full or being polled.
+        tokio::task::spawn_blocking(move || {
             match client
                 .post(&endpoint)
                 .set("Content-Type", "application/json")
@@ -656,8 +685,11 @@ impl OllamaClient {
                                     if let Some(token) = json["response"].as_str() {
                                         total_response.push_str(token);
 
-                                        // Send token through channel
-                                        if tx.send(token.to_string()).await.is_err() {
+                                        // Send token through channel (sync send
+                                        // from blocking pool — never call
+                                        // `.send().await` here, that would
+                                        // require an async runtime).
+                                        if tx.blocking_send(token.to_string()).is_err() {
                                             // Receiver dropped, stop streaming
                                             break;
                                         }
