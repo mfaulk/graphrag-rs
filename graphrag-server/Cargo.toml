@@ -19,7 +19,7 @@ path = "src/main.rs"
 default = ["qdrant"] # , "auth"]
 qdrant = ["qdrant-client"]
 lancedb = ["dep:lancedb", "arrow-array", "arrow-schema"]
-auth = ["jsonwebtoken", "bcrypt"]
+auth = ["jsonwebtoken", "bcrypt", "dep:axum"]
 ollama = ["ollama-rs"]
 
 [dependencies]
@@ -51,6 +51,10 @@ arrow-schema = { version = "56", optional = true }
 # Authentication (optional)
 jsonwebtoken = { workspace = true, optional = true }
 bcrypt = { workspace = true, optional = true }
+# axum is still imported by `auth.rs` (issue #40 — not yet ported to actix-web).
+# Pulled in only when the `auth` feature is enabled so the module can compile
+# while the port is in flight; the routes are not wired into main.rs yet.
+axum = { workspace = true, optional = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
 

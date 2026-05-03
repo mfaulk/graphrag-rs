@@ -109,7 +109,9 @@ cargo run --bin graphrag-server --features "lancedb,ollama"
 # Minimal (hash-based embeddings, in-memory storage)
 cargo run --bin graphrag-server --no-default-features
 
-# With authentication
+# With authentication (requires JWT_SECRET >= 32 bytes; server refuses
+# to start otherwise — see #31)
+JWT_SECRET="$(openssl rand -hex 32)" \
 cargo run --bin graphrag-server --features "qdrant,ollama,auth"
 ```
 
@@ -628,6 +630,33 @@ curl http://localhost:6333/healthz
 ```bash
 cargo run --bin graphrag-server 2>&1 | grep collection
 ```
+
+### "Qdrant collection dimension check failed"
+
+**Cause:** `EMBEDDING_DIM` (default `384`) disagrees with the vector
+dimension of the existing Qdrant collection. The server now refuses to
+start in that case to avoid silently corrupting the collection one
+upsert at a time.
+
+**Solutions:**
+1. Set `EMBEDDING_DIM` to match the existing collection (e.g. `768` or
+   `1024` if you previously created one with a different model).
+2. Use a different `COLLECTION_NAME` to start fresh.
+3. Drop and recreate the collection if its data is no longer needed.
+
+### "Could not determine if Qdrant collection '...' exists"
+
+**Cause:** The `CollectionExists` RPC failed (transport error, auth
+denied, server unreachable, etc.). Startup refuses to continue rather
+than coerce the failure to "does not exist", which would route to the
+create-collection path and skip the dimension check above.
+
+**Solutions:**
+1. Verify `QDRANT_URL` is reachable from the server host.
+2. If Qdrant requires authentication, ensure the client can authenticate
+   (check tokens / TLS config).
+3. Inspect Qdrant logs for the failing RPC and retry once the server is
+   healthy.
 
 ### Slow query performance
 

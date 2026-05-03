@@ -1,23 +1,14 @@
 //! Authentication and Authorization Middleware
 //!
-//! **STATUS: Not yet ported to actix-web (issue #40).** This module
-//! still imports from `axum::{extract, http, middleware, response}`
-//! while the rest of the server is built on `actix-web`. The `auth`
-//! Cargo feature is currently disabled in `default = ["qdrant"]` for
-//! exactly this reason — turning it on produces ~30 unrelated-looking
-//! compile errors about an unresolved `axum` crate.
-//!
-//! The `compile_error!` below makes that failure mode loud: anyone
-//! enabling `--features auth` gets one clear message instead of a wall
-//! of "use of unresolved module or unlinked crate `axum`" errors.
-//! Remove it once auth.rs is ported to `actix-web-httpauth`-style
-//! middleware (or, alternatively, once `axum` is added as a dep and
-//! the Apistos integration is reworked).
-
-compile_error!(
-    "the `auth` Cargo feature is not yet ported to actix-web — see issue #40. \
-     Disable the feature (it is off by default) until the port lands."
-);
+//! **STATUS: Not yet ported to actix-web (issue #40).** The HTTP-glue
+//! parts of this module still import from `axum::{extract, http,
+//! middleware, response}` while the rest of the server is on actix-web.
+//! The `auth` Cargo feature pulls `axum` in as an optional dep so the
+//! module compiles and its security-critical logic (JWT issuance/
+//! validation, RBAC, rate limiting, secret loading) can be unit-tested
+//! ahead of the port. The auth routes are still NOT wired into
+//! `main.rs` (`/auth/*` is commented out), so toggling the feature
+//! does not expose any new HTTP surface.
 
 use axum::{
     extract::{Extension, Request, State},
@@ -25,11 +16,27 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Canonical `iss` claim placed on every JWT we mint and required on
+/// every JWT we accept (#31). Pinning a fixed issuer keeps tokens
+/// minted by other services that happen to share our HS256 secret out
+/// of our trust boundary.
+pub const JWT_ISSUER: &str = "graphrag-server";
+
+/// Canonical `aud` claim. Keeps tokens issued for a different API
+/// (e.g. an admin console reusing the same secret) from being accepted
+/// here (#31).
+pub const JWT_AUDIENCE: &str = "graphrag-api";
+
+/// Minimum acceptable JWT secret length, in bytes. HS256 signatures
+/// are only as strong as the shared secret; sub-32-byte secrets are
+/// brute-forceable with commodity hardware (#31).
+pub const JWT_SECRET_MIN_BYTES: usize = 32;
 
 /// JWT claims structure
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,6 +47,12 @@ pub struct Claims {
     pub iat: u64,
     /// Expiration time (timestamp)
     pub exp: u64,
+    /// Issuer — pinned to `JWT_ISSUER` on mint, required on validate (#31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    /// Audience — pinned to `JWT_AUDIENCE` on mint, required on validate (#31).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
     /// User role
     pub role: UserRole,
     /// Custom claims
@@ -48,7 +61,15 @@ pub struct Claims {
 }
 
 /// User roles for RBAC
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+///
+/// Ordering encodes the privilege hierarchy `Admin > User > Readonly >
+/// Guest`, so `actual >= minimum` is the canonical permission check
+/// (see `require_role`). `PartialOrd`/`Ord` are implemented manually
+/// instead of derived because the `#[derive]` order would put `Admin`
+/// at the bottom — and the variant declaration order is part of the
+/// public surface (it's also serialized via `#[serde(rename_all)]`,
+/// which we don't want to reshuffle just to satisfy a derive).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum UserRole {
     /// Administrator with full access
@@ -59,6 +80,31 @@ pub enum UserRole {
     Readonly,
     /// Guest with limited access
     Guest,
+}
+
+impl UserRole {
+    /// Numeric privilege rank. Higher == more privileged. Used by
+    /// `PartialOrd`/`Ord` so callers can write `actual >= minimum`.
+    fn rank(self) -> u8 {
+        match self {
+            UserRole::Admin => 3,
+            UserRole::User => 2,
+            UserRole::Readonly => 1,
+            UserRole::Guest => 0,
+        }
+    }
+}
+
+impl PartialOrd for UserRole {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for UserRole {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
 }
 
 /// API key structure
@@ -99,6 +145,12 @@ pub struct AuthState {
     api_keys: Arc<RwLock<HashMap<String, ApiKey>>>,
     /// Rate limiting state: (user_id, (count, window_start))
     rate_limits: Arc<RwLock<HashMap<String, (usize, u64)>>>,
+    /// Per-role rate limits applied on the JWT (Bearer) auth path.
+    /// API-key callers carry their own `RateLimit`; JWT callers do not,
+    /// so without this table the Bearer branch had no per-user ceiling
+    /// at all (#32). Roles missing from the map fall back to
+    /// `RateLimit::default()`.
+    jwt_rate_limits: HashMap<UserRole, RateLimit>,
 }
 
 impl AuthState {
@@ -106,12 +158,46 @@ impl AuthState {
     ///
     /// # Arguments
     /// * `jwt_secret` - Secret key for JWT signing (should be 32+ characters)
+    ///
+    /// Prefer [`AuthState::try_new`] in production wiring; this
+    /// constructor is kept for backwards compatibility and accepts any
+    /// length, including the empty string. Tests still use it.
     pub fn new(jwt_secret: String) -> Self {
         Self {
             jwt_secret,
             api_keys: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            jwt_rate_limits: HashMap::new(),
         }
+    }
+
+    /// Construct an `AuthState` while enforcing the minimum JWT secret
+    /// length (`JWT_SECRET_MIN_BYTES`). Returns
+    /// `AuthError::TokenGenerationFailed` with an operator-facing
+    /// message that *does not* include the secret value (#31).
+    pub fn try_new(jwt_secret: String) -> Result<Self, AuthError> {
+        let len = jwt_secret.len();
+        if len < JWT_SECRET_MIN_BYTES {
+            return Err(AuthError::TokenGenerationFailed(format!(
+                "JWT secret too short: {len} bytes; minimum is {JWT_SECRET_MIN_BYTES}"
+            )));
+        }
+        Ok(Self::new(jwt_secret))
+    }
+
+    /// Override the JWT-path rate limit for a specific role.
+    ///
+    /// Used at startup (and in tests) to install per-role ceilings; the
+    /// JWT branch of `extract_auth_user` consults this table.
+    #[allow(dead_code)]
+    pub fn set_jwt_rate_limit(&mut self, role: UserRole, limit: RateLimit) {
+        self.jwt_rate_limits.insert(role, limit);
+    }
+
+    /// Look up the JWT-path rate limit for a role, falling back to the
+    /// global `RateLimit::default()` (1000 req/hr).
+    fn jwt_rate_limit_for(&self, role: UserRole) -> RateLimit {
+        self.jwt_rate_limits.get(&role).cloned().unwrap_or_default()
     }
 
     /// Generate a JWT token
@@ -126,33 +212,38 @@ impl AuthState {
         role: UserRole,
         duration_hours: u64,
     ) -> Result<String, AuthError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_secs(std::time::SystemTime::now())?;
 
         let claims = Claims {
             sub: user_id.to_string(),
             iat: now,
             exp: now + (duration_hours * 3600),
+            iss: Some(JWT_ISSUER.to_string()),
+            aud: Some(JWT_AUDIENCE.to_string()),
             role,
             custom: HashMap::new(),
         };
 
         encode(
-            &Header::default(),
+            &Header::new(Algorithm::HS256),
             &claims,
             &EncodingKey::from_secret(self.jwt_secret.as_bytes()),
         )
         .map_err(|e| AuthError::TokenGenerationFailed(e.to_string()))
     }
 
-    /// Validate a JWT token
+    /// Validate a JWT token. Requires `exp`, `iss`, `aud` and pins
+    /// `iss == JWT_ISSUER`, `aud == JWT_AUDIENCE` (#31).
     pub fn validate_token(&self, token: &str) -> Result<Claims, AuthError> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[JWT_ISSUER]);
+        validation.set_audience(&[JWT_AUDIENCE]);
+
         decode::<Claims>(
             token,
             &DecodingKey::from_secret(self.jwt_secret.as_bytes()),
-            &Validation::default(),
+            &validation,
         )
         .map(|data| data.claims)
         .map_err(|e| AuthError::InvalidToken(e.to_string()))
@@ -201,10 +292,7 @@ impl AuthState {
         user_id: &str,
         limit: &RateLimit,
     ) -> Result<(), AuthError> {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = unix_secs(std::time::SystemTime::now())?;
 
         let mut rate_limits = self.rate_limits.write().await;
 
@@ -229,6 +317,20 @@ impl AuthState {
 
         Ok(())
     }
+}
+
+/// Convert a `SystemTime` to seconds since the UNIX epoch.
+///
+/// Returns `AuthError::TokenGenerationFailed` instead of panicking when
+/// the clock is set before 1970 — both `generate_token` and
+/// `check_rate_limit` previously called `.unwrap()` on the result and
+/// would crash the worker thread (#45).
+fn unix_secs(t: std::time::SystemTime) -> Result<u64, AuthError> {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|e| {
+            AuthError::TokenGenerationFailed(format!("system clock before UNIX epoch: {e}"))
+        })
 }
 
 /// Authentication errors
@@ -298,6 +400,11 @@ pub async fn extract_auth_user(
     // Check for Bearer token (JWT)
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         let claims = auth_state.validate_token(token)?;
+        // Apply per-role JWT rate limit (#32). Previously the Bearer
+        // branch returned without ever counting the request, so a JWT
+        // had no per-user ceiling — only API-key callers were limited.
+        let limit = auth_state.jwt_rate_limit_for(claims.role);
+        auth_state.check_rate_limit(&claims.sub, &limit).await?;
         return Ok(AuthUser {
             user_id: claims.sub,
             role: claims.role,
@@ -352,21 +459,12 @@ pub async fn require_role(
     Next,
 ) -> futures::future::BoxFuture<'static, Result<Response, AuthError>> {
     move |Extension(user): axum::extract::Extension<AuthUser>, request: Request, next: Next| {
-        let minimum_role = minimum_role.clone();
+        let minimum_role = minimum_role;
         Box::pin(async move {
-            // Check role hierarchy: Admin > User > Readonly > Guest
-            let has_permission = match (&user.role, &minimum_role) {
-                (UserRole::Admin, _) => true,
-                (UserRole::User, UserRole::User) => true,
-                (UserRole::User, UserRole::Readonly) => true,
-                (UserRole::User, UserRole::Guest) => true,
-                (UserRole::Readonly, UserRole::Readonly) => true,
-                (UserRole::Readonly, UserRole::Guest) => true,
-                (UserRole::Guest, UserRole::Guest) => true,
-                _ => false,
-            };
-
-            if !has_permission {
+            // Hierarchy: Admin > User > Readonly > Guest. `UserRole`'s
+            // `Ord` impl encodes this directly, so the brittle 7-arm
+            // match with a `_ => false` catch-all (#46) is gone.
+            if user.role < minimum_role {
                 return Err(AuthError::InsufficientPermissions);
             }
 
@@ -406,6 +504,63 @@ mod tests {
         assert_eq!(api_key.role, UserRole::User);
     }
 
+    // Pre-UNIX-epoch SystemTime values must surface as TokenGenerationFailed
+    // instead of panicking via .unwrap() (regression for #45).
+    #[test]
+    fn unix_secs_returns_err_on_pre_epoch_clock() {
+        let before_epoch = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+        let result = unix_secs(before_epoch);
+        assert!(
+            matches!(result, Err(AuthError::TokenGenerationFailed(_))),
+            "expected TokenGenerationFailed, got {result:?}"
+        );
+    }
+
+    // Sanity check: a normal post-epoch SystemTime returns the seconds value.
+    #[test]
+    fn unix_secs_returns_seconds_for_post_epoch_clock() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let result = unix_secs(t).expect("post-epoch time must succeed");
+        assert_eq!(result, 1_700_000_000);
+    }
+
+    // Exhaustive role-hierarchy check (#46): every (actual, minimum) pair
+    // must satisfy `actual >= minimum` iff actual's privilege level is at
+    // least minimum's. Hierarchy: Admin > User > Readonly > Guest.
+    #[test]
+    fn user_role_ord_covers_every_pair() {
+        use UserRole::*;
+        let all = [Admin, User, Readonly, Guest];
+        // (actual, minimum, expected has_permission)
+        let cases: &[(UserRole, UserRole, bool)] = &[
+            (Admin, Admin, true),
+            (Admin, User, true),
+            (Admin, Readonly, true),
+            (Admin, Guest, true),
+            (User, Admin, false),
+            (User, User, true),
+            (User, Readonly, true),
+            (User, Guest, true),
+            (Readonly, Admin, false),
+            (Readonly, User, false),
+            (Readonly, Readonly, true),
+            (Readonly, Guest, true),
+            (Guest, Admin, false),
+            (Guest, User, false),
+            (Guest, Readonly, false),
+            (Guest, Guest, true),
+        ];
+        // Sanity: we covered every (actual, minimum) pair.
+        assert_eq!(cases.len(), all.len() * all.len());
+        for (actual, minimum, expected) in cases {
+            let got = actual >= minimum;
+            assert_eq!(
+                got, *expected,
+                "role hierarchy mismatch: actual={actual:?}, minimum={minimum:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_rate_limit() {
         let auth_state = AuthState::new("test_secret".to_string());
@@ -428,5 +583,148 @@ mod tests {
         // Third should fail
         let result = auth_state.check_rate_limit("user123", &limit).await;
         assert!(matches!(result, Err(AuthError::RateLimitExceeded { .. })));
+    }
+
+    // AuthState::try_new must reject a missing or under-32-byte JWT secret
+    // (#31). Anything weaker than 32 bytes is brute-forceable for HS256 and
+    // makes the previous hardcoded "graphrag_secret_key_change_in_production"
+    // default a security landmine.
+    #[test]
+    fn try_new_rejects_short_secret() {
+        // Use a distinctive non-English value so we can assert the secret
+        // bytes don't leak into the operator-facing error.
+        let secret = "xq8z!".to_string();
+        let result = AuthState::try_new(secret.clone());
+        let msg = match result {
+            Err(AuthError::TokenGenerationFailed(s)) => s,
+            Err(other) => panic!("expected TokenGenerationFailed, got {other:?}"),
+            Ok(_) => panic!("short secret must reject"),
+        };
+        // Length and threshold should appear in the operator-facing message,
+        // but the secret itself must NOT be logged.
+        assert!(msg.contains("32"), "msg should cite the threshold: {msg}");
+        assert!(!msg.contains(&secret), "secret value must not leak: {msg}");
+    }
+
+    // Empty secrets are also rejected, with no panic.
+    #[test]
+    fn try_new_rejects_empty_secret() {
+        let result = AuthState::try_new(String::new());
+        assert!(matches!(result, Err(AuthError::TokenGenerationFailed(_))));
+    }
+
+    // try_new accepts an exactly-32-byte secret.
+    #[test]
+    fn try_new_accepts_secret_at_threshold() {
+        let secret = "a".repeat(32);
+        assert!(
+            AuthState::try_new(secret).is_ok(),
+            "32-byte secret must be accepted"
+        );
+    }
+
+    // Issued tokens carry the canonical iss/aud claims and validate end-to-end.
+    #[test]
+    fn generate_and_validate_token_round_trip_with_iss_aud() {
+        let auth_state = AuthState::try_new("a".repeat(32)).expect("state");
+        let token = auth_state
+            .generate_token("u1", UserRole::User, 1)
+            .expect("token");
+        let claims = auth_state.validate_token(&token).expect("validate");
+        assert_eq!(claims.iss.as_deref(), Some(JWT_ISSUER));
+        assert_eq!(claims.aud.as_deref(), Some(JWT_AUDIENCE));
+    }
+
+    // A token with the wrong issuer must be rejected even if the signature
+    // verifies — protects against same-secret tokens minted by another
+    // service in the same trust boundary (#31).
+    #[test]
+    fn validate_token_rejects_wrong_issuer() {
+        let auth_state = AuthState::try_new("a".repeat(32)).expect("state");
+        // Hand-roll a token with a foreign `iss` but the right secret.
+        let now = unix_secs(std::time::SystemTime::now()).unwrap();
+        let claims = Claims {
+            sub: "u1".into(),
+            iat: now,
+            exp: now + 3600,
+            iss: Some("other-service".into()),
+            aud: Some(JWT_AUDIENCE.into()),
+            role: UserRole::User,
+            custom: HashMap::new(),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret("a".repeat(32).as_bytes()),
+        )
+        .unwrap();
+        let err = auth_state
+            .validate_token(&token)
+            .expect_err("foreign iss must reject");
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    // A token with the wrong audience must be rejected even if the
+    // signature verifies (#31).
+    #[test]
+    fn validate_token_rejects_wrong_audience() {
+        let auth_state = AuthState::try_new("a".repeat(32)).expect("state");
+        let now = unix_secs(std::time::SystemTime::now()).unwrap();
+        let claims = Claims {
+            sub: "u1".into(),
+            iat: now,
+            exp: now + 3600,
+            iss: Some(JWT_ISSUER.into()),
+            aud: Some("other-api".into()),
+            role: UserRole::User,
+            custom: HashMap::new(),
+        };
+        let token = encode(
+            &Header::default(),
+            &claims,
+            &EncodingKey::from_secret("a".repeat(32).as_bytes()),
+        )
+        .unwrap();
+        let err = auth_state
+            .validate_token(&token)
+            .expect_err("foreign aud must reject");
+        assert!(matches!(err, AuthError::InvalidToken(_)));
+    }
+
+    // JWT-authenticated callers must be rate-limited too (#32). The Bearer
+    // branch of `extract_auth_user` previously returned the user without
+    // ever calling `check_rate_limit`, so a stolen JWT had no per-user
+    // ceiling at all.
+    #[tokio::test]
+    async fn extract_auth_user_rate_limits_jwt_path() {
+        let mut auth_state = AuthState::new("test_secret_key_32_characters_long".to_string());
+        // Tighten the per-role JWT ceiling so the test doesn't have to
+        // burn the default 1000 requests.
+        auth_state.set_jwt_rate_limit(
+            UserRole::User,
+            RateLimit {
+                max_requests: 2,
+                window_seconds: 60,
+            },
+        );
+
+        let token = auth_state
+            .generate_token("jwt_user", UserRole::User, 1)
+            .expect("token");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("Authorization", format!("Bearer {token}").parse().unwrap());
+
+        // First two extractions succeed.
+        extract_auth_user(&auth_state, &headers).await.expect("1st");
+        extract_auth_user(&auth_state, &headers).await.expect("2nd");
+
+        // Third must be rejected as RateLimitExceeded — not panic, not
+        // silently pass.
+        let result = extract_auth_user(&auth_state, &headers).await;
+        assert!(
+            matches!(result, Err(AuthError::RateLimitExceeded { .. })),
+            "expected RateLimitExceeded, got {result:?}"
+        );
     }
 }
