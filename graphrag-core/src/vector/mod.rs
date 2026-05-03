@@ -2,8 +2,12 @@
 use crate::parallel::ParallelProcessor;
 use crate::{GraphRAGError, Result};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+
+// Soft-deleted vector ids accumulate as tombstones; once their share of the live
+// set crosses this ratio we pay for one HNSW rebuild instead of one per removal.
+const TOMBSTONE_REBUILD_RATIO: f32 = 0.2;
 
 #[cfg(feature = "vector-hnsw")]
 use instant_distance::{Builder, Point, Search};
@@ -68,6 +72,9 @@ pub struct VectorIndex {
     #[cfg(not(feature = "vector-hnsw"))]
     index: Option<()>, // Placeholder when HNSW is not available
     embeddings: HashMap<String, Vec<f32>>,
+    // Ids that have been soft-deleted from the HNSW graph; filtered out of search
+    // results until a rebuild flushes them. Embeddings are dropped immediately on remove.
+    tombstones: HashSet<String>,
     #[cfg(feature = "parallel-processing")]
     parallel_processor: Option<ParallelProcessor>,
 }
@@ -78,6 +85,7 @@ impl VectorIndex {
         Self {
             index: None,
             embeddings: HashMap::new(),
+            tombstones: HashSet::new(),
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
         }
@@ -89,6 +97,7 @@ impl VectorIndex {
         Self {
             index: None,
             embeddings: HashMap::new(),
+            tombstones: HashSet::new(),
             parallel_processor: Some(parallel_processor),
         }
     }
@@ -101,6 +110,8 @@ impl VectorIndex {
             });
         }
 
+        // Re-adding an id revives it from the tombstone set so search can return it again.
+        self.tombstones.remove(&id);
         self.embeddings.insert(id, embedding);
         Ok(())
     }
@@ -137,6 +148,8 @@ impl VectorIndex {
             self.index = Some(());
         }
 
+        // A fresh build only contains live ids, so any prior tombstones are now flushed.
+        self.tombstones.clear();
         Ok(())
     }
 
@@ -156,8 +169,16 @@ impl VectorIndex {
 
             let results = _index.search(&query_point, &mut search);
 
+            // Tombstoned ids still live in the HNSW graph until the next rebuild — skip
+            // them here so callers never see soft-deleted entries.
             let mut scored_results = Vec::new();
-            for item in results.into_iter().take(top_k) {
+            for item in results {
+                if scored_results.len() >= top_k {
+                    break;
+                }
+                if self.is_tombstoned(item.value) {
+                    continue;
+                }
                 let distance = item.distance;
                 // Convert distance to similarity using exponential decay for better score distribution
                 let similarity = (-distance).exp().clamp(0.0, 1.0);
@@ -174,6 +195,9 @@ impl VectorIndex {
             let mut scored_results = Vec::new();
 
             for (id, embedding) in &self.embeddings {
+                if self.is_tombstoned(id) {
+                    continue;
+                }
                 let similarity = self.cosine_similarity(query_vec, embedding);
                 scored_results.push((id.clone(), similarity));
             }
@@ -184,6 +208,16 @@ impl VectorIndex {
 
             Ok(scored_results)
         }
+    }
+
+    /// Whether an id is currently soft-deleted.
+    fn is_tombstoned(&self, id: &str) -> bool {
+        self.tombstones.contains(id)
+    }
+
+    /// Number of tombstoned (soft-deleted, awaiting rebuild) ids.
+    pub fn tombstone_count(&self) -> usize {
+        self.tombstones.len()
     }
 
     /// Calculate cosine similarity between two vectors (fallback when HNSW is not available)
@@ -219,14 +253,42 @@ impl VectorIndex {
         self.embeddings.values().next().map(|v| v.len())
     }
 
-    /// Remove a vector from the index
+    /// Remove a vector from the index.
+    ///
+    /// Drops the embedding from the source map immediately and tombstones the id
+    /// so future searches skip it. A real HNSW rebuild only happens when the
+    /// tombstone share crosses [`TOMBSTONE_REBUILD_RATIO`].
     pub fn remove_vector(&mut self, id: &str) -> Result<()> {
-        self.embeddings.remove(id);
-        // Note: instant-distance doesn't support removal, so we need to rebuild
-        if !self.embeddings.is_empty() {
-            self.build_index()?;
-        } else {
+        self.remove_vectors(&[id])
+    }
+
+    /// Remove multiple vectors with at most one rebuild check at the end.
+    pub fn remove_vectors(&mut self, ids: &[&str]) -> Result<()> {
+        for id in ids {
+            if self.embeddings.remove(*id).is_some() {
+                self.tombstones.insert((*id).to_string());
+            }
+        }
+        self.maybe_rebuild_after_removal()
+    }
+
+    /// Rebuild the HNSW graph if the tombstone share is above the threshold, or
+    /// drop the index entirely once everything has been removed.
+    fn maybe_rebuild_after_removal(&mut self) -> Result<()> {
+        if self.embeddings.is_empty() {
             self.index = None;
+            self.tombstones.clear();
+            return Ok(());
+        }
+
+        // instant-distance has no real removal, so we amortise rebuilds by
+        // letting tombstones accumulate up to the configured ratio.
+        let live = self.embeddings.len() as f32;
+        let dead = self.tombstones.len() as f32;
+        let denom = live + dead;
+        let ratio = if denom > 0.0 { dead / denom } else { 0.0 };
+        if ratio >= TOMBSTONE_REBUILD_RATIO {
+            self.build_index()?;
         }
         Ok(())
     }
@@ -951,4 +1013,88 @@ mod tests {
         // Similar content should have higher similarity
         assert!(sim1 > sim2);
     }
+
+    /// Verifies that ids removed via `remove_vector` never appear in subsequent search results.
+    #[test]
+    fn test_remove_vector_excludes_from_search() {
+        let mut index = VectorIndex::new();
+        index
+            .add_vector("doc1".to_string(), vec![1.0, 0.0, 0.0])
+            .unwrap();
+        index
+            .add_vector("doc2".to_string(), vec![0.0, 1.0, 0.0])
+            .unwrap();
+        index
+            .add_vector("doc3".to_string(), vec![0.8, 0.2, 0.0])
+            .unwrap();
+        index.build_index().unwrap();
+
+        index.remove_vector("doc1").unwrap();
+
+        let results = index.search(&[1.0, 0.0, 0.0], 5).unwrap();
+        assert!(
+            results.iter().all(|(id, _)| id != "doc1"),
+            "removed id should not appear in search results: {results:?}"
+        );
+        assert!(!index.contains("doc1"));
+    }
+
+    /// Verifies that crossing the tombstone threshold triggers a rebuild and clears tombstones.
+    #[test]
+    fn test_remove_vector_triggers_rebuild_above_threshold() {
+        let mut index = VectorIndex::new();
+        for i in 0..10 {
+            index
+                .add_vector(format!("doc{i}"), vec![i as f32, 0.0, 0.0])
+                .unwrap();
+        }
+        index.build_index().unwrap();
+
+        // Remove 1 vector: 10% tombstoned -> below 20% threshold, tombstone retained.
+        index.remove_vector("doc0").unwrap();
+        assert_eq!(
+            index.tombstone_count(),
+            1,
+            "single removal should be tombstoned, not rebuilt"
+        );
+
+        // Remove a second: ratio crosses 20% threshold -> rebuild, tombstones cleared.
+        index.remove_vector("doc1").unwrap();
+        assert_eq!(
+            index.tombstone_count(),
+            0,
+            "crossing tombstone ratio should trigger rebuild and clear tombstones"
+        );
+        assert_eq!(index.len(), 8);
+    }
+
+    /// Verifies `remove_vectors` removes a batch with at most one rebuild check at the end.
+    #[test]
+    fn test_remove_vectors_batch_single_rebuild() {
+        let mut index = VectorIndex::new();
+        for i in 0..10 {
+            index
+                .add_vector(format!("doc{i}"), vec![i as f32, 0.0, 0.0])
+                .unwrap();
+        }
+        index.build_index().unwrap();
+
+        // Remove three: ratio (3/10 = 30%) exceeds 20% so a single rebuild fires at the end.
+        index.remove_vectors(&["doc0", "doc1", "doc2"]).unwrap();
+        assert_eq!(index.len(), 7);
+        assert_eq!(
+            index.tombstone_count(),
+            0,
+            "batch removal past threshold should trigger exactly one rebuild"
+        );
+
+        let results = index.search(&[0.0, 0.0, 0.0], 10).unwrap();
+        for removed in &["doc0", "doc1", "doc2"] {
+            assert!(
+                results.iter().all(|(id, _)| id != removed),
+                "{removed} should not be in results"
+            );
+        }
+    }
+
 }
