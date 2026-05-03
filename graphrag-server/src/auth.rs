@@ -123,6 +123,12 @@ pub struct AuthState {
     api_keys: Arc<RwLock<HashMap<String, ApiKey>>>,
     /// Rate limiting state: (user_id, (count, window_start))
     rate_limits: Arc<RwLock<HashMap<String, (usize, u64)>>>,
+    /// Per-role rate limits applied on the JWT (Bearer) auth path.
+    /// API-key callers carry their own `RateLimit`; JWT callers do not,
+    /// so without this table the Bearer branch had no per-user ceiling
+    /// at all (#32). Roles missing from the map fall back to
+    /// `RateLimit::default()`.
+    jwt_rate_limits: HashMap<UserRole, RateLimit>,
 }
 
 impl AuthState {
@@ -135,7 +141,26 @@ impl AuthState {
             jwt_secret,
             api_keys: Arc::new(RwLock::new(HashMap::new())),
             rate_limits: Arc::new(RwLock::new(HashMap::new())),
+            jwt_rate_limits: HashMap::new(),
         }
+    }
+
+    /// Override the JWT-path rate limit for a specific role.
+    ///
+    /// Used at startup (and in tests) to install per-role ceilings; the
+    /// JWT branch of `extract_auth_user` consults this table.
+    #[allow(dead_code)]
+    pub fn set_jwt_rate_limit(&mut self, role: UserRole, limit: RateLimit) {
+        self.jwt_rate_limits.insert(role, limit);
+    }
+
+    /// Look up the JWT-path rate limit for a role, falling back to the
+    /// global `RateLimit::default()` (1000 req/hr).
+    fn jwt_rate_limit_for(&self, role: UserRole) -> RateLimit {
+        self.jwt_rate_limits
+            .get(&role)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Generate a JWT token
@@ -328,6 +353,11 @@ pub async fn extract_auth_user(
     // Check for Bearer token (JWT)
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
         let claims = auth_state.validate_token(token)?;
+        // Apply per-role JWT rate limit (#32). Previously the Bearer
+        // branch returned without ever counting the request, so a JWT
+        // had no per-user ceiling — only API-key callers were limited.
+        let limit = auth_state.jwt_rate_limit_for(claims.role);
+        auth_state.check_rate_limit(&claims.sub, &limit).await?;
         return Ok(AuthUser {
             user_id: claims.sub,
             role: claims.role,
@@ -506,5 +536,45 @@ mod tests {
         // Third should fail
         let result = auth_state.check_rate_limit("user123", &limit).await;
         assert!(matches!(result, Err(AuthError::RateLimitExceeded { .. })));
+    }
+
+    // JWT-authenticated callers must be rate-limited too (#32). The Bearer
+    // branch of `extract_auth_user` previously returned the user without
+    // ever calling `check_rate_limit`, so a stolen JWT had no per-user
+    // ceiling at all.
+    #[tokio::test]
+    async fn extract_auth_user_rate_limits_jwt_path() {
+        let mut auth_state = AuthState::new("test_secret_key_32_characters_long".to_string());
+        // Tighten the per-role JWT ceiling so the test doesn't have to
+        // burn the default 1000 requests.
+        auth_state.set_jwt_rate_limit(
+            UserRole::User,
+            RateLimit {
+                max_requests: 2,
+                window_seconds: 60,
+            },
+        );
+
+        let token = auth_state
+            .generate_token("jwt_user", UserRole::User, 1)
+            .expect("token");
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {token}").parse().unwrap(),
+        );
+
+        // First two extractions succeed.
+        extract_auth_user(&auth_state, &headers).await.expect("1st");
+        extract_auth_user(&auth_state, &headers).await.expect("2nd");
+
+        // Third must be rejected as RateLimitExceeded — not panic, not
+        // silently pass.
+        let result = extract_auth_user(&auth_state, &headers).await;
+        assert!(
+            matches!(result, Err(AuthError::RateLimitExceeded { .. })),
+            "expected RateLimitExceeded, got {result:?}"
+        );
     }
 }
