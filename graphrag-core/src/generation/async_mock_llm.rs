@@ -512,36 +512,48 @@ impl Clone for AsyncMockLLM {
     }
 }
 
+/// Drive an async future from a sync `LLMInterface` method.
+///
+/// Bridge strategy by tokio runtime context:
+/// * `MultiThread` runtime: `block_in_place` + `Handle::block_on`.
+/// * `CurrentThread` runtime: returns a `Generation` error — `block_in_place`
+///   would panic and `Handle::block_on` on `CurrentThread` deadlocks.
+/// * No runtime: builds an ad-hoc `Runtime` and surfaces construction
+///   failure as a `Generation` error.
+fn run_sync_llm<F>(work: F) -> Result<String>
+where
+    F: std::future::Future<Output = Result<String>>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(work))
+            },
+            _ => Err(GraphRAGError::Generation {
+                message: "AsyncMockLLM sync LLMInterface methods require a multi-thread \
+                          tokio runtime when called from inside an async context; \
+                          call the async API directly or switch to a multi_thread runtime"
+                    .to_string(),
+            }),
+        },
+        Err(_) => match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt.block_on(work),
+            Err(e) => Err(GraphRAGError::Generation {
+                message: format!("Failed to construct ad-hoc tokio runtime: {e}"),
+            }),
+        },
+    }
+}
+
 /// Synchronous LLMInterface implementation for backward compatibility
 #[async_trait]
 impl LLMInterface for AsyncMockLLM {
     fn generate_response(&self, prompt: &str) -> Result<String> {
-        // For sync compatibility, use tokio's block_in_place if we're in a tokio context
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(self.complete(prompt))
-            })
-        } else {
-            // If not in async context, create a new runtime
-            let rt = tokio::runtime::Runtime::new().map_err(|e| GraphRAGError::Generation {
-                message: format!("Failed to create async runtime: {e}"),
-            })?;
-            rt.block_on(self.complete(prompt))
-        }
+        run_sync_llm(self.complete(prompt))
     }
 
     fn generate_summary(&self, content: &str, max_length: usize) -> Result<String> {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current()
-                    .block_on(self.generate_summary_async(content, max_length))
-            })
-        } else {
-            let rt = tokio::runtime::Runtime::new().map_err(|e| GraphRAGError::Generation {
-                message: format!("Failed to create async runtime: {e}"),
-            })?;
-            rt.block_on(self.generate_summary_async(content, max_length))
-        }
+        run_sync_llm(self.generate_summary_async(content, max_length))
     }
 
     fn extract_key_points(&self, content: &str, num_points: usize) -> Result<Vec<String>> {
@@ -627,5 +639,51 @@ mod tests {
         let llm = AsyncMockLLM::new().await.unwrap();
         let tokens = llm.estimate_tokens("This is a test prompt").await.unwrap();
         assert!(tokens > 0);
+    }
+
+    // Sync `LLMInterface::generate_response` returns a typed error (not a
+    // panic) when invoked from a tokio current_thread runtime. Regression
+    // for #16.
+    #[test]
+    fn generate_response_returns_error_on_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let llm = AsyncMockLLM::new().await.unwrap();
+            let err = llm
+                .generate_response("Hello")
+                .expect_err("expected typed error on current_thread runtime");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("current_thread") || msg.contains("multi-thread"),
+                "error should mention runtime flavor mismatch, got: {msg}"
+            );
+        });
+    }
+
+    // Sync `LLMInterface::generate_summary` returns a typed error (not a
+    // panic) when invoked from a tokio current_thread runtime. Regression
+    // for #16.
+    #[test]
+    fn generate_summary_returns_error_on_current_thread_runtime() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            let llm = AsyncMockLLM::new().await.unwrap();
+            let err = llm
+                .generate_summary("Some content for the model.", 32)
+                .expect_err("expected typed error on current_thread runtime");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("current_thread") || msg.contains("multi-thread"),
+                "error should mention runtime flavor mismatch, got: {msg}"
+            );
+        });
     }
 }
