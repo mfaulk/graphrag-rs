@@ -1,6 +1,4 @@
-//! Color themes and styling for the TUI
-//!
-//! Provides consistent color schemes and style utilities across the application.
+//! TUI color themes and style helpers.
 
 use ratatui::style::{Color, Modifier, Style};
 

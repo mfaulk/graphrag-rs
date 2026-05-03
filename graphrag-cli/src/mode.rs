@@ -1,8 +1,4 @@
-//! Input utilities for the TUI
-//!
-//! The input box automatically detects whether input is a query or slash command.
-//! - Regular text: Natural language questions
-//! - Text starting with '/': Slash commands
+//! Slash-command detection for TUI input.
 
 /// Check if input text is a slash command
 pub fn is_slash_command(input: &str) -> bool {

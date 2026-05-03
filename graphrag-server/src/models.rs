@@ -1,6 +1,4 @@
-//! API Models with Apistos OpenAPI support
-//!
-//! All request/response models with automatic OpenAPI schema generation
+//! REST API request and response types (also drive OpenAPI schema generation).
 
 use actix_web::{error::ResponseError, http::StatusCode, HttpResponse};
 use apistos::ApiComponent;

@@ -1,48 +1,7 @@
-//! High-performance LLM response caching system
+//! Transparent LLM response cache built on `moka` (TTL, LRU/LFU, statistics).
 //!
-//! This module provides a transparent caching layer for Language Model operations
-//! using the moka cache library for high-performance concurrent caching with TTL support.
-//!
-//! ## Features
-//!
-//! - **Transparent caching**: Drop-in replacement for existing LLM clients
-//! - **High performance**: Sub-millisecond response times for cached queries
-//! - **Cost optimization**: Dramatic reduction in LLM API calls (6x+ cost reduction)
-//! - **Multiple eviction policies**: LRU, LFU, TTL with configurable parameters
-//! - **Intelligent cache keys**: Content-based hashing for optimal hit rates
-//! - **Comprehensive monitoring**: Cache statistics and health metrics
-//! - **Cache warming**: Preload frequently accessed content
-//! - **Thread-safe**: Fully concurrent operations with lock-free performance
-//!
-//! ## Usage
-//!
-//! ```rust
-//! use graphrag_rs::caching::{CachedLLMClient, CacheConfig, EvictionPolicy};
-//! use graphrag_rs::generation::MockLLM;
-//!
-//! # async fn example() -> graphrag_rs::Result<()> {
-//! // Create cache configuration
-//! let cache_config = CacheConfig::builder()
-//!     .max_capacity(10_000)
-//!     .ttl_seconds(3600)
-//!     .eviction_policy(EvictionPolicy::LRU)
-//!     .enable_statistics(true)
-//!     .build();
-//!
-//! // Wrap any LLM with caching
-//! let base_llm = Box::new(MockLLM::new()?);
-//! let cached_llm = CachedLLMClient::new(base_llm, cache_config).await?;
-//!
-//! // Use exactly like any other LLM
-//! let response1 = cached_llm.complete("What is AI?").await?; // Cache miss
-//! let response2 = cached_llm.complete("What is AI?").await?; // Cache hit!
-//!
-//! // Monitor cache performance
-//! let stats = cached_llm.cache_statistics();
-//! println!("Cache hit rate: {:.2}%", stats.hit_rate() * 100.0);
-//! # Ok(())
-//! # }
-//! ```
+//! Wrap any [`LanguageModel`](crate::core::traits::LanguageModel) implementation
+//! with [`client::CachedLLMClient`] to deduplicate repeated prompts.
 
 pub mod cache_config;
 pub mod cache_key;
