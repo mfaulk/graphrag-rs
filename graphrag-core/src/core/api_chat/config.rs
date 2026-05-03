@@ -107,32 +107,36 @@ impl ChatProviderConfig {
 
     /// Resolve the API key, falling back to the provider-specific env
     /// var when the config doesn't carry one. Returns `Auth` if the env
-    /// var is missing for OpenAI/Anthropic. Ollama returns `None`.
+    /// var is missing or empty for OpenAI/Anthropic. Ollama returns
+    /// `None`. Empty/whitespace-only keys (from either source) are
+    /// rejected with `Auth` so we never issue requests with blank
+    /// authorization headers.
     pub fn resolved_api_key(&self) -> Result<Option<String>> {
-        if let Some(k) = &self.api_key {
-            return Ok(Some(k.clone()));
+        let provider = self.provider_kind()?;
+        let env_var = match provider {
+            ChatProvider::OpenAi => "OPENAI_API_KEY",
+            ChatProvider::Anthropic => "ANTHROPIC_API_KEY",
+            ChatProvider::Ollama => return Ok(None),
+        };
+
+        let key = if let Some(k) = &self.api_key {
+            k.clone()
+        } else {
+            std::env::var(env_var).map_err(|_| GraphRAGError::Auth {
+                message: format!("{} env var not set and no api_key in config", env_var),
+            })?
+        };
+
+        if key.trim().is_empty() {
+            return Err(GraphRAGError::Auth {
+                message: format!(
+                    "{} is empty (set the env var or `api_key` in [chat] config)",
+                    env_var
+                ),
+            });
         }
-        match self.provider_kind()? {
-            ChatProvider::OpenAi => std::env::var("OPENAI_API_KEY").ok().map_or_else(
-                || {
-                    Err(GraphRAGError::Auth {
-                        message: "OPENAI_API_KEY env var not set and no api_key in config"
-                            .to_string(),
-                    })
-                },
-                |v| Ok(Some(v)),
-            ),
-            ChatProvider::Anthropic => std::env::var("ANTHROPIC_API_KEY").ok().map_or_else(
-                || {
-                    Err(GraphRAGError::Auth {
-                        message: "ANTHROPIC_API_KEY env var not set and no api_key in config"
-                            .to_string(),
-                    })
-                },
-                |v| Ok(Some(v)),
-            ),
-            ChatProvider::Ollama => Ok(None),
-        }
+
+        Ok(Some(key))
     }
 
     /// Build a `DynChatBackend` from this config. Returns `Unsupported`
@@ -263,6 +267,62 @@ mod tests {
             Ok(_) => panic!("ollama should not be buildable via ChatProviderConfig"),
             Err(GraphRAGError::Unsupported { .. }) => {},
             Err(other) => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    /// An explicit empty `api_key` in the config must be rejected so we
+    /// never issue requests with a blank `Authorization` header.
+    #[test]
+    fn build_errors_on_empty_api_key_in_config() {
+        let cfg = ChatProviderConfig {
+            provider: "openai".into(),
+            model: None,
+            api_key: Some(String::new()),
+            max_tokens: None,
+        };
+        match cfg.build() {
+            Ok(_) => panic!("empty api_key should be rejected"),
+            Err(GraphRAGError::Auth { .. }) => {},
+            Err(other) => panic!("expected Auth, got {other:?}"),
+        }
+
+        // Whitespace-only is also rejected.
+        let cfg = ChatProviderConfig {
+            provider: "anthropic".into(),
+            model: None,
+            api_key: Some("   ".into()),
+            max_tokens: None,
+        };
+        match cfg.build() {
+            Ok(_) => panic!("whitespace api_key should be rejected"),
+            Err(GraphRAGError::Auth { .. }) => {},
+            Err(other) => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    /// An empty `OPENAI_API_KEY` env var must be rejected the same way as
+    /// a missing one — otherwise `build` would silently issue requests
+    /// with an empty bearer token.
+    #[test]
+    fn build_errors_on_empty_api_key_in_env() {
+        let prev = std::env::var("OPENAI_API_KEY").ok();
+        std::env::set_var("OPENAI_API_KEY", "");
+        let cfg = ChatProviderConfig {
+            provider: "openai".into(),
+            model: None,
+            api_key: None,
+            max_tokens: None,
+        };
+        let result = cfg.build();
+        // Restore before asserting so a panic doesn't leak state.
+        match prev {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match result {
+            Ok(_) => panic!("empty OPENAI_API_KEY should be rejected"),
+            Err(GraphRAGError::Auth { .. }) => {},
+            Err(other) => panic!("expected Auth, got {other:?}"),
         }
     }
 }
