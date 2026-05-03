@@ -1012,6 +1012,42 @@ mod tests {
         assert!(!index.contains("doc1"));
     }
 
+    /// Verifies the tombstone filter excludes a removed id from `search` results when no
+    /// rebuild has happened (i.e. exercises the filter path, not the rebuild path).
+    #[test]
+    fn test_tombstone_filter_below_rebuild_threshold() {
+        let mut index = VectorIndex::new();
+        for i in 0..10 {
+            index
+                .add_vector(format!("doc{i}"), vec![i as f32, 0.0, 0.0])
+                .unwrap();
+        }
+        index.build_index().unwrap();
+
+        // Remove 1 of 10: ratio is 10%, below the 20% rebuild threshold.
+        index.remove_vector("doc0").unwrap();
+        assert_eq!(
+            index.tombstone_count(),
+            1,
+            "removal below threshold must not trigger a rebuild"
+        );
+
+        // Search must still exclude the tombstoned id even though the underlying HNSW
+        // graph still contains its node.
+        let results = index.search(&[0.0, 0.0, 0.0], 10).unwrap();
+        assert!(
+            results.iter().all(|(id, _)| id != "doc0"),
+            "tombstoned id must be filtered from results: {results:?}"
+        );
+
+        // The tombstone must still be present after search (no rebuild was triggered).
+        assert_eq!(
+            index.tombstone_count(),
+            1,
+            "search must not clear tombstones (no rebuild expected)"
+        );
+    }
+
     /// Verifies that crossing the tombstone threshold triggers a rebuild and clears tombstones.
     #[test]
     fn test_remove_vector_triggers_rebuild_above_threshold() {
