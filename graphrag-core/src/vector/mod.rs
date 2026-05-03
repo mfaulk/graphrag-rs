@@ -199,14 +199,13 @@ impl VectorIndex {
 
         #[cfg(not(feature = "vector-hnsw"))]
         {
-            // Fallback to brute force similarity search
+            // Fallback to brute force similarity search.
+            // Note: tombstoned ids are removed from `self.embeddings` immediately by
+            // `remove_vectors`, so iterating `self.embeddings` cannot yield a tombstoned id.
             let query_vec = query_embedding;
-            let mut scored_results = Vec::new();
+            let mut scored_results = Vec::with_capacity(self.embeddings.len());
 
             for (id, embedding) in &self.embeddings {
-                if self.is_tombstoned(id) {
-                    continue;
-                }
                 let similarity = self.cosine_similarity(query_vec, embedding);
                 scored_results.push((id.clone(), similarity));
             }
@@ -220,6 +219,9 @@ impl VectorIndex {
     }
 
     /// Whether an id is currently soft-deleted.
+    /// Only the HNSW search path consults this — the brute-force fallback drops
+    /// embeddings on remove, so it never sees a tombstoned id.
+    #[cfg(feature = "vector-hnsw")]
     fn is_tombstoned(&self, id: &str) -> bool {
         self.tombstones.contains(id)
     }
