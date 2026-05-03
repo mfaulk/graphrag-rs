@@ -1351,25 +1351,17 @@ impl GraphRAG {
 
     /// Query the system for relevant information (synchronous version)
     ///
-    /// The hybrid retrieval pipeline is async-only, so this fallback delegates
-    /// to `RetrievalSystem::query`, which performs a placeholder lookup. Builds
-    /// that need real retrieval should enable the `async` feature.
+    /// The hybrid retrieval pipeline is async-only. This sync fallback exists
+    /// only to keep the `GraphRAG::ask` symbol present on builds without the
+    /// `async` feature; calling it returns an error rather than fabricating
+    /// stub answers. Enable the `async` feature for real retrieval.
     #[cfg(not(feature = "async"))]
-    pub fn ask(&mut self, query: &str) -> Result<String> {
-        self.ensure_initialized()?;
-
-        if self.has_documents() && !self.has_graph() {
-            self.build_graph()?;
-        }
-
-        let retrieval = self
-            .retrieval_system
-            .as_ref()
-            .ok_or_else(|| GraphRAGError::Config {
-                message: "Retrieval system not initialized".to_string(),
-            })?;
-        let results = retrieval.query(query)?;
-        Ok(results.join("\n"))
+    pub fn ask(&mut self, _query: &str) -> Result<String> {
+        Err(GraphRAGError::Config {
+            message: "GraphRAG::ask requires the `async` feature; the sync \
+                fallback cannot drive hybrid retrieval"
+                .to_string(),
+        })
     }
 
     /// Query the system and return an explained answer with reasoning trace
