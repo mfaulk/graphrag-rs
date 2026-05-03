@@ -306,20 +306,58 @@ where
         // Try L2 (Redis) if available
         #[cfg(feature = "redis_storage")]
         if let Some(l2) = &self.l2 {
-            if let Ok(Some(bytes)) = l2.get(&key.to_string()) {
-                if let Ok(value) = bincode::deserialize::<V>(&bytes) {
-                    self.stats.write().l2_hits += 1;
-
-                    // Populate L1 cache
-                    self.l1.put(key.clone(), value.clone());
-
-                    return Some(value);
-                }
+            match l2.get(&key.to_string()) {
+                Ok(Some(bytes)) => {
+                    // Bytes present — distinguish a successful deserialize
+                    // (true L2 hit) from a deserialize failure (corrupt
+                    // payload / serialization-format drift). The previous
+                    // `if let Ok(value) = ...` collapsed these into a plain
+                    // miss, masking format drift in metrics. (#23)
+                    match Self::try_deserialize(&bytes) {
+                        Ok(value) => {
+                            self.stats.write().l2_hits += 1;
+                            self.l1.put(key.clone(), value.clone());
+                            return Some(value);
+                        },
+                        Err(_e) => {
+                            self.stats.write().l2_deserialize_failures += 1;
+                            #[cfg(feature = "tracing")]
+                            tracing::warn!(
+                                key = %key.to_string(),
+                                error = %_e,
+                                "L2 cache: bytes present but deserialize failed — \
+                                 treating as miss. Likely format drift or corruption."
+                            );
+                        },
+                    }
+                },
+                Ok(None) => {
+                    self.stats.write().l2_misses += 1;
+                },
+                Err(_e) => {
+                    // Connection / transport error against Redis. Count as
+                    // a miss but log so the operator sees it.
+                    self.stats.write().l2_misses += 1;
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        key = %key.to_string(),
+                        error = %_e,
+                        "L2 cache GET failed (Redis transport error)"
+                    );
+                },
             }
-            self.stats.write().l2_misses += 1;
         }
 
         None
+    }
+
+    /// Attempt to deserialize a bincode-encoded cache payload.
+    ///
+    /// Extracted so tests can exercise the deserialize-failure path
+    /// without spinning up Redis.
+    #[cfg(feature = "redis_storage")]
+    fn try_deserialize(bytes: &[u8]) -> std::result::Result<V, bincode::Error> {
+        bincode::deserialize::<V>(bytes)
     }
 
     /// Put value into cache (writes to both L1 and L2)
@@ -397,8 +435,12 @@ pub struct DistributedCacheStats {
     pub l1_capacity: usize,
     /// Number of cache hits in L2 (Redis) cache
     pub l2_hits: u64,
-    /// Number of cache misses in L2 (Redis) cache
+    /// Number of cache misses in L2 (Redis) cache (key absent)
     pub l2_misses: u64,
+    /// L2 lookups that returned bytes but failed to deserialize. Counted
+    /// separately from `l2_misses` so format drift / corruption shows up
+    /// in metrics instead of disguised as a normal miss. (#23)
+    pub l2_deserialize_failures: u64,
 }
 
 impl DistributedCacheStats {
@@ -452,5 +494,29 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(15));
         assert!(entry.is_expired());
+    }
+
+    // Regression for #23: bincode garbage in the L2 byte stream must surface
+    // as a deserialize failure (caller can count it separately from miss).
+    #[cfg(feature = "redis_storage")]
+    #[test]
+    fn try_deserialize_returns_err_on_garbage_bytes() {
+        // We never deserialize an `i32` from a single 0xff byte successfully.
+        let result: std::result::Result<i32, _> =
+            DistributedCache::<String, i32>::try_deserialize(&[0xff]);
+        assert!(
+            result.is_err(),
+            "deserialize must fail loudly on corrupt bytes so callers can \
+             distinguish miss from format drift"
+        );
+    }
+
+    // The new `l2_deserialize_failures` counter starts at zero and is
+    // distinct from `l2_misses` so dashboards can split the two signals.
+    #[test]
+    fn distributed_cache_stats_separates_misses_from_deserialize_failures() {
+        let stats = DistributedCacheStats::default();
+        assert_eq!(stats.l2_misses, 0);
+        assert_eq!(stats.l2_deserialize_failures, 0);
     }
 }
