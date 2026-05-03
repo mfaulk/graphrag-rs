@@ -237,7 +237,9 @@ impl HybridRetriever {
         let mut content_map: HashMap<String, String> = HashMap::new();
 
         // Drain semantic results: each id is cloned at most once (for the
-        // score-map key) and content is moved into content_map.
+        // score-map key) and content is moved into content_map. The semantic
+        // pass runs first into an empty map, so entry/or_insert and a plain
+        // insert behave identically here.
         for (rank, (id, score, content)) in semantic_results.into_iter().enumerate() {
             let rrf_score = 1.0 / (self.config.rrf_k + rank as f32 + 1.0);
             let weighted = rrf_score * self.config.semantic_weight;
@@ -248,7 +250,10 @@ impl HybridRetriever {
             content_map.entry(id).or_insert(content);
         }
 
-        // Drain keyword results with the same single-clone, move-content pattern.
+        // Drain keyword results. Use a plain `insert` for content_map so that
+        // the real BM25 text overwrites any semantic-side placeholder for
+        // overlapping ids (semantic_search currently returns the id as
+        // content). The owned `result.content` lets us avoid a clone.
         for (rank, result) in keyword_results.into_iter().enumerate() {
             let rrf_score = 1.0 / (self.config.rrf_k + rank as f32 + 1.0);
             let weighted = rrf_score * self.config.keyword_weight;
@@ -257,7 +262,7 @@ impl HybridRetriever {
                 .or_insert((0.0, 0.0, 0.0));
             entry.0 += weighted;
             entry.2 = result.score;
-            content_map.entry(result.doc_id).or_insert(result.content);
+            content_map.insert(result.doc_id, result.content);
         }
 
         self.create_hybrid_results(combined_scores, content_map, limit, FusionMethod::RRF)
@@ -284,7 +289,8 @@ impl HybridRetriever {
             .fold(f32::NEG_INFINITY, f32::max);
 
         // Drain semantic results: id cloned once for the score-map key,
-        // content moved into the content map.
+        // content moved into the content map. Semantic pass runs first
+        // into an empty map, so entry/or_insert is fine here.
         for (id, score, content) in semantic_results.into_iter() {
             let normalized_score = if max_semantic > 0.0 {
                 score / max_semantic
@@ -299,7 +305,9 @@ impl HybridRetriever {
             content_map.entry(id).or_insert(content);
         }
 
-        // Drain keyword results with the same single-clone, move-content pattern.
+        // Drain keyword results. Use a plain `insert` for content_map so
+        // the real BM25 text overwrites any semantic-side placeholder for
+        // overlapping ids; the owned `result.content` keeps this clone-free.
         for result in keyword_results.into_iter() {
             let normalized_score = if max_keyword > 0.0 {
                 result.score / max_keyword
@@ -312,7 +320,7 @@ impl HybridRetriever {
                 .or_insert((0.0, 0.0, 0.0));
             entry.0 += weighted;
             entry.2 = result.score;
-            content_map.entry(result.doc_id).or_insert(result.content);
+            content_map.insert(result.doc_id, result.content);
         }
 
         self.create_hybrid_results(combined_scores, content_map, limit, FusionMethod::Weighted)
