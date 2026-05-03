@@ -518,18 +518,11 @@ impl KnowledgeGraph {
 
         // Helper: pull a required non-empty string field from a json::JsonValue
         // and surface DataCorruption rather than silently substituting "".
-        fn required_str(
-            obj: &json::JsonValue,
-            field: &str,
-            kind: &str,
-        ) -> Result<String> {
+        fn required_str(obj: &json::JsonValue, field: &str, kind: &str) -> Result<String> {
             match obj[field].as_str() {
                 Some(s) if !s.is_empty() => Ok(s.to_string()),
                 _ => Err(GraphRAGError::DataCorruption {
-                    message: format!(
-                        "{} record missing required string field '{}'",
-                        kind, field
-                    ),
+                    message: format!("{} record missing required string field '{}'", kind, field),
                 }),
             }
         }
@@ -580,10 +573,8 @@ impl KnowledgeGraph {
         let mut dropped_relationships: usize = 0;
         if json_data["relationships"].is_array() {
             for rel_obj in json_data["relationships"].members() {
-                let source =
-                    EntityId::new(required_str(rel_obj, "source_id", "relationship")?);
-                let target =
-                    EntityId::new(required_str(rel_obj, "target_id", "relationship")?);
+                let source = EntityId::new(required_str(rel_obj, "source_id", "relationship")?);
+                let target = EntityId::new(required_str(rel_obj, "target_id", "relationship")?);
                 let relation_type = rel_obj["relation_type"].as_str().unwrap_or("").to_string();
                 let confidence = rel_obj["confidence"].as_f32().unwrap_or(0.0);
 
@@ -596,9 +587,8 @@ impl KnowledgeGraph {
                     }
                 }
 
-                let relationship =
-                    Relationship::new(source, target, relation_type, confidence)
-                        .with_context(context);
+                let relationship = Relationship::new(source, target, relation_type, confidence)
+                    .with_context(context);
 
                 // A relationship can fail to attach if its endpoints reference
                 // entities that aren't in the graph (schema drift, partial
@@ -622,8 +612,7 @@ impl KnowledgeGraph {
         if json_data["chunks"].is_array() {
             for chunk_obj in json_data["chunks"].members() {
                 let id = ChunkId::new(required_str(chunk_obj, "id", "chunk")?);
-                let document_id =
-                    DocumentId::new(required_str(chunk_obj, "document_id", "chunk")?);
+                let document_id = DocumentId::new(required_str(chunk_obj, "document_id", "chunk")?);
                 let start_offset = chunk_obj["start_offset"].as_usize().unwrap_or(0);
                 let end_offset = chunk_obj["end_offset"].as_usize().unwrap_or(0);
 
