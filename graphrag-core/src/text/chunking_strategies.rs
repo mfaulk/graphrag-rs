@@ -654,10 +654,7 @@ mod tests {
                 Ok(v)
             }
 
-            async fn embed_batch(
-                &self,
-                texts: &[&str],
-            ) -> crate::core::Result<Vec<Vec<f32>>> {
+            async fn embed_batch(&self, texts: &[&str]) -> crate::core::Result<Vec<Vec<f32>>> {
                 let mut out = Vec::with_capacity(texts.len());
                 for t in texts {
                     out.push(self.embed(t).await?);
