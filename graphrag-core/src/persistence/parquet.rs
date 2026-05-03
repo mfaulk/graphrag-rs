@@ -512,12 +512,13 @@ impl ParquetPersistence {
 
         // Reattach mentions from the sidecar so retrieval has provenance back
         // to source chunks (#24). Tolerate a missing sidecar file (legacy
-        // workspaces written before this fix).
-        let mentions_by_entity = self.load_entity_mentions()?;
+        // workspaces written before this fix). Use `remove` to take
+        // ownership of each `Vec<EntityMention>` rather than cloning.
+        let mut mentions_by_entity = self.load_entity_mentions()?;
         if !mentions_by_entity.is_empty() {
             for entity in entities.iter_mut() {
-                if let Some(mentions) = mentions_by_entity.get(&entity.id) {
-                    entity.mentions = mentions.clone();
+                if let Some(mentions) = mentions_by_entity.remove(&entity.id) {
+                    entity.mentions = mentions;
                 }
             }
         }
