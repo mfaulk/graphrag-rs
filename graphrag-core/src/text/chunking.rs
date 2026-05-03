@@ -1,17 +1,55 @@
-// Advanced text chunking with hierarchical boundary preservation (2024 best practices)
-// Shared utility module implementing state-of-the-art chunking strategies
+// Hierarchical chunker with both character- and token-based windowing.
+//
+// Token mode uses the cl100k_base BPE tokenizer (`tiktoken-rs`), which matches
+// OpenAI's `gpt-4o`/`gpt-4o-mini` tokenization. Token-mode default sizes follow
+// Edge et al. 2024 (arXiv 2404.16130) §2.1 ablation: 600-token windows with
+// 60-token overlap.
 
-/// Hierarchical text chunking following LangChain RecursiveCharacterTextSplitter approach
-/// with semantic boundary preservation for optimal RAG performance
+use std::sync::{Arc, OnceLock};
+use tiktoken_rs::{cl100k_base, CoreBPE};
+
+/// Unit used by `chunk_size`, `overlap`, and `min_chunk_size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkingMode {
+    /// Counts in raw byte length (legacy behavior, kept for backwards compat).
+    Chars,
+    /// Counts in cl100k_base BPE tokens (default).
+    Tokens,
+}
+
+impl Default for ChunkingMode {
+    fn default() -> Self {
+        ChunkingMode::Tokens
+    }
+}
+
+/// Default chunk size in tokens (Edge et al. 2024 §2.1 ablation).
+pub const DEFAULT_TOKEN_CHUNK_SIZE: usize = 600;
+/// Default overlap in tokens (10% of chunk size).
+pub const DEFAULT_TOKEN_OVERLAP: usize = 60;
+/// Default minimum chunk size in tokens.
+pub const DEFAULT_TOKEN_MIN_CHUNK_SIZE: usize = 50;
+
+fn cl100k() -> &'static Arc<CoreBPE> {
+    static BPE: OnceLock<Arc<CoreBPE>> = OnceLock::new();
+    BPE.get_or_init(|| Arc::new(cl100k_base().expect("cl100k_base BPE bundled with tiktoken-rs")))
+}
+
+/// Hierarchical text chunking with semantic boundary preservation.
+///
+/// Mirrors the LangChain `RecursiveCharacterTextSplitter` approach in `Chars`
+/// mode and uses fixed-size cl100k_base token windows in `Tokens` mode.
 pub struct HierarchicalChunker {
-    /// Hierarchical separators in order of preference
+    /// Hierarchical separators in order of preference (used in `Chars` mode).
     separators: Vec<String>,
-    /// Minimum chunk size to maintain
+    /// Minimum chunk size, in units of `mode`.
     min_chunk_size: usize,
+    /// Counting mode.
+    mode: ChunkingMode,
 }
 
 impl HierarchicalChunker {
-    /// Create a new hierarchical chunker with default separators
+    /// Create a new hierarchical chunker with default separators (char mode).
     pub fn new() -> Self {
         Self {
             // Following 2024 research best practices - hierarchical separators
@@ -27,25 +65,53 @@ impl HierarchicalChunker {
                 "".to_string(),     // Character level (fallback)
             ],
             min_chunk_size: 50,
+            mode: ChunkingMode::Chars,
         }
     }
 
-    /// Create chunker with custom separators
+    /// Create chunker with custom separators (char mode).
     pub fn with_separators(separators: Vec<String>) -> Self {
         Self {
             separators,
             min_chunk_size: 50,
+            mode: ChunkingMode::Chars,
         }
     }
 
-    /// Set minimum chunk size
+    /// Set minimum chunk size (in units of the current `mode`).
     pub fn with_min_size(mut self, min_size: usize) -> Self {
         self.min_chunk_size = min_size;
         self
     }
 
-    /// Split text into semantically coherent chunks
+    /// Switch counting mode. Defaults to `Chars` for backwards compat;
+    /// callers that want paper-aligned token windows should call
+    /// `.with_mode(ChunkingMode::Tokens)`.
+    pub fn with_mode(mut self, mode: ChunkingMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Current counting mode.
+    pub fn mode(&self) -> ChunkingMode {
+        self.mode
+    }
+
+    /// Split text into semantically coherent chunks.
+    ///
+    /// `chunk_size` and `overlap` are interpreted in units of `self.mode()`.
+    /// In `Tokens` mode, decoded chunks may have slightly different
+    /// leading/trailing whitespace than the same byte range from a char-mode
+    /// slice — this is expected: BPE round-trips are exact for token-aligned
+    /// slices but not for arbitrary byte offsets.
     pub fn chunk_text(&self, text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+        match self.mode {
+            ChunkingMode::Chars => self.chunk_text_chars(text, chunk_size, overlap),
+            ChunkingMode::Tokens => self.chunk_text_tokens(text, chunk_size, overlap),
+        }
+    }
+
+    fn chunk_text_chars(&self, text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
         let mut chunks = Vec::new();
         let mut start = 0;
 
@@ -96,6 +162,50 @@ impl HierarchicalChunker {
             next_start = self.find_word_boundary_backward(text, next_start);
 
             start = next_start;
+        }
+
+        chunks
+    }
+
+    /// Token-based windowing using cl100k_base BPE.
+    ///
+    /// Produces fixed-size token windows (`chunk_size` tokens) with `overlap`
+    /// tokens of step-back. Uses `encode_ordinary` (no special-token handling)
+    /// so prose containing literal "<|...|>" sequences is treated as text.
+    fn chunk_text_tokens(&self, text: &str, chunk_size: usize, overlap: usize) -> Vec<String> {
+        if chunk_size == 0 {
+            return Vec::new();
+        }
+        let bpe = cl100k();
+        let tokens = bpe.encode_ordinary(text);
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+
+        let stride = chunk_size.saturating_sub(overlap).max(1);
+        let mut chunks = Vec::new();
+        let mut start = 0usize;
+
+        while start < tokens.len() {
+            let end = (start + chunk_size).min(tokens.len());
+            let slice = &tokens[start..end];
+
+            // Decode the token slice. cl100k_base round-trips token-aligned
+            // slices cleanly; any decode error here means a non-UTF-8 token
+            // boundary and we skip rather than panic.
+            if let Ok(decoded) = bpe.decode(slice.to_vec()) {
+                let token_count = slice.len();
+                if token_count >= self.min_chunk_size || end >= tokens.len() {
+                    if !decoded.trim().is_empty() {
+                        chunks.push(decoded);
+                    }
+                }
+            }
+
+            if end >= tokens.len() {
+                break;
+            }
+            start += stride;
         }
 
         chunks
@@ -346,6 +456,102 @@ mod tests {
                         || chunk.trim() == text.trim()
                 );
             }
+        }
+    }
+
+    /// Pins existing char-mode behavior so the token-mode refactor doesn't change it.
+    #[test]
+    fn chunk_text_with_chars_mode_unchanged_from_old_default() {
+        let chunker = HierarchicalChunker::new();
+        assert_eq!(chunker.mode(), ChunkingMode::Chars);
+        let text = "This is a test document.\n\nIt has multiple paragraphs. \
+                    Each paragraph should be preserved as much as possible. \
+                    This helps maintain semantic coherence in the chunks.";
+        let chunks = chunker.chunk_text(text, 100, 20);
+        // Same behavior as the legacy `test_hierarchical_chunking` assertions.
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            assert!(c.trim().len() >= 50);
+        }
+    }
+
+    /// Token mode produces the expected number of windows for known token counts.
+    #[test]
+    fn chunk_text_with_token_mode_emits_expected_chunk_count() {
+        // 100 tokens of "word " repeats ≈ 100 BPE tokens for cl100k_base.
+        // Use a deterministic count: encode and slide manually to compute the
+        // expected chunk count, then compare.
+        let bpe = cl100k_base().unwrap();
+        let raw = "lorem ipsum dolor sit amet ".repeat(60);
+        let tokens = bpe.encode_ordinary(&raw);
+        let n = tokens.len();
+        let chunk_size = 32usize;
+        let overlap = 8usize;
+        let stride = chunk_size - overlap;
+        // Sliding-window count: number of starts s ∈ {0, stride, 2*stride, ...}
+        // such that s < n.
+        let expected = (n + stride - 1) / stride;
+        let chunker = HierarchicalChunker::new()
+            .with_mode(ChunkingMode::Tokens)
+            .with_min_size(0);
+        let chunks = chunker.chunk_text(&raw, chunk_size, overlap);
+        assert_eq!(
+            chunks.len(),
+            expected,
+            "chunk count mismatch for {} tokens, size={}, overlap={}",
+            n,
+            chunk_size,
+            overlap
+        );
+    }
+
+    /// Token mode round-trips simple English prose without garbage characters.
+    #[test]
+    fn chunk_text_with_token_mode_round_trips_text_for_simple_input() {
+        let chunker = HierarchicalChunker::new()
+            .with_mode(ChunkingMode::Tokens)
+            .with_min_size(0);
+        let text = "The quick brown fox jumps over the lazy dog. \
+                    Pack my box with five dozen liquor jugs. \
+                    How vexingly quick daft zebras jump.";
+        let chunks = chunker.chunk_text(text, 32, 0);
+        let joined: String = chunks.concat();
+        // No-overlap concatenation should reproduce original token stream.
+        let bpe = cl100k_base().unwrap();
+        let original = bpe.decode(bpe.encode_ordinary(text)).unwrap();
+        assert_eq!(joined, original);
+        // Each chunk must be valid UTF-8 (it already is, since `String`).
+        for c in &chunks {
+            assert!(!c.is_empty());
+            assert!(c.is_char_boundary(0));
+            assert!(c.is_char_boundary(c.len()));
+        }
+    }
+
+    /// Token mode handles non-ASCII (CJK + emoji) without producing broken UTF-8.
+    #[test]
+    fn chunk_text_with_token_mode_handles_unicode_cleanly() {
+        let chunker = HierarchicalChunker::new()
+            .with_mode(ChunkingMode::Tokens)
+            .with_min_size(0);
+        // Mix CJK, emoji, accented Latin.
+        let text = "こんにちは世界。Привет мир. Hello world! 🚀🌍🎉 \
+                    日本語のテキスト Français naïve café résumé"
+            .repeat(8);
+        let chunks = chunker.chunk_text(&text, 16, 4);
+        assert!(!chunks.is_empty());
+        for c in &chunks {
+            // Every chunk must be valid UTF-8 (String guarantees it) and
+            // start/end at char boundaries.
+            assert!(c.is_char_boundary(0));
+            assert!(c.is_char_boundary(c.len()));
+            // Should not contain the U+FFFD replacement character: BPE
+            // round-trip on a token-aligned slice never inserts replacements.
+            assert!(
+                !c.contains('\u{FFFD}'),
+                "chunk contains replacement char: {:?}",
+                c
+            );
         }
     }
 }

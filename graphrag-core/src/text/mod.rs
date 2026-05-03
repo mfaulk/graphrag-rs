@@ -56,7 +56,10 @@ use crate::{
     core::{ChunkId, ChunkingStrategy, Document, TextChunk},
     GraphRAGError, Result,
 };
-use chunking::HierarchicalChunker;
+pub use chunking::{
+    ChunkingMode, HierarchicalChunker, DEFAULT_TOKEN_CHUNK_SIZE, DEFAULT_TOKEN_MIN_CHUNK_SIZE,
+    DEFAULT_TOKEN_OVERLAP,
+};
 
 /// Text processing utilities for chunking and preprocessing
 #[derive(Debug)]
