@@ -1,0 +1,4 @@
+**Sales Rep**: Morning Priya. Following up on the Helio Analytics demo last week — what's resonating with your team?
+**Customer**: The dashboards looked great. Honestly, the blocker is integration. We're on a custom Postgres setup and migrations scare us.
+**Sales Rep**: That's fair. We have a connector library for Postgres and a solutions engineer can scope the migration on a thirty-minute call.
+**Customer**: Set that up. If integration is clean, budget conversations get easier.

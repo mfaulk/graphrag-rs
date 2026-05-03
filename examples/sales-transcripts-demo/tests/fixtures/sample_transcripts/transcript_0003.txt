@@ -1,0 +1,4 @@
+**Sales Rep**: Hi Marcus. I know Northwind Logistics is evaluating a few options. What's the timeline pressure look like on your end?
+**Customer**: We need a vendor signed by end of quarter, otherwise the whole rollout slips to next year.
+**Sales Rep**: Got it. Helio Analytics can stand up a pilot tenant in under a week. Would that buy you the timeline cushion you need?
+**Customer**: A pilot would help, but procurement still takes three weeks no matter what.

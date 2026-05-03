@@ -1,0 +1,4 @@
+**Sales Rep**: Hi Jordan, I noticed Helio Analytics hasn't heard back from you in two weeks. Is the project still active?
+**Customer**: It's active, but priorities shifted. Our CFO wants to delay all new vendor spend until next quarter.
+**Sales Rep**: I appreciate the candor. Can we schedule a fifteen-minute call once the new quarter starts so we're ready to move?
+**Customer**: That works. Put it on my calendar for the first week of the new quarter.

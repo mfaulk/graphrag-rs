@@ -348,6 +348,7 @@ New to GraphRAG? Start here:
 - 🏗️ **[Pipeline Architecture](graphrag-core/PIPELINE_ARCHITECTURE.md)** - Technical deep dive into implementation details
 - 💡 **[Examples](examples/)** - Hands-on code examples from basic to advanced
 - 📊 **[Multi-Document Pipeline](examples/MULTI_DOCUMENT_PIPELINE.md)** - Production-ready example with benchmarks
+- 🤝 **[Sales-Transcripts Demo](examples/sales-transcripts-demo/)** - End-to-end ingest → index → query against the public `gwenshap/sales-transcripts` Hugging Face dataset
 - ⚙️ **[Pipeline Architecture](graphrag-core/PIPELINE_ARCHITECTURE.md)** - Detailed 7-phase configuration & performance guide
 
 ### Complete 7-Stage Pipeline Schema

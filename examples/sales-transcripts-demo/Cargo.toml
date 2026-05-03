@@ -1,0 +1,42 @@
+[package]
+name = "sales-transcripts-demo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "End-to-end demo: ingest gwenshap/sales-transcripts (HuggingFace), index, query"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "sales-fetch"
+path = "src/bin/fetch.rs"
+
+[[bin]]
+name = "sales-to-text"
+path = "src/bin/to_text.rs"
+
+[[bin]]
+name = "sales-pipeline"
+path = "src/bin/pipeline.rs"
+
+[dependencies]
+graphrag-core = { path = "../../graphrag-core", features = ["async", "memory-storage", "basic-retrieval"] }
+tokio = { workspace = true }
+anyhow = "1"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { workspace = true }
+
+# Parquet ingestion (HuggingFace ships datasets as parquet)
+arrow = { workspace = true, features = ["ipc"] }
+parquet = { version = "57", default-features = false, features = ["arrow", "snap"] }
+
+# HF download (reuse the workspace HTTP client)
+ureq = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

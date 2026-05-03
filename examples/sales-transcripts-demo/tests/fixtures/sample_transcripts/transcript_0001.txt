@@ -1,0 +1,5 @@
+**Sales Rep**: Hi Jordan, thanks for taking my call. I wanted to walk you through how Helio Analytics could help your team cut reporting time.
+**Customer**: Sure, but pricing is going to be the deciding factor for us this quarter.
+**Sales Rep**: Understood. Our standard tier starts at four thousand a month, and we can talk about discounts for an annual commit.
+**Customer**: That's higher than I expected. Can you send a one-pager I can share with finance?
+**Sales Rep**: Absolutely, I'll have it in your inbox by end of day.
