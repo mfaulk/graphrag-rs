@@ -68,6 +68,11 @@ pub struct AsyncGraphRAG {
     document_trees: Arc<RwLock<HashMap<DocumentId, DocumentTree>>>,
     hierarchical_config: HierarchicalConfig,
     language_model: Option<Arc<BoxedAsyncLanguageModel>>,
+    /// Test-only hooks for observing/perturbing entity extraction. None in
+    /// release builds; tests opt-in per-instance to avoid cross-test pollution
+    /// that a `static` would cause when `cargo test` runs concurrently.
+    #[cfg(test)]
+    test_hooks: Option<Arc<tests::ExtractionHooks>>,
 }
 
 impl AsyncGraphRAG {
@@ -80,6 +85,8 @@ impl AsyncGraphRAG {
             document_trees: Arc::new(RwLock::new(HashMap::new())),
             hierarchical_config,
             language_model: None,
+            #[cfg(test)]
+            test_hooks: None,
         })
     }
 
@@ -94,6 +101,8 @@ impl AsyncGraphRAG {
             document_trees: Arc::new(RwLock::new(HashMap::new())),
             hierarchical_config,
             language_model: None,
+            #[cfg(test)]
+            test_hooks: None,
         })
     }
 
@@ -247,11 +256,14 @@ impl AsyncGraphRAG {
         // Simulate async processing delay
         tokio::time::sleep(std::time::Duration::from_millis(1)).await;
 
-        // Test-only barrier injection point: lets tests assert that all chunk
-        // extractions can be in flight simultaneously. Sequential code deadlocks here.
+        // Test-only hooks: per-instance (no globals) so concurrent tests don't
+        // collide. When `barrier` is set, every extraction awaits it before
+        // continuing — sequential code deadlocks on an N-party barrier.
         #[cfg(test)]
-        if let Some(barrier) = tests::TEST_EXTRACTION_BARRIER.get() {
-            barrier.wait().await;
+        if let Some(hooks) = &self.test_hooks {
+            if let Some(barrier) = &hooks.barrier {
+                barrier.wait().await;
+            }
         }
 
         // Simple entity extraction for demo (would use actual async implementation)
@@ -636,13 +648,22 @@ impl Default for AsyncGraphRAGBuilder {
 mod tests {
     use super::*;
     use crate::core::ChunkId;
-    use std::sync::OnceLock;
     use tokio::sync::Barrier;
 
-    /// Test hook: when set, every `extract_entities_async` call awaits this barrier
-    /// before returning. Tests use it to assert that build_graph runs extractions
-    /// concurrently — sequential code deadlocks when the barrier expects N parties.
-    pub(super) static TEST_EXTRACTION_BARRIER: OnceLock<Arc<Barrier>> = OnceLock::new();
+    /// Per-instance test hooks for `extract_entities_async`. Lives on the
+    /// AsyncGraphRAG instance under test (no static/global state) so concurrent
+    /// `cargo test` workers can't collide.
+    pub(super) struct ExtractionHooks {
+        /// Optional N-party barrier; every extraction awaits it before returning,
+        /// so sequential extraction deadlocks while concurrent extraction proceeds.
+        pub(super) barrier: Option<Arc<Barrier>>,
+    }
+
+    impl ExtractionHooks {
+        fn new() -> Self {
+            Self { barrier: None }
+        }
+    }
 
     #[tokio::test]
     async fn test_async_graphrag_creation() {
@@ -702,48 +723,50 @@ mod tests {
         assert_eq!(stats.health_status, AsyncHealthStatus::Healthy);
     }
 
+    /// Seeds `graphrag` with `n_chunks` chunks under one document, skipping
+    /// `initialize()` so tests don't require the async-traits feature for the
+    /// mock LLM.
+    async fn seed_chunks(graphrag: &mut AsyncGraphRAG, n_chunks: usize) {
+        let mut graph_guard = graphrag.knowledge_graph.write().await;
+        let mut graph = KnowledgeGraph::new();
+        let doc_id = DocumentId::new("doc-0".to_string());
+        let chunks: Vec<TextChunk> = (0..n_chunks)
+            .map(|i| {
+                TextChunk::new(
+                    ChunkId::new(format!("chunk-{i}")),
+                    doc_id.clone(),
+                    format!("Tom and Huck were here in chunk {i}"),
+                    0,
+                    32,
+                )
+            })
+            .collect();
+        let document = Document {
+            id: doc_id,
+            title: "test".to_string(),
+            content: "test".to_string(),
+            metadata: Default::default(),
+            chunks,
+        };
+        graph.add_document(document).unwrap();
+        *graph_guard = Some(graph);
+    }
+
     /// Verifies build_graph runs entity extraction concurrently across chunks
     /// (sequential code deadlocks on an N-party barrier; concurrent code clears it).
     #[tokio::test]
     async fn test_build_graph_extracts_entities_concurrently() {
         const N_CHUNKS: usize = 8;
 
-        // Install a barrier expecting all N extractions to be in flight at once.
-        let barrier = Arc::new(Barrier::new(N_CHUNKS));
-        TEST_EXTRACTION_BARRIER
-            .set(barrier)
-            .expect("barrier already set; tests must not run twice in same process");
-
         let config = Config::default();
         let mut graphrag = AsyncGraphRAG::new(config).await.unwrap();
 
-        // Manually seed the knowledge graph (skip initialize() which requires
-        // async-traits feature for the mock LLM).
-        {
-            let mut graph_guard = graphrag.knowledge_graph.write().await;
-            let mut graph = KnowledgeGraph::new();
-            let doc_id = DocumentId::new("doc-0".to_string());
-            let chunks: Vec<TextChunk> = (0..N_CHUNKS)
-                .map(|i| {
-                    TextChunk::new(
-                        ChunkId::new(format!("chunk-{i}")),
-                        doc_id.clone(),
-                        format!("Tom and Huck were here in chunk {i}"),
-                        0,
-                        32,
-                    )
-                })
-                .collect();
-            let document = Document {
-                id: doc_id,
-                title: "test".to_string(),
-                content: "test".to_string(),
-                metadata: Default::default(),
-                chunks,
-            };
-            graph.add_document(document).unwrap();
-            *graph_guard = Some(graph);
-        }
+        // Per-instance barrier (no globals): only this graphrag's extractions wait.
+        let mut hooks = ExtractionHooks::new();
+        hooks.barrier = Some(Arc::new(Barrier::new(N_CHUNKS)));
+        graphrag.test_hooks = Some(Arc::new(hooks));
+
+        seed_chunks(&mut graphrag, N_CHUNKS).await;
 
         // Sequential code can only have one extraction in flight at a time, so the
         // N-party barrier never clears and build_graph hangs. We give it a generous
