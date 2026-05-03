@@ -1,0 +1,131 @@
+// Zero-LLM config for the sales-transcripts demo.
+//
+// - Algorithmic entity extraction (regex + capitalization), no Ollama, no API keys.
+// - Hash embeddings (fallback_to_hash) — fast, deterministic, no model download.
+// - Tuned for short multi-turn transcripts (~200 chars each):
+//     chunk_size 256 / overlap 40 keeps each transcript in ~one chunk.
+//
+// Usage:
+//   cargo run -p graphrag-cli -- bench \
+//     --config examples/sales-transcripts-demo/configs/sales_hash_only.json5 \
+//     --book examples/sales-transcripts-demo/data/all.txt \
+//     --questions "What products are sold?|What objections come up most?"
+{
+  "mode": {
+    "approach": "algorithmic"
+  },
+  "general": {
+    "output_dir": "./examples/sales-transcripts-demo/workspace/hash_only",
+    "log_level": "info",
+    "max_threads": 4
+  },
+  "pipeline": {
+    "workflows": ["extract_text", "extract_entities", "build_graph", "detect_communities"],
+    "parallel_execution": true,
+    "text_extraction": {
+      "chunk_size": 256,
+      "chunk_overlap": 40,
+      "min_chunk_size": 60,
+      "clean_control_chars": true,
+      "normalize_whitespace": true
+    },
+    "entity_extraction": {
+      "model_name": "none",
+      "temperature": 0.0,
+      "max_tokens": 1200,
+      "entity_types": ["PERSON", "ORG", "PRODUCT", "PAIN_POINT", "OBJECTION"],
+      "confidence_threshold": 0.6
+    },
+    "graph_building": {
+      "relation_scorer": "cosine_similarity",
+      "min_relation_score": 0.4,
+      "max_connections_per_node": 20,
+      "bidirectional_relations": true
+    },
+    "community_detection": {
+      "algorithm": "leiden",
+      "resolution": 0.8,
+      "min_community_size": 2,
+      "max_community_size": 20
+    }
+  },
+  "text_processing": {
+    "enabled": true,
+    "chunk_size": 256,
+    "chunk_overlap": 40,
+    "min_chunk_size": 60,
+    "max_chunk_size": 800,
+    "normalize_whitespace": true,
+    "remove_artifacts": true,
+    "extract_keywords": true,
+    "keyword_min_score": 0.15
+  },
+  "entity_extraction": {
+    "enabled": true,
+    "min_confidence": 0.6,
+    "use_gleaning": false,
+    "max_gleaning_rounds": 0,
+    "gleaning_improvement_threshold": 0.08,
+    "semantic_merging": true,
+    "merge_similarity_threshold": 0.85,
+    "automatic_linking": true,
+    "linking_confidence_threshold": 0.7
+  },
+  "graph_construction": {
+    "enabled": true,
+    "incremental_updates": true,
+    "use_pagerank": true,
+    "pagerank_damping": 0.85,
+    "pagerank_iterations": 50,
+    "pagerank_convergence": 0.0001,
+    "extract_relationships": true,
+    "relationship_confidence_threshold": 0.5
+  },
+  "vector_processing": {
+    "enabled": true,
+    "embedding_model": "none",
+    "embedding_dimensions": 384,
+    "use_hnsw_index": true,
+    "hnsw_ef_construction": 200,
+    "hnsw_m": 16,
+    "similarity_threshold": 0.7
+  },
+  "query_processing": {
+    "enabled": true,
+    "use_advanced_pipeline": true,
+    "use_intent_classification": true,
+    "use_concept_extraction": true,
+    "use_temporal_parsing": false,
+    "confidence_threshold": 0.5
+  },
+  "ollama": {
+    "enabled": false,
+    "host": "http://localhost",
+    "port": 11434,
+    "chat_model": "none",
+    "embedding_model": "none",
+    "timeout_seconds": 120,
+    "max_retries": 3,
+    "fallback_to_hash": true,
+    "max_tokens": 1200,
+    "temperature": 0.0,
+    "generation": {
+      "temperature": 0.0,
+      "top_p": 0.9,
+      "max_tokens": 1500,
+      "stream": false
+    }
+  },
+  "performance": {
+    "batch_processing": true,
+    "batch_size": 50,
+    "worker_threads": 4,
+    "memory_limit_mb": 2048,
+    "cache_embeddings": true
+  },
+  "auto_save": {
+    "enabled": true,
+    "base_dir": "./examples/sales-transcripts-demo/workspace",
+    "workspace_name": "sales_hash_only"
+  }
+}

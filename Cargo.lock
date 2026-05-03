@@ -8382,6 +8382,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sales-transcripts-demo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "clap",
+ "graphrag-core",
+ "parquet",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "ureq",
+]
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,4 @@
+**Sales Rep**: Hey Marcus, quick check-in. Any progress on procurement for the Northwind Logistics deal?
+**Customer**: Legal flagged the data residency clause. Helio Analytics needs to confirm EU hosting before we can move.
+**Sales Rep**: Good catch. We host EU customers in Frankfurt with full GDPR coverage. I'll have legal send the data processing addendum today.
+**Customer**: Send it. If that lands, we can sign by Friday.

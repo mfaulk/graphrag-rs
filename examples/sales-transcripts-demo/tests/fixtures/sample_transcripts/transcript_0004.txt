@@ -1,0 +1,4 @@
+**Sales Rep**: Hi Priya, circling back on the Helio Analytics pilot. Has the solutions engineer reached out about the Postgres connector?
+**Customer**: Yes, we mapped the schema yesterday. Integration looks doable. Now I'm back to the pricing question.
+**Sales Rep**: We can offer fifteen percent off for an annual contract signed before quarter end.
+**Customer**: That's enough to get this past finance. Send the redlined contract.
