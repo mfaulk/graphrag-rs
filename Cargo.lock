@@ -3956,13 +3956,13 @@ dependencies = [
 name = "graphrag-core"
 version = "0.1.0"
 dependencies = [
- "ahash",
  "arrow",
  "arrow-array 57.3.0",
  "arrow-schema 57.3.0",
  "async-trait",
  "axum",
  "bincode",
+ "blake3",
  "candle-core",
  "candle-nn",
  "candle-transformers",
