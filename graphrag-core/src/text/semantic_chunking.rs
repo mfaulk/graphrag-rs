@@ -163,15 +163,13 @@ impl SemanticChunker {
         sentences
     }
 
-    /// Generate embeddings for all sentences
+    /// Generate embeddings for all sentences in a single batch call.
+    ///
+    /// Issuing one batched request avoids N sequential round-trips for
+    /// remote embedders (Ollama/OpenAI), which dominated chunking latency.
     fn embed_sentences(&mut self, sentences: &[String]) -> Result<Vec<Vec<f32>>> {
-        let mut embeddings = Vec::new();
-
-        for sentence in sentences {
-            let embedding = self.embedding_generator.generate_embedding(sentence);
-            embeddings.push(embedding);
-        }
-
+        let refs: Vec<&str> = sentences.iter().map(String::as_str).collect();
+        let embeddings = self.embedding_generator.batch_generate(&refs);
         Ok(embeddings)
     }
 
@@ -446,5 +444,41 @@ mod tests {
         let chunker = SemanticChunker::new(config, embedding_gen);
         let result = chunker.calculate_std_threshold(&[]);
         assert_eq!(result, 0.0, "empty diffs should yield default threshold");
+    }
+
+    // embed_sentences must produce the same vectors as
+    // EmbeddingGenerator::batch_generate (regression for #103).
+    //
+    // LIMITATION: this test cannot prove that `embed_sentences` actually
+    // uses the batched code path. `EmbeddingGenerator::batch_generate`
+    // currently delegates to `generate_embedding` per item, so a
+    // hypothetical regression that re-introduces a per-sentence loop
+    // would still produce identical output and pass this test. Verifying
+    // call-count behavior would require either making the embedder
+    // injectable behind a trait or adding a counting wrapper, both of
+    // which are out of scope here. The test still guards against output
+    // shape/content drift between the chunker and the embedder.
+    #[test]
+    fn embed_sentences_uses_batch_call() {
+        let config = SemanticChunkerConfig::default();
+        let embedding_gen = EmbeddingGenerator::new(64);
+        let mut chunker = SemanticChunker::new(config, embedding_gen);
+
+        let sentences: Vec<String> = vec![
+            "Alice loves programming.".to_string(),
+            "Bob also codes daily.".to_string(),
+            "The weather is sunny today.".to_string(),
+            "Rain is expected tomorrow.".to_string(),
+        ];
+
+        let chunker_embeddings = chunker.embed_sentences(&sentences).unwrap();
+
+        // Independently compute the expected batch output.
+        let mut reference_gen = EmbeddingGenerator::new(64);
+        let refs: Vec<&str> = sentences.iter().map(String::as_str).collect();
+        let expected = reference_gen.batch_generate(&refs);
+
+        assert_eq!(chunker_embeddings.len(), sentences.len());
+        assert_eq!(chunker_embeddings, expected);
     }
 }

@@ -236,25 +236,33 @@ impl HybridRetriever {
         let mut combined_scores: HashMap<String, (f32, f32, f32)> = HashMap::new();
         let mut content_map: HashMap<String, String> = HashMap::new();
 
-        // Process semantic results
-        for (rank, (id, score, content)) in semantic_results.iter().enumerate() {
+        // Drain semantic results: each id is cloned at most once (for the
+        // score-map key) and content is moved into content_map. The semantic
+        // pass runs first into an empty map, so entry/or_insert and a plain
+        // insert behave identically here.
+        for (rank, (id, score, content)) in semantic_results.into_iter().enumerate() {
             let rrf_score = 1.0 / (self.config.rrf_k + rank as f32 + 1.0);
-            combined_scores.insert(
-                id.clone(),
-                (rrf_score * self.config.semantic_weight, *score, 0.0),
-            );
-            content_map.insert(id.clone(), content.clone());
+            let weighted = rrf_score * self.config.semantic_weight;
+            combined_scores
+                .entry(id.clone())
+                .or_insert((0.0, score, 0.0))
+                .0 += weighted;
+            content_map.entry(id).or_insert(content);
         }
 
-        // Process keyword results
-        for (rank, result) in keyword_results.iter().enumerate() {
+        // Drain keyword results. Use a plain `insert` for content_map so that
+        // the real BM25 text overwrites any semantic-side placeholder for
+        // overlapping ids (semantic_search currently returns the id as
+        // content). The owned `result.content` lets us avoid a clone.
+        for (rank, result) in keyword_results.into_iter().enumerate() {
             let rrf_score = 1.0 / (self.config.rrf_k + rank as f32 + 1.0);
+            let weighted = rrf_score * self.config.keyword_weight;
             let entry = combined_scores
                 .entry(result.doc_id.clone())
                 .or_insert((0.0, 0.0, 0.0));
-            entry.0 += rrf_score * self.config.keyword_weight;
+            entry.0 += weighted;
             entry.2 = result.score;
-            content_map.insert(result.doc_id.clone(), result.content.clone());
+            content_map.insert(result.doc_id, result.content);
         }
 
         self.create_hybrid_results(combined_scores, content_map, limit, FusionMethod::RRF)
@@ -270,43 +278,49 @@ impl HybridRetriever {
         let mut combined_scores: HashMap<String, (f32, f32, f32)> = HashMap::new();
         let mut content_map: HashMap<String, String> = HashMap::new();
 
-        // Normalize semantic scores
+        // Compute normalization factors before draining the inputs.
         let max_semantic = semantic_results
             .iter()
             .map(|(_, score, _)| *score)
             .fold(f32::NEG_INFINITY, f32::max);
-
-        for (id, score, content) in semantic_results {
-            let normalized_score = if max_semantic > 0.0 {
-                score / max_semantic
-            } else {
-                0.0
-            };
-            combined_scores.insert(
-                id.clone(),
-                (normalized_score * self.config.semantic_weight, score, 0.0),
-            );
-            content_map.insert(id, content);
-        }
-
-        // Normalize keyword scores
         let max_keyword = keyword_results
             .iter()
             .map(|r| r.score)
             .fold(f32::NEG_INFINITY, f32::max);
 
-        for result in keyword_results {
+        // Drain semantic results: id cloned once for the score-map key,
+        // content moved into the content map. Semantic pass runs first
+        // into an empty map, so entry/or_insert is fine here.
+        for (id, score, content) in semantic_results.into_iter() {
+            let normalized_score = if max_semantic > 0.0 {
+                score / max_semantic
+            } else {
+                0.0
+            };
+            let weighted = normalized_score * self.config.semantic_weight;
+            combined_scores
+                .entry(id.clone())
+                .or_insert((0.0, score, 0.0))
+                .0 += weighted;
+            content_map.entry(id).or_insert(content);
+        }
+
+        // Drain keyword results. Use a plain `insert` for content_map so
+        // the real BM25 text overwrites any semantic-side placeholder for
+        // overlapping ids; the owned `result.content` keeps this clone-free.
+        for result in keyword_results.into_iter() {
             let normalized_score = if max_keyword > 0.0 {
                 result.score / max_keyword
             } else {
                 0.0
             };
+            let weighted = normalized_score * self.config.keyword_weight;
             let entry = combined_scores
                 .entry(result.doc_id.clone())
                 .or_insert((0.0, 0.0, 0.0));
-            entry.0 += normalized_score * self.config.keyword_weight;
+            entry.0 += weighted;
             entry.2 = result.score;
-            content_map.insert(result.doc_id.clone(), result.content.clone());
+            content_map.insert(result.doc_id, result.content);
         }
 
         self.create_hybrid_results(combined_scores, content_map, limit, FusionMethod::Weighted)
@@ -541,5 +555,80 @@ mod tests {
         let mut retriever = HybridRetriever::new();
         let result = retriever.search("test", 10);
         assert!(result.is_err());
+    }
+
+    // Mimic the real semantic_search content: a placeholder string derived
+    // from the id (see `semantic_search` which uses the id as content).
+    fn semantic(id: &str, score: f32) -> (String, f32, String) {
+        (id.to_string(), score, format!("semantic-placeholder-{id}"))
+    }
+
+    // Mimic real BM25 results carrying the actual document text.
+    fn keyword(id: &str, score: f32) -> BM25Result {
+        BM25Result {
+            doc_id: id.to_string(),
+            score,
+            content: format!("real-bm25-text-{id}"),
+        }
+    }
+
+    // RRF fusion preserves expected scores and content while consuming
+    // its inputs (regression for #108: drained, not cloned). For ids that
+    // appear in both inputs the keyword (BM25) content must win, since
+    // the semantic side carries only an id-derived placeholder.
+    #[test]
+    fn rrf_fusion_consumes_inputs_and_preserves_output() {
+        let mut retriever = HybridRetriever::with_config(HybridConfig {
+            min_score_threshold: 0.0,
+            ..HybridConfig::default()
+        });
+
+        let semantic_results = vec![semantic("a", 0.9), semantic("b", 0.7)];
+        let keyword_results = vec![keyword("b", 5.0), keyword("c", 3.0)];
+
+        let results = retriever
+            .reciprocal_rank_fusion(semantic_results, keyword_results, 10)
+            .expect("rrf should succeed");
+
+        let by_id: HashMap<_, _> = results.iter().map(|r| (r.id.clone(), r)).collect();
+        assert_eq!(by_id.len(), 3, "expected ids a, b, c");
+        assert_eq!(by_id["a"].content, "semantic-placeholder-a");
+        assert_eq!(
+            by_id["b"].content, "real-bm25-text-b",
+            "overlapping id must keep keyword content, not semantic placeholder"
+        );
+        assert_eq!(by_id["c"].content, "real-bm25-text-c");
+        assert!(
+            by_id["b"].score >= by_id["a"].score,
+            "b appears in both lists"
+        );
+    }
+
+    // Weighted fusion preserves expected scores and content while
+    // consuming its inputs (regression for #108). Keyword content must
+    // win for ids present in both input sets.
+    #[test]
+    fn weighted_fusion_consumes_inputs_and_preserves_output() {
+        let mut retriever = HybridRetriever::with_config(HybridConfig {
+            min_score_threshold: 0.0,
+            fusion_method: FusionMethod::Weighted,
+            ..HybridConfig::default()
+        });
+
+        let semantic_results = vec![semantic("a", 0.9), semantic("b", 0.6)];
+        let keyword_results = vec![keyword("b", 4.0), keyword("c", 2.0)];
+
+        let results = retriever
+            .weighted_combination(semantic_results, keyword_results, 10)
+            .expect("weighted fusion should succeed");
+
+        let by_id: HashMap<_, _> = results.iter().map(|r| (r.id.clone(), r)).collect();
+        assert_eq!(by_id.len(), 3, "expected ids a, b, c");
+        assert_eq!(by_id["a"].content, "semantic-placeholder-a");
+        assert_eq!(
+            by_id["b"].content, "real-bm25-text-b",
+            "overlapping id must keep keyword content, not semantic placeholder"
+        );
+        assert_eq!(by_id["c"].content, "real-bm25-text-c");
     }
 }
