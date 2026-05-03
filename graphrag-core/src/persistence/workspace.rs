@@ -251,12 +251,34 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    /// Load knowledge graph from workspace
+    /// Load knowledge graph from workspace.
+    ///
+    /// Refuses to load if the workspace's `metadata.toml` declares a
+    /// `format_version` that doesn't match [`CURRENT_FORMAT_VERSION`] —
+    /// continuing would silently couple a stale on-disk schema to in-memory
+    /// types. Recreate the workspace or write a migration before retrying.
+    /// (Workspaces without metadata.toml fall through to the existing
+    /// best-effort load path.) See issue #23.
     pub fn load_graph(&self, workspace_name: &str) -> Result<KnowledgeGraph> {
         if !self.workspace_exists(workspace_name) {
             return Err(GraphRAGError::Config {
                 message: format!("Workspace '{}' does not exist", workspace_name),
             });
+        }
+
+        // Refuse on format_version mismatch. Missing metadata.toml is
+        // treated as legacy and tolerated below.
+        if let Ok(meta) = self.load_metadata(workspace_name) {
+            if meta.format_version != CURRENT_FORMAT_VERSION {
+                return Err(GraphRAGError::Config {
+                    message: format!(
+                        "Workspace '{}' has metadata format_version '{}' but this build \
+                         expects '{}'. Refusing to load: no migration is implemented. \
+                         Recreate the workspace or downgrade graphrag-core.",
+                        workspace_name, meta.format_version, CURRENT_FORMAT_VERSION
+                    ),
+                });
+            }
         }
 
         let workspace_path = self.workspace_path(workspace_name);
@@ -454,6 +476,39 @@ mod tests {
     fn new_metadata_carries_current_format_version() {
         let m = WorkspaceMetadata::new("fresh".to_string());
         assert_eq!(m.format_version, CURRENT_FORMAT_VERSION);
+    }
+
+    // Regression for #23: load_graph must refuse to load a workspace whose
+    // metadata.toml declares an unrecognized `format_version`. Continuing
+    // would silently couple stale on-disk schemas to in-memory types and is
+    // a correctness footgun; surface it as an error so callers either
+    // migrate or recreate the workspace.
+    #[test]
+    fn load_graph_refuses_on_format_version_mismatch() {
+        let temp_dir = TempDir::new().unwrap();
+        let workspace = WorkspaceManager::new(temp_dir.path()).unwrap();
+
+        let graph = KnowledgeGraph::new();
+        workspace.save_graph(&graph, "future").unwrap();
+
+        // Replace metadata with a version we don't understand.
+        let meta_path = temp_dir.path().join("future").join("metadata.toml");
+        let mut meta: WorkspaceMetadata =
+            toml::from_str(&fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta.format_version = "9.9-from-the-future".to_string();
+        fs::write(&meta_path, toml::to_string_pretty(&meta).unwrap()).unwrap();
+
+        let result = workspace.load_graph("future");
+        assert!(
+            result.is_err(),
+            "load_graph must refuse to load a workspace with an incompatible format_version"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("format_version") || msg.contains("9.9-from-the-future"),
+            "error message should mention the version mismatch, got: {}",
+            msg
+        );
     }
 
     // Regression for #23: a workspace dir whose metadata.toml is unreadable
