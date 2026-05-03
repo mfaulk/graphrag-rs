@@ -13,14 +13,23 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 ### Configuration
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `chunk_size` | Maximum number of tokens per chunk | 600 |
+| `chunk_size` | Maximum number of tokens (or bytes, in `Chars` mode) per chunk | 600 |
 | `chunk_overlap` | Number of overlapping tokens between chunks | 60 |
 | `min_chunk_size` | Minimum tokens before a chunk is emitted | 50 |
-| `chunking_mode` | `Tokens` (cl100k_base BPE) or `Chars` (legacy byte-based) | `Tokens` |
+| `chunking_mode` | `Tokens` (cl100k_base BPE) or `Chars` (legacy byte-based) | see note |
 
 Token counts use the `cl100k_base` BPE (matches `gpt-4o` / `gpt-4o-mini`) via
 `tiktoken-rs`. Char mode is preserved for backwards compatibility with callers
 that pass byte-length sizes into legacy code paths.
+
+> [!NOTE]
+> The runtime `chunking_mode` default depends on how the chunker is
+> constructed. `HierarchicalChunker::new()` returns `Chars` mode for
+> backwards compatibility with existing `TextProcessor` pipelines. To use
+> the paper-aligned token-based chunker (600 tokens, 60-token overlap),
+> opt in via `HierarchicalChunker::new().with_mode(ChunkingMode::Tokens)`.
+> The `ChunkingMode::default()` enum impl returns `Tokens` and is used by
+> any caller that goes through `Default::default()` rather than `new()`.
 
 ### Guidelines
 - **Small Chunks (300-600 tokens):** Better for granular retrieval and precise fact extraction.
@@ -139,9 +148,9 @@ that pass byte-length sizes into legacy code paths.
 
 | Section | Parameter | Type | Default | Description |
 |---------|-----------|------|---------|-------------|
-| **Chunking** | `chunk_size` | int | 600 | Max tokens per chunk (cl100k_base BPE) |
+| **Chunking** | `chunk_size` | int | 600 | Max tokens per chunk in `Tokens` mode (cl100k_base BPE); bytes in `Chars` mode |
 | | `chunk_overlap` | int | 60 | Overlap tokens |
-| | `chunking_mode` | enum | Tokens | `Tokens` or `Chars` |
+| | `chunking_mode` | enum | see note | `Tokens` or `Chars`. `HierarchicalChunker::new()` defaults to `Chars` for backwards compat; opt into token mode via `.with_mode(ChunkingMode::Tokens)` |
 | **Extraction** | `entity_extraction.approach` | enum | hybrid | Extraction method |
 | | `entity_extraction.entity_types` | list | [...] | Target entities |
 | | `entities.mode` | enum | n/a | `algorithmic` \| `llm_single_pass` \| `llm_gleaning` (overrides `use_gleaning`) |
