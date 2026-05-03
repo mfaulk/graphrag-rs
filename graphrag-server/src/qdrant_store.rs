@@ -127,12 +127,22 @@ impl QdrantStore {
         Ok(())
     }
 
-    /// Check if collection exists
+    /// Check if the collection exists.
+    ///
+    /// Delegates to `qdrant_client::Qdrant::collection_exists`, which uses
+    /// the dedicated `CollectionExists` RPC and reports presence/absence
+    /// without conflating it with transport, permission, or other RPC
+    /// failures. Errors are propagated as `CollectionError` so callers
+    /// can fail fast instead of silently treating a transient/permission
+    /// failure as "collection does not exist" — that misclassification
+    /// would route startup through the create-collection branch and
+    /// bypass `verify_collection_dimension` (#37 follow-up from the
+    /// Codex review).
     pub async fn collection_exists(&self) -> Result<bool, QdrantError> {
-        match self.client.collection_info(&self.collection_name).await {
-            Ok(_) => Ok(true),
-            Err(_) => Ok(false),
-        }
+        self.client
+            .collection_exists(self.collection_name.clone())
+            .await
+            .map_err(|e| QdrantError::CollectionError(e.to_string()))
     }
 
     /// Fetch the configured vector dimension of the existing collection.
@@ -359,6 +369,39 @@ impl QdrantStore {
     #[allow(dead_code)]
     pub fn collection_name(&self) -> &str {
         &self.collection_name
+    }
+}
+
+/// What startup should do after probing whether the target Qdrant
+/// collection already exists.
+///
+/// Returned by `classify_collection_existence` so the decision can be
+/// unit-tested without a live Qdrant server. Aborting on probe failure
+/// is the whole point — a swallowed error would skip
+/// `verify_collection_dimension` (#37 follow-up).
+#[derive(Debug)]
+pub(crate) enum CollectionStartupAction {
+    /// Probe returned `Ok(false)`: create the collection.
+    Create,
+    /// Probe returned `Ok(true)`: run the dimension check against the
+    /// existing collection before serving traffic.
+    VerifyExisting,
+    /// Probe failed: refuse to start. Treating this as "does not exist"
+    /// would route to `Create` and bypass the dimension verification.
+    Abort(QdrantError),
+}
+
+/// Map a `collection_exists` probe result to the startup action.
+///
+/// Pure helper so the regression test for the Codex-reported bug
+/// (existence-probe errors silently bypassing #37) can be a unit test.
+pub(crate) fn classify_collection_existence(
+    probe: Result<bool, QdrantError>,
+) -> CollectionStartupAction {
+    match probe {
+        Ok(true) => CollectionStartupAction::VerifyExisting,
+        Ok(false) => CollectionStartupAction::Create,
+        Err(e) => CollectionStartupAction::Abort(e),
     }
 }
 
@@ -594,6 +637,48 @@ mod tests {
             msg.contains("768"),
             "msg should include expected dim: {msg}"
         );
+    }
+
+    // classify_collection_existence reports Create when the existence
+    // probe returns Ok(false), so startup takes the create-collection
+    // branch.
+    #[test]
+    fn classify_returns_create_when_collection_absent() {
+        match classify_collection_existence(Ok(false)) {
+            CollectionStartupAction::Create => {},
+            other => panic!("expected Create, got {other:?}"),
+        }
+    }
+
+    // classify_collection_existence reports VerifyExisting when the
+    // existence probe returns Ok(true), so startup runs the dimension
+    // check against the live collection (#37).
+    #[test]
+    fn classify_returns_verify_when_collection_present() {
+        match classify_collection_existence(Ok(true)) {
+            CollectionStartupAction::VerifyExisting => {},
+            other => panic!("expected VerifyExisting, got {other:?}"),
+        }
+    }
+
+    // Regression: a transient/permission failure on the existence probe
+    // must abort startup instead of being coerced to "collection does
+    // not exist". Previously `collection_exists` returned `Ok(false)` on
+    // any error, so `main.rs` took the create-collection branch and
+    // skipped `verify_collection_dimension` — silently bypassing the
+    // #37 fail-fast dimension check (Codex review follow-up).
+    #[test]
+    fn classify_aborts_on_existence_probe_error() {
+        let err = QdrantError::CollectionError("rpc unavailable".into());
+        match classify_collection_existence(Err(err)) {
+            CollectionStartupAction::Abort(QdrantError::CollectionError(msg)) => {
+                assert!(
+                    msg.contains("rpc unavailable"),
+                    "abort should preserve underlying error: {msg}"
+                );
+            },
+            other => panic!("expected Abort(CollectionError), got {other:?}"),
+        }
     }
 
     // metadata_to_payload round-trips a normal DocumentMetadata.

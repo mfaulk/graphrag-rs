@@ -49,7 +49,9 @@ use models::*;
 #[cfg(feature = "qdrant")]
 mod qdrant_store;
 #[cfg(feature = "qdrant")]
-use qdrant_store::{DocumentMetadata, QdrantStore};
+use qdrant_store::{
+    classify_collection_existence, CollectionStartupAction, DocumentMetadata, QdrantStore,
+};
 
 #[cfg(feature = "auth")]
 mod auth;
@@ -174,39 +176,60 @@ impl AppState {
 
             match QdrantStore::new(&qdrant_url, &collection_name).await {
                 Ok(store) => {
-                    // Check if collection exists, create if not
-                    if !store.collection_exists().await.unwrap_or(false) {
-                        match store.create_collection(embedding_dim as u64).await {
-                            Ok(_) => {
-                                tracing::info!("✅ Created Qdrant collection: {}", collection_name);
-                            },
-                            Err(e) => {
-                                tracing::warn!("⚠️  Could not create collection: {}", e);
-                            },
-                        }
-                    } else {
-                        // Refuse to start if EMBEDDING_DIM disagrees with the
-                        // collection's stored vector size (#37). A silent
-                        // mismatch otherwise corrupts the index one upsert
-                        // at a time. Mirrors the LanceDB per-row dim check.
-                        if let Err(e) = store
-                            .verify_collection_dimension(embedding_dim as u64)
-                            .await
-                        {
+                    // Probe whether the collection exists. A probe failure
+                    // (transport, permission, etc.) MUST abort startup —
+                    // treating it as "does not exist" would route to the
+                    // create-collection branch and bypass the #37
+                    // dimension check on the existing collection.
+                    match classify_collection_existence(store.collection_exists().await) {
+                        CollectionStartupAction::Create => {
+                            match store.create_collection(embedding_dim as u64).await {
+                                Ok(_) => {
+                                    tracing::info!(
+                                        "✅ Created Qdrant collection: {}",
+                                        collection_name
+                                    );
+                                },
+                                Err(e) => {
+                                    tracing::warn!("⚠️  Could not create collection: {}", e);
+                                },
+                            }
+                        },
+                        CollectionStartupAction::VerifyExisting => {
+                            // Refuse to start if EMBEDDING_DIM disagrees with the
+                            // collection's stored vector size (#37). A silent
+                            // mismatch otherwise corrupts the index one upsert
+                            // at a time. Mirrors the LanceDB per-row dim check.
+                            if let Err(e) = store
+                                .verify_collection_dimension(embedding_dim as u64)
+                                .await
+                            {
+                                tracing::error!(
+                                    "❌ Qdrant collection dimension check failed: {}. \
+                                     Set EMBEDDING_DIM to match the existing collection, \
+                                     use a different COLLECTION_NAME, or recreate the \
+                                     collection.",
+                                    e
+                                );
+                                std::process::exit(1);
+                            }
+                            tracing::info!(
+                                "✅ Connected to existing Qdrant collection: {} ({} dims)",
+                                collection_name,
+                                embedding_dim
+                            );
+                        },
+                        CollectionStartupAction::Abort(e) => {
                             tracing::error!(
-                                "❌ Qdrant collection dimension check failed: {}. \
-                                 Set EMBEDDING_DIM to match the existing collection, \
-                                 use a different COLLECTION_NAME, or recreate the \
-                                 collection.",
+                                "❌ Could not determine if Qdrant collection '{}' exists: {}. \
+                                 Refusing to start: a probe failure could otherwise route to \
+                                 the create-collection path and skip the EMBEDDING_DIM check \
+                                 against an existing collection (#37).",
+                                collection_name,
                                 e
                             );
                             std::process::exit(1);
-                        }
-                        tracing::info!(
-                            "✅ Connected to existing Qdrant collection: {} ({} dims)",
-                            collection_name,
-                            embedding_dim
-                        );
+                        },
                     }
 
                     tracing::info!("🗄️  Using Qdrant at: {}", qdrant_url);

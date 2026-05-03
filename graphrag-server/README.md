@@ -644,6 +644,20 @@ upsert at a time.
 2. Use a different `COLLECTION_NAME` to start fresh.
 3. Drop and recreate the collection if its data is no longer needed.
 
+### "Could not determine if Qdrant collection '...' exists"
+
+**Cause:** The `CollectionExists` RPC failed (transport error, auth
+denied, server unreachable, etc.). Startup refuses to continue rather
+than coerce the failure to "does not exist", which would route to the
+create-collection path and skip the dimension check above.
+
+**Solutions:**
+1. Verify `QDRANT_URL` is reachable from the server host.
+2. If Qdrant requires authentication, ensure the client can authenticate
+   (check tokens / TLS config).
+3. Inspect Qdrant logs for the failing RPC and retry once the server is
+   healthy.
+
 ### Slow query performance
 
 **Cause:** Large dataset without proper indexing.
