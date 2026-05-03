@@ -444,10 +444,16 @@ pub struct DistributedCacheStats {
 }
 
 impl DistributedCacheStats {
-    /// Calculate the overall cache hit rate across both L1 and L2
+    /// Calculate the overall cache hit rate across both L1 and L2.
+    ///
+    /// `l2_deserialize_failures` count toward the denominator: a deserialize
+    /// failure is a request that did not return cached data, so excluding it
+    /// would inflate the reported hit rate and mask cache-health regressions
+    /// caused by format drift or corruption (#23).
     pub fn hit_rate(&self) -> f64 {
         let total_hits = self.l1_hits + self.l2_hits;
-        let total_requests = total_hits + self.l1_misses + self.l2_misses;
+        let total_requests =
+            total_hits + self.l1_misses + self.l2_misses + self.l2_deserialize_failures;
         if total_requests == 0 {
             0.0
         } else {
@@ -518,5 +524,34 @@ mod tests {
         let stats = DistributedCacheStats::default();
         assert_eq!(stats.l2_misses, 0);
         assert_eq!(stats.l2_deserialize_failures, 0);
+    }
+
+    // hit_rate() must count L2 deserialize failures as non-hits in its
+    // denominator; otherwise a wave of corruption-induced failures would
+    // leave the reported hit rate unchanged and hide the regression (#23).
+    #[test]
+    fn hit_rate_counts_deserialize_failures_as_non_hits() {
+        let baseline = DistributedCacheStats {
+            l1_hits: 1,
+            l1_misses: 0,
+            l1_size: 0,
+            l1_capacity: 0,
+            l2_hits: 0,
+            l2_misses: 1,
+            l2_deserialize_failures: 0,
+        };
+        let with_failure = DistributedCacheStats {
+            l2_deserialize_failures: 1,
+            ..baseline.clone()
+        };
+
+        assert!(
+            with_failure.hit_rate() < baseline.hit_rate(),
+            "deserialize failures must lower the hit rate (baseline {}, with failure {})",
+            baseline.hit_rate(),
+            with_failure.hit_rate()
+        );
+        // 1 hit / (1 hit + 1 miss + 1 deserialize failure) = 1/3.
+        assert!((with_failure.hit_rate() - (1.0 / 3.0)).abs() < f64::EPSILON);
     }
 }
