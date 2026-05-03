@@ -8,7 +8,9 @@ use crate::{
     theme::Theme,
     tui::{Event, Tui},
     ui::{HelpOverlay, InfoPanel, QueryInput, RawResultsViewer, ResultsViewer, StatusBar},
-    workspace::{cli_workspaces_dir, CliWorkspaceManager, WorkspaceMetadata},
+    workspace::{
+        cli_workspaces_dir, global_query_history_path, CliWorkspaceManager, WorkspaceMetadata,
+    },
 };
 use chrono::Utc;
 use color_eyre::eyre::Result;
@@ -67,6 +69,33 @@ impl App {
 
         let workspace_manager = CliWorkspaceManager::new()?;
 
+        // Best-effort restore of the previous session's query history (#62).
+        // Failure is silent: a fresh install has no history file, and a
+        // corrupt one shouldn't block TUI startup. Worst case the user
+        // starts with an empty history — same as the prior behavior.
+        let query_history = match global_query_history_path() {
+            Ok(path) if path.exists() => {
+                // Use blocking std::fs here because we're not in a tokio
+                // context yet; QueryHistory::load is async only because the
+                // existing API was async. A small sync read at startup is
+                // fine and simpler than spawning a runtime just for this.
+                match std::fs::read_to_string(&path)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<QueryHistory>(&s).ok())
+                {
+                    Some(h) => h,
+                    None => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "Could not parse query history file; starting fresh"
+                        );
+                        QueryHistory::new()
+                    },
+                }
+            },
+            _ => QueryHistory::new(),
+        };
+
         Ok(Self {
             should_quit: false,
             tui: Tui::new()?,
@@ -79,7 +108,7 @@ impl App {
             info_panel: InfoPanel::new(),
             status_bar: StatusBar::new(),
             help_overlay: HelpOverlay::new(),
-            query_history: QueryHistory::new(),
+            query_history,
             workspace_manager,
             workspace_metadata: None,
             config_path,
@@ -182,6 +211,23 @@ impl App {
                     help_overlay.render(f, f.area());
                 }
             })?;
+        }
+
+        // Persist query history before tearing down (#62). Best-effort —
+        // a write failure shouldn't block TUI shutdown; log and continue.
+        match global_query_history_path() {
+            Ok(path) => {
+                if let Err(e) = self.query_history.save(&path).await {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to persist query history on exit"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!("Cannot resolve query history path: {e}");
+            },
         }
 
         // Exit TUI mode
