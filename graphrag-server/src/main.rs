@@ -901,42 +901,27 @@ async fn graph_stats(state: Data<AppState>) -> Json<GraphStatsResponse> {
     error_code = 500
 )]
 async fn login(
-    state: Data<AppState>,
+    _state: Data<AppState>,
     body: Json<LoginRequest>,
 ) -> Result<Json<LoginResponse>, ApiError> {
-    // TODO: Implement real user authentication against database
-    // For now, accept any credentials for demo purposes
-    tracing::info!("Login attempt for user: {}", body.username);
-
-    let role = if body.username == "admin" {
-        auth::UserRole::Admin
-    } else {
-        auth::UserRole::User
-    };
-
-    match state.auth.generate_token(&body.username, role.clone(), 24) {
-        Ok(token) => {
-            tracing::info!(
-                "✅ Generated JWT token for user: {} (role: {:?})",
-                body.username,
-                role
-            );
-            Ok(Json(LoginResponse {
-                success: true,
-                token,
-                user_id: body.username.clone(),
-                role: format!("{:?}", role),
-                expires_in_hours: 24,
-                usage: "Add header: Authorization: Bearer <token>".to_string(),
-            }))
-        },
-        Err(e) => {
-            tracing::error!("❌ Failed to generate token: {}", e);
-            Err(ApiError::InternalError(
-                "token generation failed".to_string(),
-            ))
-        },
-    }
+    // SECURITY: the previous body issued an Admin-role JWT to any caller
+    // submitting `{"username":"admin","password":"anything"}` — no
+    // password verification, no user store, no bcrypt. Even though the
+    // route is currently NOT mounted (see the commented-out `/auth/*`
+    // section in `main()`), the handler is shipped in the binary and
+    // would be live the moment someone wires the routes.
+    //
+    // Refuse to issue tokens until a real credential store is in place
+    // (#30). The bcrypt dep declared under the `auth` feature is the
+    // intended verification path; backing it requires a persisted
+    // `(username, bcrypt_hash, role)` store that doesn't exist yet.
+    tracing::warn!(
+        username = %body.username,
+        "Login attempt rejected: no credential store configured (see #30)"
+    );
+    Err(ApiError::InternalError(
+        "Login is not configured on this deployment. Set up a credential store first.".to_string(),
+    ))
 }
 
 #[cfg(feature = "auth")]
