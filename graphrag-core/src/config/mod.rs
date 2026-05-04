@@ -2420,8 +2420,7 @@ impl Config {
         entities["use_gleaning"] = json::JsonValue::from(self.entities.use_gleaning);
         entities["max_gleaning_rounds"] = json::JsonValue::from(self.entities.max_gleaning_rounds);
         let mut element_summary = json::JsonValue::new_object();
-        element_summary["enabled"] =
-            json::JsonValue::from(self.entities.element_summary.enabled);
+        element_summary["enabled"] = json::JsonValue::from(self.entities.element_summary.enabled);
         element_summary["min_instances"] =
             json::JsonValue::from(self.entities.element_summary.min_instances);
         element_summary["max_chars_for_concat"] =
@@ -2668,7 +2667,10 @@ mod config_io_round_trip_tests {
         cfg.to_file(&path_str).expect("write config");
 
         let loaded = Config::from_file(&path_str).expect("read config");
-        assert_eq!(loaded.entities.mode, Some(EntityExtractionMode::LlmSinglePass));
+        assert_eq!(
+            loaded.entities.mode,
+            Some(EntityExtractionMode::LlmSinglePass)
+        );
     }
 
     /// JSON I/O round-trip preserves the `entities.element_summary` block.
