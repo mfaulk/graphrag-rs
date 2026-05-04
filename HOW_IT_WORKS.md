@@ -4,6 +4,10 @@
 
 ---
 
+> **Status vs. the GraphRAG paper.** This document describes the *intended* GraphRAG-style pipeline. Several stages of the original Microsoft GraphRAG paper (arxiv 2404.16130) are not yet wired up on `main` - most notably paper-style **Global Search** (map-reduce over community reports) and LLM-generated **community reports**. Token-based chunking, hierarchical Leiden contraction, paper-aligned gleaning defaults, element-summary collapse, and a paper-aligned Local Search mode are all in flight on open PRs (#126, #128, #130, #131). See [Status vs. paper in the root README](README.md#status-vs-paper) for the full stage-by-stage breakdown before benchmarking against the paper's results.
+
+---
+
 ## 🎯 What is GraphRAG?
 
 GraphRAG (Graph-based Retrieval-Augmented Generation) is an intelligent system that transforms unstructured text into a **knowledge graph** and uses it to answer questions with unprecedented accuracy and context awareness.
@@ -814,7 +818,7 @@ let scores = pagerank.compute_personalized(
 // Ranks entities by importance: 27x faster retrieval!
 ```
 
-**C. Community Detection** (Hierarchical Clustering)
+**C. Community Detection** (Leiden clustering)
 ```
 Community 1: Tom Sawyer storyline (347 entities)
   ├─ Subgraph: Treasure hunting (45 entities)
@@ -824,6 +828,8 @@ Community 1: Tom Sawyer storyline (347 entities)
 Community 2: Philosophical concepts (189 entities)
   └─ From Symposium document
 ```
+
+> **Status:** `main` runs a single-level Leiden today. Multi-level / hierarchical Leiden (super-graph contraction, the paper's "C0/C1/C2/..." hierarchy) is in flight on PR #128. LLM-generated **community reports** for each community - which the paper feeds into Global Search - are not yet implemented (issue #95).
 
 **Module**: `src/graph/mod.rs`, `src/graph/incremental.rs`
 **Performance**:
