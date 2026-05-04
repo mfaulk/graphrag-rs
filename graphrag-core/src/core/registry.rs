@@ -67,6 +67,16 @@ impl ServiceRegistry {
         self.chat_backend = Some(backend);
     }
 
+    /// Clear the injected chat backend without touching any other
+    /// registered services. Used by `GraphRAG::set_chat_backend(None)` to
+    /// preserve the rest of the registry (issue #6 review). The previous
+    /// implementation rebuilt a fresh `ServiceRegistry` and only copied
+    /// the embedder slot, silently dropping anything registered through
+    /// the generic `register/get` map (Storage, Retriever, ...).
+    pub fn clear_chat_backend(&mut self) {
+        self.chat_backend = None;
+    }
+
     /// Get the injected chat backend, if any.
     pub fn chat_backend(&self) -> Option<&DynChatBackend> {
         self.chat_backend.as_ref()

@@ -363,15 +363,12 @@ impl GraphRAG {
         if let Some(b) = backend {
             self.registry.set_chat_backend(b);
         } else {
-            // Drop any previously-injected backend by replacing the registry
-            // (the typed slot has no public `clear` to keep the surface small).
-            let mut new_reg = core::registry::ServiceRegistry::default();
-            // Preserve the embedder slot if one was injected, since that's
-            // the other typed slot consumers care about.
-            if let Some(emb) = self.registry.async_embedder().cloned() {
-                new_reg.set_async_embedder(emb);
-            }
-            self.registry = new_reg;
+            // Null only the chat-backend slot. The previous implementation
+            // rebuilt the entire `ServiceRegistry` and copied just the
+            // embedder, which silently dropped anything else the user
+            // had registered through `register/get` (Storage, Retriever,
+            // ...). See `ServiceRegistry::clear_chat_backend` (#6 review).
+            self.registry.clear_chat_backend();
         }
     }
 

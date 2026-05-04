@@ -573,6 +573,49 @@ fn empty_registry_has_no_typed_slots() {
     assert!(reg.chat_backend().is_none());
 }
 
+/// `clear_chat_backend` nulls only the chat-backend slot and preserves
+/// any other registered services. The previous `set_chat_backend(None)`
+/// rebuilt the whole registry, dropping every entry registered through
+/// the generic `register/get` map (issue #6 review).
+#[test]
+fn clear_chat_backend_preserves_other_services() {
+    use graphrag_core::core::registry::DynAsyncEmbedder;
+
+    #[derive(Debug, PartialEq)]
+    struct CustomService {
+        marker: u32,
+    }
+
+    let mut reg = ServiceRegistry::default();
+    reg.register(CustomService { marker: 42 });
+
+    let counting = CountingEmbedder::new(8);
+    let emb_dyn: DynAsyncEmbedder = Arc::new(counting);
+    reg.set_async_embedder(emb_dyn);
+
+    let backend: DynChatBackend = Arc::new(CountingChatBackend::new());
+    reg.set_chat_backend(backend);
+
+    assert!(reg.chat_backend().is_some());
+    assert!(reg.async_embedder().is_some());
+    assert!(reg.has::<CustomService>());
+
+    reg.clear_chat_backend();
+
+    assert!(
+        reg.chat_backend().is_none(),
+        "chat backend slot must be cleared"
+    );
+    assert!(
+        reg.async_embedder().is_some(),
+        "embedder slot must survive clear_chat_backend"
+    );
+    let svc = reg
+        .get::<CustomService>()
+        .expect("generic-map service must survive clear_chat_backend");
+    assert_eq!(svc.marker, 42);
+}
+
 /// `backend = "huggingface"` must fail fast in the factory rather than
 /// silently routing through the HTTP provider (which requires an API key
 /// HF doesn't use) or, with `fallback_to_hash = true`, downgrading to
