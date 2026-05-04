@@ -37,9 +37,10 @@ pub struct HierarchicalCommunities {
     /// Level 0 = finest granularity, higher = coarser
     pub levels: HashMap<usize, HashMap<NodeIndex, usize>>,
 
-    /// Parent-child relationships between levels
-    /// Maps community ID at level N to parent community ID at level N+1
-    pub hierarchy: HashMap<usize, Option<usize>>,
+    /// Parent-child community relationships across hierarchy levels.
+    /// `hierarchy[level][community_id]` = `Some((parent_level, parent_community_id))` for non-root
+    /// communities, or `None` for roots at the top level. Walk leaf -> root by chasing parents.
+    pub hierarchy: HashMap<usize, HashMap<usize, Option<(usize, usize)>>>,
 
     /// LLM-generated summaries for each community (optional)
     pub summaries: HashMap<usize, String>,
@@ -496,33 +497,113 @@ impl LeidenCommunityDetector {
         })
     }
 
-    /// Hierarchical Leiden algorithm implementation
+    /// Hierarchical Leiden: run leaf-level local moving + refine, then iteratively contract
+    /// the result into a super-graph (one node per community, multi-edges for inter-community
+    /// edges) and re-cluster until communities stop collapsing or `max_levels` is reached.
     fn hierarchical_leiden(
         &self,
         graph: &Graph<String, f32, Undirected>,
     ) -> Result<(
         HashMap<usize, HashMap<NodeIndex, usize>>,
-        HashMap<usize, Option<usize>>,
+        HashMap<usize, HashMap<usize, Option<(usize, usize)>>>,
     )> {
-        let mut levels = HashMap::new();
-        let hierarchy = HashMap::new();
+        let mut levels: HashMap<usize, HashMap<NodeIndex, usize>> = HashMap::new();
+        let mut hierarchy: HashMap<usize, HashMap<usize, Option<(usize, usize)>>> = HashMap::new();
 
-        let current_graph = graph.clone();
-        let level = 0;
+        // Run level 0 directly on the input graph.
+        let level0_communities = self.run_leiden_pass(graph)?;
+        levels.insert(0, level0_communities.clone());
 
-        // Phase 1: Initialize each node in its own community
-        let mut communities = self.initialize_communities(&current_graph);
+        if self.config.max_levels <= 1 {
+            return Ok((levels, hierarchy));
+        }
 
-        // Phase 2: Local moving (greedy modularity optimization)
+        // For each subsequent level we operate on a contracted super-graph and project the
+        // resulting community ids back onto the original NodeIndex space.
+        let mut prev_assignment = level0_communities; // original NodeIndex -> level-(L-1) community id
+        let mut prev_level = 0usize;
+
+        for level in 1..self.config.max_levels {
+            let unique_prev: HashSet<usize> = prev_assignment.values().copied().collect();
+            // Stop if previous level already collapsed below 2 communities — nothing left to group.
+            if unique_prev.len() < 2 {
+                break;
+            }
+
+            // Build super-graph: one node per prev-level community, multi-edges between
+            // communities preserve inter-community edge counts (used by the unweighted modularity
+            // calc to recover correct super-node degrees). Intra-community edges are dropped.
+            let (super_graph, super_to_prev_id) = build_super_graph(graph, &prev_assignment);
+
+            // Run a Leiden pass on the super-graph.
+            let super_communities = self.run_leiden_pass(&super_graph)?;
+            let unique_super: HashSet<usize> = super_communities.values().copied().collect();
+
+            // No further grouping happened (each super-node is still its own community) — stop.
+            if unique_super.len() == unique_prev.len() {
+                break;
+            }
+
+            // Project the super-graph partition back onto the original nodes:
+            //   prev_community_id -> super_community_id
+            let mut prev_to_super: HashMap<usize, usize> = HashMap::new();
+            for (super_node, &super_comm) in &super_communities {
+                if let Some(&prev_id) = super_to_prev_id.get(super_node) {
+                    prev_to_super.insert(prev_id, super_comm);
+                }
+            }
+
+            let mut level_assignment: HashMap<NodeIndex, usize> =
+                HashMap::with_capacity(prev_assignment.len());
+            for (&node, prev_id) in &prev_assignment {
+                if let Some(&new_id) = prev_to_super.get(prev_id) {
+                    level_assignment.insert(node, new_id);
+                }
+            }
+
+            // Record parent links for every prev-level community.
+            let parent_entry = hierarchy.entry(prev_level).or_default();
+            for (&prev_id, &new_id) in &prev_to_super {
+                parent_entry.insert(prev_id, Some((level, new_id)));
+            }
+
+            levels.insert(level, level_assignment.clone());
+            prev_assignment = level_assignment;
+            prev_level = level;
+
+            // If this level collapsed to a single community, it is the root — stop.
+            if unique_super.len() < 2 {
+                break;
+            }
+        }
+
+        // Top-level communities are roots: record explicit None parents so callers can detect them.
+        let top_level = *levels.keys().max().unwrap_or(&0);
+        if top_level > 0 {
+            let unique_top: HashSet<usize> = levels[&top_level].values().copied().collect();
+            let entry = hierarchy.entry(top_level).or_default();
+            for id in unique_top {
+                entry.entry(id).or_insert(None);
+            }
+        }
+
+        Ok((levels, hierarchy))
+    }
+
+    /// One Leiden pass (local moving + refinement) on the given graph.
+    fn run_leiden_pass(
+        &self,
+        graph: &Graph<String, f32, Undirected>,
+    ) -> Result<HashMap<NodeIndex, usize>> {
+        let mut communities = self.initialize_communities(graph);
+
         let mut improved = true;
         let mut iteration = 0;
         const MAX_ITERATIONS: usize = 100;
-
         while improved && iteration < MAX_ITERATIONS {
             improved = false;
-            for node in current_graph.node_indices() {
-                let best_community = self.find_best_community(&current_graph, node, &communities);
-
+            for node in graph.node_indices() {
+                let best_community = self.find_best_community(graph, node, &communities);
                 if best_community != communities[&node] {
                     communities.insert(node, best_community);
                     improved = true;
@@ -531,13 +612,8 @@ impl LeidenCommunityDetector {
             iteration += 1;
         }
 
-        // Phase 3: Refinement (KEY difference from Louvain)
-        communities = self.refine_partition(&current_graph, communities)?;
-
-        // Store this level
-        levels.insert(level, communities);
-
-        Ok((levels, hierarchy))
+        communities = self.refine_partition(graph, communities)?;
+        Ok(communities)
     }
 
     /// Initialize each node in its own community
@@ -780,6 +856,53 @@ impl LeidenCommunityDetector {
     }
 }
 
+/// Contract a graph by collapsing each community to a single super-node.
+///
+/// Recipe (standard Leiden / Louvain aggregation): one super-node per community in the
+/// `assignment`. For every original edge (u, v), if `assignment[u] != assignment[v]` add a new
+/// edge between the corresponding super-nodes; intra-community edges are dropped (they would
+/// only become self-loops and the existing modularity calc ignores them anyway). Multi-edges
+/// are preserved so the unweighted degree of each super-node equals the original
+/// inter-community edge count of its underlying community.
+///
+/// Returns the super-graph and a `super_node -> source_community_id` mapping the caller uses
+/// to project the next-level partition back onto the original nodes.
+fn build_super_graph(
+    graph: &Graph<String, f32, Undirected>,
+    assignment: &HashMap<NodeIndex, usize>,
+) -> (Graph<String, f32, Undirected>, HashMap<NodeIndex, usize>) {
+    let mut super_graph = Graph::new_undirected();
+    let mut comm_to_super: HashMap<usize, NodeIndex> = HashMap::new();
+    let mut super_to_comm: HashMap<NodeIndex, usize> = HashMap::new();
+
+    // Stable iteration over communities by sorted id keeps super-node ordering deterministic.
+    let mut comm_ids: Vec<usize> = assignment.values().copied().collect();
+    comm_ids.sort_unstable();
+    comm_ids.dedup();
+    for cid in comm_ids {
+        let super_node = super_graph.add_node(format!("c{cid}"));
+        comm_to_super.insert(cid, super_node);
+        super_to_comm.insert(super_node, cid);
+    }
+
+    for edge in graph.edge_references() {
+        use petgraph::visit::EdgeRef;
+        let a = edge.source();
+        let b = edge.target();
+        let (Some(&ca), Some(&cb)) = (assignment.get(&a), assignment.get(&b)) else {
+            continue;
+        };
+        if ca == cb {
+            continue;
+        }
+        let sa = comm_to_super[&ca];
+        let sb = comm_to_super[&cb];
+        super_graph.add_edge(sa, sb, *edge.weight());
+    }
+
+    (super_graph, super_to_comm)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,5 +960,113 @@ mod tests {
         assert_eq!(config.resolution, 1.0);
         assert_eq!(config.max_levels, 5);
         assert!(config.use_lcc);
+    }
+
+    /// Builds a synthetic two-tier graph: 2 outer cliques, each with 2 inner sub-cliques of 3 nodes.
+    /// Strong intra-sub-clique edges (10), medium intra-outer-clique bridge (3), weak inter-outer edge (1).
+    fn create_two_tier_graph() -> Graph<String, f32, Undirected> {
+        let mut graph = Graph::new_undirected();
+        let mut nodes = Vec::with_capacity(12);
+        for i in 0..12 {
+            nodes.push(graph.add_node(format!("N{i}")));
+        }
+        // Four sub-cliques of 3 nodes each: [0,1,2], [3,4,5], [6,7,8], [9,10,11]
+        let sub_cliques = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
+        for sc in &sub_cliques {
+            for i in 0..sc.len() {
+                for j in (i + 1)..sc.len() {
+                    graph.add_edge(nodes[sc[i]], nodes[sc[j]], 10.0);
+                }
+            }
+        }
+        // Outer-clique bridges: sub-clique 0<->1 inside outer A; sub-clique 2<->3 inside outer B
+        graph.add_edge(nodes[2], nodes[3], 3.0);
+        graph.add_edge(nodes[1], nodes[4], 3.0);
+        graph.add_edge(nodes[8], nodes[9], 3.0);
+        graph.add_edge(nodes[7], nodes[10], 3.0);
+        // Single weak inter-outer-clique edge
+        graph.add_edge(nodes[5], nodes[6], 1.0);
+        graph
+    }
+
+    /// Two-tier graph yields >=2 levels with parent links connecting leaf communities to coarser ones.
+    #[test]
+    fn test_hierarchical_two_tier_graph() {
+        let graph = create_two_tier_graph();
+        let config = LeidenConfig {
+            seed: Some(42),
+            max_levels: 5,
+            ..Default::default()
+        };
+        let detector = LeidenCommunityDetector::new(config);
+
+        let result = detector
+            .detect_communities(&graph)
+            .expect("detection succeeds");
+
+        assert!(
+            result.levels.len() >= 2,
+            "expected >=2 levels, got {}: {:?}",
+            result.levels.len(),
+            result.levels.keys().collect::<Vec<_>>()
+        );
+
+        // At level 0, expect at least 2 distinct communities (the algorithm partitions the graph).
+        let level0_ids: HashSet<usize> = result.levels[&0].values().copied().collect();
+        assert!(
+            level0_ids.len() >= 2,
+            "expected level 0 to have >=2 communities, got {}",
+            level0_ids.len()
+        );
+
+        // The hierarchy must record parent links from level-0 communities up to level 1+.
+        let parented: usize = result
+            .hierarchy
+            .get(&0)
+            .map(|m| m.values().filter(|p| p.is_some()).count())
+            .unwrap_or(0);
+        assert!(
+            parented >= 2,
+            "expected at least 2 level-0 communities with parents, got {parented}",
+        );
+
+        // Top level must have all entries with no parent (roots).
+        let top_level = *result.levels.keys().max().unwrap();
+        if let Some(top_map) = result.hierarchy.get(&top_level) {
+            assert!(
+                top_map.values().all(|p| p.is_none()),
+                "top level entries should have no parent"
+            );
+        }
+    }
+
+    /// max_levels = 1 caps the algorithm at the leaf partition only.
+    #[test]
+    fn test_hierarchical_max_levels_cap() {
+        let graph = create_two_tier_graph();
+        let config = LeidenConfig {
+            seed: Some(42),
+            max_levels: 1,
+            ..Default::default()
+        };
+        let detector = LeidenCommunityDetector::new(config);
+
+        let result = detector
+            .detect_communities(&graph)
+            .expect("detection succeeds");
+
+        assert_eq!(
+            result.levels.len(),
+            1,
+            "expected exactly 1 level when max_levels=1"
+        );
+        // With only one level, hierarchy should be empty (no parents to record).
+        let parented: usize = result
+            .hierarchy
+            .values()
+            .flat_map(|m| m.values())
+            .filter(|p| p.is_some())
+            .count();
+        assert_eq!(parented, 0, "expected no parent links at max_levels=1");
     }
 }
