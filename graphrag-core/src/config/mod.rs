@@ -1092,6 +1092,50 @@ pub struct EntityConfig {
     /// Facts longer than this will be rejected
     #[serde(default = "default_max_fact_tokens")]
     pub max_fact_tokens: usize,
+
+    /// Element-summary collapse settings (Edge et al. 2024 §2.2).
+    #[serde(default)]
+    pub element_summary: ElementSummaryConfig,
+}
+
+/// Configuration for element-summary collapse (paper §2.2).
+///
+/// When the same entity or relationship appears in multiple chunks, this
+/// step synthesizes a single coherent description from the per-instance
+/// descriptions, calling the chat backend only when the total instance
+/// length exceeds the cost-guard threshold.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElementSummaryConfig {
+    /// Master switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Minimum instances of an element required to trigger summarization.
+    #[serde(default = "default_element_summary_min_instances")]
+    pub min_instances: usize,
+
+    /// Total character budget below which descriptions are concatenated
+    /// locally instead of being sent to the LLM.
+    #[serde(default = "default_element_summary_max_chars_concat")]
+    pub max_chars_for_concat: usize,
+}
+
+impl Default for ElementSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_instances: default_element_summary_min_instances(),
+            max_chars_for_concat: default_element_summary_max_chars_concat(),
+        }
+    }
+}
+
+fn default_element_summary_min_instances() -> usize {
+    2
+}
+
+fn default_element_summary_max_chars_concat() -> usize {
+    800
 }
 
 /// Configuration for advanced GraphRAG features (Phases 2-3)
@@ -1475,6 +1519,7 @@ impl Default for Config {
                 validation_min_confidence: default_validation_confidence(),
                 use_atomic_facts: false,
                 max_fact_tokens: default_max_fact_tokens(),
+                element_summary: ElementSummaryConfig::default(),
             },
             retrieval: RetrievalConfig {
                 top_k: default_top_k(),
@@ -1807,6 +1852,7 @@ impl Config {
                 max_fact_tokens: parsed["entities"]["max_fact_tokens"]
                     .as_usize()
                     .unwrap_or(default_max_fact_tokens()),
+                element_summary: ElementSummaryConfig::default(),
             },
             retrieval: RetrievalConfig {
                 top_k: parsed["retrieval"]["top_k"]
