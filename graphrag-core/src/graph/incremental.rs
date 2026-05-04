@@ -1326,15 +1326,18 @@ impl IncrementalGraphManager {
 
 /// Incremental PageRank calculator for efficient updates
 #[cfg(feature = "incremental")]
-#[allow(dead_code)]
 pub struct IncrementalPageRank {
     scores: DashMap<EntityId, f64>,
-    adjacency_changes: DashMap<EntityId, Vec<(EntityId, f64)>>, // Node -> [(neighbor, weight)]
+    // Reserved for delta-PageRank propagation; not yet consumed by `update_incremental`.
+    #[allow(dead_code)]
+    adjacency_changes: DashMap<EntityId, Vec<(EntityId, f64)>>,
     damping_factor: f64,
     tolerance: f64,
     max_iterations: usize,
+    // Tracked for periodic full-recompute heuristics; reader is pending.
+    #[allow(dead_code)]
     last_full_computation: DateTime<Utc>,
-    incremental_threshold: usize, // Number of changes before full recomputation
+    incremental_threshold: usize,
     pending_changes: RwLock<usize>,
 }
 
@@ -1611,8 +1614,8 @@ pub struct BatchProcessor {
     metrics: RwLock<BatchMetrics>,
 }
 
+#[cfg(feature = "incremental")]
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct PendingBatch {
     changes: Vec<ChangeRecord>,
     created_at: Instant,
@@ -1843,7 +1846,6 @@ impl GraphRAGError {
 
 /// Production implementation of IncrementalGraphStore with full ACID guarantees
 #[cfg(feature = "incremental")]
-#[allow(dead_code)]
 pub struct ProductionGraphStore {
     graph: Arc<RwLock<KnowledgeGraph>>,
     transactions: DashMap<TransactionId, Transaction>,
@@ -1852,25 +1854,36 @@ pub struct ProductionGraphStore {
     conflict_resolver: Arc<ConflictResolver>,
     cache_invalidation: Arc<SelectiveInvalidation>,
     monitor: Arc<UpdateMonitor>,
+    // Held for batch-update wiring; current code path goes directly through `apply_change`.
+    #[allow(dead_code)]
     batch_processor: Arc<BatchProcessor>,
     incremental_pagerank: Arc<IncrementalPageRank>,
     event_publisher: broadcast::Sender<ChangeEvent>,
+    // Captured at construction for future runtime tuning hooks.
+    #[allow(dead_code)]
     config: IncrementalConfig,
 }
 
 /// Transaction state for ACID operations
+#[cfg(feature = "incremental")]
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 struct Transaction {
+    // Tx id is also the DashMap key; field is for debug/logging.
+    #[allow(dead_code)]
     id: TransactionId,
     changes: Vec<ChangeRecord>,
     status: TransactionStatus,
+    // Recorded for transaction-age metrics; reader pending.
+    #[allow(dead_code)]
     created_at: DateTime<Utc>,
+    // Reserved for per-transaction isolation policy enforcement.
+    #[allow(dead_code)]
     isolation_level: IsolationLevel,
 }
 
+#[cfg(feature = "incremental")]
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Variants reserved for two-phase commit / abort flows; ABI-stable surface.
 enum TransactionStatus {
     Active,
     Preparing,
@@ -1878,8 +1891,9 @@ enum TransactionStatus {
     Aborted,
 }
 
+#[cfg(feature = "incremental")]
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Variants reserved for isolation-level configuration; ABI-stable surface.
 enum IsolationLevel {
     ReadUncommitted,
     ReadCommitted,
@@ -2546,7 +2560,7 @@ impl IncrementalGraphStore for ProductionGraphStore {
 }
 
 // Helper trait for extracting entity ID from ChangeData
-#[allow(dead_code)]
+#[allow(dead_code)] // Used only when feature = "incremental" is enabled.
 trait ChangeDataExt {
     fn get_entity_id(&self) -> Option<EntityId>;
 }

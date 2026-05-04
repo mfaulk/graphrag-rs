@@ -1139,6 +1139,7 @@ impl AsyncTimer {
 pub struct Timer {
     /// Name of the operation being timed
     #[allow(dead_code)]
+    // Surfaced via Debug-style traces; kept for downstream MetricsCollector impls.
     name: String,
     /// Start time of the timer
     start: std::time::Instant,

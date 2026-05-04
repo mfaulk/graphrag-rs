@@ -406,7 +406,7 @@ pub struct MergingStatistics {
 
 impl MergingStatistics {
     /// Print statistics to stdout
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public diagnostic helper; called by downstream binaries and examples.
     pub fn print(&self) {
         tracing::info!("Entity Merging Statistics");
         tracing::info!("  Similarity threshold: {:.2}", self.similarity_threshold);

@@ -106,7 +106,7 @@ pub struct RogragProcessorBuilder {
 #[cfg(feature = "rograg")]
 #[derive(Debug)]
 struct ProcessingContext {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Captured for diagnostic logging; reader pending.
     query: String,
     start_time: Instant,
     decomposition_time: Option<Duration>,

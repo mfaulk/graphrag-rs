@@ -676,12 +676,6 @@ impl EntityExtractor {
         is_proper_format && (word.len() >= 3 || has_name_ending || has_name_prefix)
     }
 
-    /// Check if a word is a title
-    #[allow(dead_code)]
-    fn is_title(&self, word: &str) -> bool {
-        matches!(word, "Dr." | "Mr." | "Ms." | "Mrs." | "Prof.")
-    }
-
     /// Check if a name is likely a person name
     fn is_likely_person_name(&self, name: &str) -> bool {
         let parts: Vec<&str> = name.split_whitespace().collect();

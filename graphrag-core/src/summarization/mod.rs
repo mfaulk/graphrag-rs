@@ -617,7 +617,7 @@ impl DocumentTree {
         Ok(result)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Used only when feature = "parallel-processing" is enabled.
     fn generate_parallel_summary(
         &self,
         text: &str,

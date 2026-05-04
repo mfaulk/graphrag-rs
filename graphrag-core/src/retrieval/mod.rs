@@ -1906,7 +1906,7 @@ pub struct RetrievalStatistics {
 
 impl RetrievalStatistics {
     /// Print retrieval statistics
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public diagnostic helper; called by downstream binaries and examples.
     pub fn print(&self) {
         tracing::info!("Retrieval System Statistics:");
         tracing::info!("  Indexed vectors: {}", self.indexed_vectors);
