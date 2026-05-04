@@ -2,7 +2,9 @@
 
 ![GraphRAG Network Visualization](examples/readme.jpg)
 
-A high-performance, modular Rust implementation of GraphRAG (Graph-based Retrieval Augmented Generation) with **three deployment architectures**: Server-Only, WASM-Only (100% client-side), and Hybrid. Build knowledge graphs from documents and query them with natural language, with GPU acceleration support via WebGPU.
+A high-performance, modular Rust implementation of graph-based retrieval-augmented generation, inspired by Microsoft's GraphRAG paper (arxiv 2404.16130) and adjacent work (LightRAG, HippoRAG, Fast-GraphRAG). It supports **three deployment architectures**: Server-Only, WASM-Only (100% client-side), and Hybrid. Build knowledge graphs from documents and query them with natural language, with GPU acceleration support via WebGPU.
+
+> **Status vs. the GraphRAG paper.** This project does *not* implement every stage of the original paper yet. Most notably, paper-style **Global Search** (map-reduce over community reports) and LLM-generated **community reports** are not yet wired in. See the [Status vs. paper](#status-vs-paper) section below before benchmarking against the paper's numbers.
 
 [![CI](https://github.com/mfaulk/graphrag-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mfaulk/graphrag-rs/actions/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-1.70+-orange.svg)](https://www.rust-lang.org)
@@ -370,7 +372,7 @@ QUERY (ask())
 
 | Phase | Goal | Key Parameters |
 |-------|------|----------------|
-| **1. Chunking** | Split text | `chunk_size` (300), `chunk_overlap` (30) |
+| **1. Chunking** | Split text | `chunk_size` (1000), `chunk_overlap` (200) |
 | **2. Extraction** | Identify entities | `approach` (hybrid), `entity_types` |
 | **3. Relationships** | Connect entities | `extract_relationships` (true) |
 | **4. Graph** | Build network | `max_connections` (50), `enable_pagerank` |
@@ -379,6 +381,24 @@ QUERY (ask())
 | **7. Generation** | Answer query | `chat_model` (gpt-4o), `temperature` (0.0) |
 
 See **[PIPELINE_ARCHITECTURE.md](graphrag-core/PIPELINE_ARCHITECTURE.md)** for detailed configuration and performance tuning.
+
+## Status vs. paper
+
+Marketing the project as a "Rust implementation of GraphRAG" overstates what is wired up today. Here is what each stage of the original GraphRAG paper (arxiv 2404.16130) currently looks like in this codebase:
+
+| Pipeline stage | Status | Notes |
+|---|---|---|
+| Document chunking | In progress: token-based via `tiktoken-rs` (cl100k_base) on PR #126; `main` uses a hierarchical char-based chunker | PR #126 |
+| LLM entity extraction with gleaning | In progress: paper-aligned prompts and `max_gleanings = 1` default land in PR #131; `main` defaults to `max_gleaning_rounds = 3` | PR #131 |
+| Hierarchical Leiden (super-graph contraction) | In progress: real multi-level Leiden lands in PR #128; `main` runs a single-level Leiden | PR #128 |
+| Element summaries (LLM collapse of duplicate descriptions) | Preview only: API exists in PR #131; full wiring needs `Entity::description` (Wave 3 A) | PR #131 + Wave 3 A |
+| Community reports (LLM-generated structured summaries) | Not yet implemented | Issue #95 (blocked on #94 / #97) |
+| Local Search (entity-anchored, token-budgeted retrieval) | In progress: `--mode local` lands in PR #130 | PR #130 |
+| Global Search (map-reduce over community reports + helpfulness scoring) | Not yet implemented | Issue #93 |
+
+**On query modes:** the default mode is `--mode hybrid`, which is *this project's own* blend (LightRAG dual-level + PageRank/PPR + cross-encoder reranking) rather than the paper's modes. Once PR #130 merges, `--mode local` will provide the paper-aligned Local Search. Paper-aligned `--mode global` remains future work, tracked in issue #93.
+
+**Note for benchmarking:** because Global Search is not yet implemented, comparisons against the GraphRAG paper's reported numbers should be interpreted carefully and ideally restricted to Local Search / hybrid retrieval. Until PRs #126, #128, #130, and #131 merge, several other stages (token-based chunking, hierarchical Leiden, paper-aligned gleaning defaults, element-summary collapse) are also still in flight on `main`.
 
 ### 4. CLI Usage
 
