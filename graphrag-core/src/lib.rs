@@ -1150,53 +1150,45 @@ impl GraphRAG {
         };
 
         // Collect per-element descriptions keyed by (lowercased_name, type).
-        // We track the EntityIds in each group so we can write the synthesised
-        // description back without re-grouping.
-        let mut groups: HashMap<(String, String), (String, Vec<String>, Vec<EntityId>)> =
-            HashMap::new();
+        // We iterate the actual graph nodes rather than `entity_index` because
+        // LLM extractors can emit duplicate `EntityId`s (deterministic IDs
+        // from `(entity_type, normalized_name)`); when that happens
+        // `entity_index` only retains the latest `NodeIndex`, leaving older
+        // nodes reachable via `entities()` but invisible to `get_entity_mut`.
+        let mut groups: HashMap<(String, String), (String, Vec<String>)> = HashMap::new();
         for entity in graph.entities() {
             let key = (entity.name.to_lowercase(), entity.entity_type.clone());
             let entry = groups
                 .entry(key)
-                .or_insert_with(|| (entity.name.clone(), Vec::new(), Vec::new()));
+                .or_insert_with(|| (entity.name.clone(), Vec::new()));
             if let Some(desc) = &entity.description {
                 let trimmed = desc.trim();
                 if !trimmed.is_empty() {
                     entry.1.push(trimmed.to_string());
                 }
             }
-            entry.2.push(entity.id.clone());
-        }
-
-        // Build the collapse_all input shape: key -> (name, descriptions).
-        let mut to_collapse: HashMap<(String, String), (String, Vec<String>)> =
-            HashMap::with_capacity(groups.len());
-        let mut id_index: HashMap<(String, String), Vec<EntityId>> =
-            HashMap::with_capacity(groups.len());
-        for (key, (name, descs, ids)) in groups.into_iter() {
-            id_index.insert(key.clone(), ids);
-            to_collapse.insert(key, (name, descs));
         }
 
         let backend = self.chat_backend.as_deref();
         let summaries = entity::element_summary::collapse_all(
             "entity",
-            to_collapse,
+            groups,
             &self.config.entities.element_summary,
             backend.map(|b| b as &dyn core::backend::ChatBackend),
         )
         .await?;
 
-        // Write the synthesised description back onto every entity in the
-        // group. Groups that fell below `min_instances` are absent from
+        // Write the synthesised description back onto every entity node in
+        // the group. Groups that fell below `min_instances` are absent from
         // `summaries` and keep their existing per-instance descriptions.
-        for (key, summary) in summaries.into_iter() {
-            if let Some(ids) = id_index.get(&key) {
-                for id in ids {
-                    if let Some(entity) = graph.get_entity_mut(id) {
-                        entity.description = Some(summary.clone());
-                    }
-                }
+        // Iterating `entities_mut()` is essential here: when two extractor
+        // emissions share an `EntityId`, both graph nodes must receive the
+        // synthesised description even though only one is reachable through
+        // the index (#97 review).
+        for entity in graph.entities_mut() {
+            let key = (entity.name.to_lowercase(), entity.entity_type.clone());
+            if let Some(summary) = summaries.get(&key) {
+                entity.description = Some(summary.clone());
             }
         }
 
@@ -2232,5 +2224,57 @@ mod element_summary_wiring_tests {
             .collect();
         assert!(descs.contains(&"the engineer".to_string()));
         assert!(descs.contains(&"the founder".to_string()));
+    }
+
+    /// `add_entity` creates one graph node per call but `entity_index` only
+    /// keeps the latest `NodeIndex` for a given `EntityId`. When LLM
+    /// extractors emit deterministic IDs from `(entity_type, normalized_name)`,
+    /// the same id can appear twice and the older node becomes orphaned in
+    /// the index. `apply_element_summaries` must still update both nodes
+    /// (see #97 review): callers iterating over `entities()` should observe
+    /// the synthesised description on every node sharing the group key, not
+    /// just the index-canonical one.
+    #[tokio::test]
+    async fn apply_element_summaries_updates_all_entity_nodes_sharing_id() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        config.entities.element_summary.max_chars_for_concat = 800;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+
+        // Two Entity rows with the SAME id but different descriptions —
+        // mirrors the deterministic-id path in LLM extractors where the
+        // same `(entity_type, normalized_name)` shows up in two chunks.
+        let shared_id = EntityId::new("person_alice".into());
+        let mut alice1 = entity_with_description("Alice", "PERSON", "the engineer");
+        alice1.id = shared_id.clone();
+        let mut alice2 = entity_with_description("Alice", "PERSON", "the founder");
+        alice2.id = shared_id.clone();
+        kg.add_entity(alice1).unwrap();
+        kg.add_entity(alice2).unwrap();
+        // Sanity check: two graph nodes exist even though entity_index can
+        // only point at one of them.
+        assert_eq!(kg.entities().count(), 2);
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        let alices: Vec<&Entity> = kg
+            .entities()
+            .filter(|e| e.name.eq_ignore_ascii_case("alice"))
+            .collect();
+        assert_eq!(alices.len(), 2);
+        for a in &alices {
+            let d = a.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("the engineer") && d.contains("the founder"),
+                "expected every duplicate-id node to receive the collapsed \
+                 description, got {:?}",
+                a.description
+            );
+        }
     }
 }
