@@ -42,8 +42,13 @@ pub struct HierarchicalCommunities {
     /// communities, or `None` for roots at the top level. Walk leaf -> root by chasing parents.
     pub hierarchy: HashMap<usize, HashMap<usize, Option<(usize, usize)>>>,
 
-    /// LLM-generated summaries for each community (optional)
-    pub summaries: HashMap<usize, String>,
+    /// LLM- or extractor-generated summaries for each community, keyed by hierarchy level.
+    ///
+    /// `summaries[level][community_id]` holds the summary for that community. Keying by
+    /// `(level, community_id)` is required because community ids can collide across levels:
+    /// a level-0 community and a level-1 community can both carry id `7`, so a flat
+    /// `HashMap<usize, String>` would let one overwrite the other.
+    pub summaries: HashMap<usize, HashMap<usize, String>>,
 
     /// Mapping from entity names to metadata (enriched from KnowledgeGraph)
     pub entity_mapping: Option<HashMap<String, EntityMetadata>>,
@@ -210,9 +215,19 @@ impl HierarchicalCommunities {
             for community_id in community_ids {
                 let summary =
                     self.generate_community_summary(level, community_id, graph, max_length);
-                self.summaries.insert(community_id, summary);
+                self.summaries
+                    .entry(level)
+                    .or_default()
+                    .insert(community_id, summary);
             }
         }
+    }
+
+    /// Look up the summary for a specific `(level, community_id)`.
+    pub fn get_summary(&self, level: usize, community_id: usize) -> Option<&String> {
+        self.summaries
+            .get(&level)
+            .and_then(|m| m.get(&community_id))
     }
 
     /// Generate summaries for all levels bottom-up
@@ -373,10 +388,12 @@ impl HierarchicalCommunities {
                     .any(|entity| entity.to_lowercase().contains(&query_lower));
 
                 if is_relevant {
-                    // Get or generate summary
+                    // Get or generate summary, keyed by (level, community_id) to avoid
+                    // cross-level id collisions.
                     let summary = self
                         .summaries
-                        .get(&community_id)
+                        .get(&level)
+                        .and_then(|m| m.get(&community_id))
                         .cloned()
                         .unwrap_or_else(|| {
                             // Fallback: create entity list
@@ -1088,6 +1105,48 @@ mod tests {
             .filter(|p| p.is_some())
             .count();
         assert_eq!(parented, 0, "expected no parent links at max_levels=1");
+    }
+
+    /// Summaries must not collide when communities at different levels share an id.
+    #[test]
+    fn test_summaries_distinct_across_levels() {
+        // Manually construct a HierarchicalCommunities with overlapping ids across levels.
+        let mut communities = HierarchicalCommunities {
+            levels: HashMap::new(),
+            hierarchy: HashMap::new(),
+            summaries: HashMap::new(),
+            entity_mapping: None,
+        };
+
+        // Level 0: a single community with id 0.
+        let mut l0 = HashMap::new();
+        l0.insert(NodeIndex::new(0), 0usize);
+        communities.levels.insert(0, l0);
+        // Level 1: a community also with id 0 (different community semantically).
+        let mut l1 = HashMap::new();
+        l1.insert(NodeIndex::new(0), 0usize);
+        communities.levels.insert(1, l1);
+
+        // Insert distinct summaries for the colliding ids.
+        communities
+            .summaries
+            .entry(0)
+            .or_default()
+            .insert(0, "level-0 summary".to_string());
+        communities
+            .summaries
+            .entry(1)
+            .or_default()
+            .insert(0, "level-1 summary".to_string());
+
+        let s0 = communities.get_summary(0, 0).expect("level 0 summary");
+        let s1 = communities.get_summary(1, 0).expect("level 1 summary");
+        assert_ne!(
+            s0, s1,
+            "summaries collided across levels: l0={s0:?}, l1={s1:?}"
+        );
+        assert_eq!(s0, "level-0 summary");
+        assert_eq!(s1, "level-1 summary");
     }
 
     /// Total weighted degree must be preserved across super-graph contractions; intra-community

@@ -564,18 +564,29 @@ impl GraphRAG {
             .map_err(|e| JsValue::from_str(&format!("JSON serialization failed: {}", e)))
     }
 
-    /// Get summary for a specific community
-    pub fn get_community_summary(&self, community_id: usize) -> Result<String, JsValue> {
+    /// Get summary for a specific community at a given hierarchy level.
+    ///
+    /// Summaries are keyed by `(level, community_id)` to avoid id collisions across
+    /// hierarchy levels.
+    pub fn get_community_summary(
+        &self,
+        level: usize,
+        community_id: usize,
+    ) -> Result<String, JsValue> {
         let communities = self
             .hierarchical_communities
             .as_ref()
             .ok_or_else(|| JsValue::from_str("No communities detected"))?;
 
         communities
-            .summaries
-            .get(&community_id)
+            .get_summary(level, community_id)
             .cloned()
-            .ok_or_else(|| JsValue::from_str(&format!("No summary for community {}", community_id)))
+            .ok_or_else(|| {
+                JsValue::from_str(&format!(
+                    "No summary for community {} at level {}",
+                    community_id, level
+                ))
+            })
     }
 
     /// Get all community summaries as JSON

@@ -196,11 +196,14 @@ fn main() -> graphrag_core::Result<()> {
     let mut communities_mut = communities;
     communities_mut.generate_hierarchical_summaries(&leiden_graph, 3);
 
-    println!("  Generated {} summaries", communities_mut.summaries.len());
+    let total_summaries: usize = communities_mut.summaries.values().map(|m| m.len()).sum();
+    println!("  Generated {} summaries", total_summaries);
 
-    for (community_id, summary) in &communities_mut.summaries {
-        println!("\n  Community {} summary:", community_id);
-        println!("    {}", summary);
+    for (level, level_summaries) in &communities_mut.summaries {
+        for (community_id, summary) in level_summaries {
+            println!("\n  Level {} Community {} summary:", level, community_id);
+            println!("    {}", summary);
+        }
     }
 
     // Step 7: Demonstrate adaptive query routing (NEW!)
