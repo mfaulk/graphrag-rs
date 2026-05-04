@@ -1027,7 +1027,8 @@ mod tests {
         graph
     }
 
-    /// Two-tier graph yields >=2 levels with parent links connecting leaf communities to coarser ones.
+    /// Two-tier graph: level 0 must recover the four sub-cliques and level 1 must merge them
+    /// into exactly two outer cliques (each containing two sub-cliques).
     #[test]
     fn test_hierarchical_two_tier_graph() {
         let graph = create_two_tier_graph();
@@ -1049,7 +1050,7 @@ mod tests {
             result.levels.keys().collect::<Vec<_>>()
         );
 
-        // At level 0, expect at least 2 distinct communities (the algorithm partitions the graph).
+        // Level 0: must produce >=2 distinct communities (the algorithm partitions the graph).
         let level0_ids: HashSet<usize> = result.levels[&0].values().copied().collect();
         assert!(
             level0_ids.len() >= 2,
@@ -1057,25 +1058,50 @@ mod tests {
             level0_ids.len()
         );
 
-        // The hierarchy must record parent links from level-0 communities up to level 1+.
-        let parented: usize = result
-            .hierarchy
-            .get(&0)
-            .map(|m| m.values().filter(|p| p.is_some()).count())
-            .unwrap_or(0);
+        // Level 1: with two well-separated outer cliques, expect at least 2 outer
+        // communities at the next level — a buggy implementation that over-collapses to a
+        // single root in one step would otherwise pass.
+        let level_1 = result.levels.get(&1).expect("level 1 present");
+        let level1_ids: HashSet<usize> = level_1.values().copied().collect();
         assert!(
-            parented >= 2,
-            "expected at least 2 level-0 communities with parents, got {parented}",
+            level1_ids.len() >= 2,
+            "expected >=2 outer communities at level 1, got {}",
+            level1_ids.len()
         );
 
-        // Top level must have all entries with no parent (roots).
-        let top_level = *result.levels.keys().max().unwrap();
-        if let Some(top_map) = result.hierarchy.get(&top_level) {
+        // Group level-0 sub-cliques by their level-1 parent. The two outer cliques each
+        // contain two sub-cliques, so we expect exactly 2 parent groups, each holding >=2
+        // children.
+        let mut parent_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&l0_id, parent) in result.hierarchy.get(&0).expect("level 0 hierarchy") {
+            if let Some((_, l1_id)) = parent {
+                parent_groups.entry(*l1_id).or_default().push(l0_id);
+            }
+        }
+        assert_eq!(
+            parent_groups.len(),
+            2,
+            "expected exactly 2 outer groups at level 1, got {} ({parent_groups:?})",
+            parent_groups.len()
+        );
+        for (parent_id, children) in &parent_groups {
             assert!(
-                top_map.values().all(|p| p.is_none()),
-                "top level entries should have no parent"
+                children.len() >= 2,
+                "outer community {parent_id} should contain >=2 sub-cliques, got {}",
+                children.len()
             );
         }
+
+        // Top level must have all entries with `None` parents (roots).
+        let top_level = *result.levels.keys().max().unwrap();
+        let top_map = result
+            .hierarchy
+            .get(&top_level)
+            .expect("top level hierarchy present");
+        assert!(
+            top_map.values().all(|p| p.is_none()),
+            "top level entries should have no parent"
+        );
     }
 
     /// max_levels = 1 caps the algorithm at the leaf partition only; the top level (level 0)
