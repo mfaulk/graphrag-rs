@@ -140,10 +140,12 @@ use_gleaning = true
 max_gleaning_rounds = 1
 entity_types = ["PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT"]
 
-# Element-summary collapse (Edge et al. 2024 §2.2): synthesize one coherent
-# description per entity/relationship described in multiple chunks. Below
-# `max_chars_for_concat` total chars descriptions are joined locally rather
-# than sent to the LLM.
+# Element-summary collapse (Edge et al. 2024 §2.2): preview API only.
+# These keys are accepted by all config loaders and round-trip through
+# serialisation, but they are NOT yet invoked during `build_graph` —
+# `core::Entity` does not yet carry a description field for the collapsed
+# text. The collapse functions in `entity::element_summary` are public and
+# usable directly. See issue #97 review for the wiring follow-up.
 [entities.element_summary]
 enabled = true
 min_instances = 2

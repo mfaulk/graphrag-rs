@@ -5,6 +5,25 @@
 //! single coherent description from the per-instance descriptions. Below a
 //! cost-guard threshold the descriptions are concatenated locally to avoid
 //! unnecessary LLM calls.
+//!
+//! # Status: Preview API — not yet wired into indexing
+//!
+//! As of this revision, this module is **not invoked during
+//! `GraphRAG::build_graph`**. Both LLM extraction paths add entities and
+//! relationships directly to the graph without grouping by element and
+//! collapsing their descriptions, because `core::Entity` does not yet carry
+//! a `description` field for the collapsed text to live in.
+//!
+//! The functions below (`collapse_descriptions`, `collapse_all`,
+//! `collapse_entity_descriptions`, `collapse_relationship_descriptions`) are
+//! a stable public API that downstream callers can use today against their
+//! own description storage. The corresponding `entities.element_summary.*`
+//! configuration block is plumbed end-to-end through serialization and the
+//! `SetConfig` → `Config` conversion, so no config-file changes will be
+//! required when indexing-time wiring lands.
+//!
+//! Tracking: see issue #97 / PR review notes for the description-schema
+//! follow-up that will hook this into `build_graph`.
 
 use std::collections::HashMap;
 
