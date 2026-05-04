@@ -83,6 +83,10 @@ where
 ///   `"mistral"`, `"together"`) go through `HttpEmbeddingProvider`,
 ///   which already handles auth headers + the sync-`ureq`-on-blocking
 ///   pool dance described in `embeddings/api_providers.rs`.
+/// - `"huggingface"` / `"hf"` returns an explicit error: the local-model
+///   path (`embeddings/huggingface.rs`) is not yet wired into factory
+///   dispatch. Users wanting HF must inject the embedder via
+///   `RegistryBuilder::with_async_embedder` or pick a different backend.
 pub fn build_async_embedder(config: &RuntimeEmbeddingConfig) -> Result<Option<DynAsyncEmbedder>> {
     let backend = config.backend.to_lowercase();
 
@@ -111,7 +115,7 @@ pub fn build_async_embedder(config: &RuntimeEmbeddingConfig) -> Result<Option<Dy
 
         "openai" | "voyage" | "voyageai" | "voyage-ai" | "cohere" | "jina" | "jinaai"
         | "jina-ai" | "mistral" | "mistralai" | "mistral-ai" | "together" | "togetherai"
-        | "together-ai" | "huggingface" | "hf" => {
+        | "together-ai" => {
             #[cfg(feature = "ureq")]
             {
                 let provider_cfg = EmbeddingProviderConfig {
@@ -148,9 +152,30 @@ pub fn build_async_embedder(config: &RuntimeEmbeddingConfig) -> Result<Option<Dy
             }
         }
 
+        // HuggingFace is *not* an HTTP API provider — it requires a local
+        // model download + Candle inference (see `embeddings/huggingface.rs`)
+        // gated behind the `huggingface-hub` and `neural-embeddings`
+        // features. Routing it through `HttpEmbeddingProvider` was the
+        // previous behavior; it produced confusing "API key required" or
+        // "Unsupported API provider" errors and, when paired with
+        // `fallback_to_hash = true`, silently downgraded HF configs to
+        // hash embeddings without telling the user (issue #91 review).
+        // Until the local-model path is wired into the factory, fail fast
+        // with an explicit, actionable error.
+        "huggingface" | "hf" => Err(GraphRAGError::Config {
+            message: "embeddings.backend=\"huggingface\" is not yet wired into the factory \
+                      dispatch. The `huggingface` feature provides \
+                      `crate::embeddings::huggingface::HuggingFaceEmbeddings` for direct use, \
+                      but it requires `huggingface-hub` + `neural-embeddings` features and a \
+                      local model download. Choose `ollama` or one of the HTTP API backends \
+                      (`openai`, `voyage`, `cohere`, `jina`, `mistral`, `together`) instead, \
+                      or inject a custom embedder via `RegistryBuilder::with_async_embedder`."
+                .to_string(),
+        }),
+
         other => Err(GraphRAGError::Config {
             message: format!(
-                "Unknown embeddings.backend \"{}\". Expected one of: hash, ollama, openai, voyage, cohere, jina, mistral, together, huggingface",
+                "Unknown embeddings.backend \"{}\". Expected one of: hash, ollama, openai, voyage, cohere, jina, mistral, together",
                 other
             ),
         }),

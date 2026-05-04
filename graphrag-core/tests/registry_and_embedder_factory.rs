@@ -508,3 +508,39 @@ fn empty_registry_has_no_typed_slots() {
     assert!(reg.async_embedder().is_none());
     assert!(reg.chat_backend().is_none());
 }
+
+/// `backend = "huggingface"` must fail fast in the factory rather than
+/// silently routing through the HTTP provider (which requires an API key
+/// HF doesn't use) or, with `fallback_to_hash = true`, downgrading to
+/// hash embeddings without telling the user (issue #91 review).
+#[test]
+fn factory_returns_error_for_unsupported_huggingface_backend() {
+    use graphrag_core::embeddings::factory::build_async_embedder;
+
+    let mut config = Config::default();
+    config.embeddings.backend = "huggingface".to_string();
+    config.embeddings.dimension = 384;
+    config.embeddings.fallback_to_hash = false;
+
+    match build_async_embedder(&config.embeddings) {
+        Ok(_) => panic!("huggingface backend must error in the factory"),
+        Err(err) => {
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("huggingface"),
+                "error must name the backend, got: {msg}"
+            );
+        },
+    }
+
+    // Same expectation for the `hf` alias.
+    let mut config = Config::default();
+    config.embeddings.backend = "hf".to_string();
+    match build_async_embedder(&config.embeddings) {
+        Ok(_) => panic!("hf alias must also error"),
+        Err(err) => assert!(
+            format!("{err}").contains("huggingface"),
+            "error must reference the huggingface backend"
+        ),
+    }
+}
