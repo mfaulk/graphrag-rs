@@ -1701,6 +1701,29 @@ impl GraphRAG {
         self.knowledge_graph.as_ref()
     }
 
+    /// Run paper-aligned Local Search and return a packed, token-budgeted
+    /// context (#102). The result is prompt-ready; the caller is responsible
+    /// for the LLM synthesis call.
+    #[cfg(feature = "async")]
+    pub async fn query_local(
+        &mut self,
+        query: &str,
+        budget: usize,
+    ) -> Result<retrieval::LocalContext> {
+        self.ensure_initialized()?;
+        if self.has_documents() && !self.has_graph() {
+            self.build_graph().await?;
+        }
+        let graph = self
+            .knowledge_graph
+            .as_ref()
+            .ok_or_else(|| GraphRAGError::Config {
+                message: "Knowledge graph not initialized".to_string(),
+            })?;
+        let ls = retrieval::LocalSearch::with_default_config(graph);
+        ls.search(query, budget)
+    }
+
     /// Get entity details by ID
     pub fn get_entity(&self, entity_id: &str) -> Option<&Entity> {
         if let Some(graph) = &self.knowledge_graph {
