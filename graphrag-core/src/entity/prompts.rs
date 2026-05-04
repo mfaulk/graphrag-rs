@@ -50,9 +50,13 @@ Text: {input_text}
 Output:
 "#;
 
-/// Gleaning continuation prompt for additional rounds
+/// Gleaning continuation prompt for additional rounds.
+///
+/// Wording follows Edge et al. 2024 §2.1: the prompt asserts that "MANY entities
+/// were missed" to bias the model toward producing additional output, rather
+/// than the softer "may have missed" framing.
 pub const GLEANING_CONTINUATION_PROMPT: &str = r#"-Goal-
-You previously extracted entities and relationships from a text document. Review your previous extraction and the original text to identify any additional entities or relationships you may have missed in the first pass.
+MANY entities were missed in the last extraction. Review your previous extraction and the original text and add any entities and relationships that were missed.
 
 -Steps-
 1. Review the entities you previously identified:
@@ -95,8 +99,14 @@ Text: {input_text}
 Output:
 "#;
 
-/// Completion check prompt to determine if extraction is complete
-pub const COMPLETION_CHECK_PROMPT: &str = r#"Based on the text below and the entities/relationships already extracted, are there any significant entities or relationships that have been missed?
+/// Completion check prompt to determine if extraction is complete.
+///
+/// Wording follows Edge et al. 2024 §2.1: rather than asking whether anything
+/// "may have been missed", the prompt asserts "MANY entities were missed" and
+/// asks the model to answer YES or NO. The decision is intended to be taken on
+/// a single token using `logit_bias` to force a YES/NO answer; backends that
+/// do not support `logit_bias` fall back to string parsing.
+pub const COMPLETION_CHECK_PROMPT: &str = r#"It appears MANY entities were missed in the last extraction. Answer YES if there are still entities or relationships that need to be added, or NO if the extraction is complete.
 
 Text:
 {input_text}
@@ -107,13 +117,7 @@ Current Entities ({entity_count}):
 Current Relationships ({relationship_count}):
 {relationships_summary}
 
-Think carefully about:
-1. Are all important characters, people, organizations mentioned in the text captured?
-2. Are all significant locations, places, settings identified?
-3. Are all key events, objects, concepts extracted?
-4. Are all meaningful relationships between entities documented?
-
-Respond with ONLY "YES" if the extraction is complete and thorough, or "NO" if there are still significant entities or relationships missing.
+Answer with ONLY "YES" if more entities or relationships should be added, or "NO" if the extraction is complete.
 
 Answer (YES or NO):"#;
 
@@ -375,6 +379,30 @@ mod tests {
 
         assert!(prompt.contains("Tom"));
         assert!(prompt.contains("YES or NO"));
+    }
+
+    /// Paper-aligned wording: continuation prompt asserts entities were missed.
+    #[test]
+    fn test_continuation_prompt_uses_paper_wording() {
+        let builder = PromptBuilder::new(vec!["PERSON".to_string()]);
+        let prompt = builder.build_continuation_prompt("Some text", &[], &[]);
+        assert!(
+            prompt.contains("MANY entities were missed"),
+            "continuation prompt must use paper wording, got: {}",
+            prompt
+        );
+    }
+
+    /// Paper-aligned wording: completion check asserts entities were missed.
+    #[test]
+    fn test_completion_prompt_uses_paper_wording() {
+        let builder = PromptBuilder::new(vec!["PERSON".to_string()]);
+        let prompt = builder.build_completion_prompt("Some text", &[], &[]);
+        assert!(
+            prompt.contains("MANY entities were missed"),
+            "completion prompt must use paper wording, got: {}",
+            prompt
+        );
     }
 
     #[test]

@@ -1333,7 +1333,8 @@ fn default_relationship_confidence() -> f32 {
     0.5
 }
 fn default_max_gleaning_rounds() -> usize {
-    3
+    // Edge et al. 2024 §2.1 default: a single gleaning round.
+    1
 }
 
 fn default_validation_confidence() -> f32 {

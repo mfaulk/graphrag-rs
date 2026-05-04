@@ -1269,7 +1269,8 @@ fn default_max_retries() -> u32 {
     3
 }
 fn default_gleaning_rounds() -> usize {
-    3
+    // Edge et al. 2024 §2.1 default: a single gleaning round.
+    1
 }
 fn default_gleaning_improvement() -> f32 {
     0.1
@@ -1304,7 +1305,8 @@ fn default_semantic_entity_method() -> String {
     "llm".to_string()
 }
 fn default_max_gleaning_rounds() -> usize {
-    3
+    // Edge et al. 2024 §2.1 default: a single gleaning round.
+    1
 }
 fn default_semantic_temperature() -> f32 {
     0.1
