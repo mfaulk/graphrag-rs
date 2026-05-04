@@ -506,14 +506,16 @@ fn parse_completion_response(response: &str) -> bool {
         "NO" => true,   // Extraction is COMPLETE
         "YES" => false, // More entities were missed
         _ => {
-            // Fall back to substring matching to be robust against verbose
-            // responses; default to INCOMPLETE if neither token appears.
-            let upper = trimmed.to_ascii_uppercase();
-            if upper.contains("NO") && !upper.contains("YES") {
-                true
-            } else {
-                false
-            }
+            // Fall back to word-boundary matching so verbose responses
+            // containing words like "KNOW", "NOTHING", "NONE", or
+            // "ENOUGH" are not mistaken for an isolated "NO" token.
+            // Default to INCOMPLETE if neither word appears.
+            let upper = trimmed.to_uppercase();
+            let words: std::collections::HashSet<&str> = upper
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            words.contains("NO") && !words.contains("YES")
         },
     }
 }
@@ -580,6 +582,32 @@ Here's the extraction:
     fn test_parse_completion_response_unknown_defaults_incomplete() {
         assert!(!parse_completion_response(""));
         assert!(!parse_completion_response("maybe"));
+    }
+
+    /// Substring "NO" inside other words must not classify as complete.
+    #[test]
+    fn parse_completion_response_does_not_match_no_in_word() {
+        assert!(!parse_completion_response(
+            "NOTHING WAS MISSED. KNOW WHAT I MEAN?"
+        ));
+        assert!(!parse_completion_response("ENOUGH context, KNOW more?"));
+        assert!(!parse_completion_response("NONE of the above"));
+    }
+
+    /// An isolated "NO" word (in any form) must classify as complete.
+    #[test]
+    fn parse_completion_response_recognizes_isolated_no() {
+        assert!(parse_completion_response("NO"));
+        assert!(parse_completion_response("No, the extraction is complete."));
+        assert!(parse_completion_response("no - all entities found"));
+    }
+
+    /// Ambiguous "not sure" must not classify as complete (no isolated NO/YES).
+    #[test]
+    fn parse_completion_response_handles_not_sure() {
+        assert!(!parse_completion_response(
+            "Not sure if there are more entities."
+        ));
     }
 
     #[test]
