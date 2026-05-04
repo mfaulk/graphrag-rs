@@ -2,6 +2,8 @@
 pub mod atomic_fact_extractor;
 /// Bidirectional entity-chunk index for fast lookups
 pub mod bidirectional_index;
+/// Element-summary collapse for entities/relationships described in many chunks (paper §2.2)
+pub mod element_summary;
 /// Gleaning-based entity extraction module
 pub mod gleaning_extractor;
 /// GLiNER-Relex joint NER + RE extractor (feature-gated: `gliner`)
@@ -20,6 +22,10 @@ pub mod string_similarity_linker;
 
 pub use atomic_fact_extractor::{AtomicFact, AtomicFactExtractor};
 pub use bidirectional_index::{BidirectionalIndex, IndexStatistics};
+pub use element_summary::{
+    build_summary_prompt, collapse_all, collapse_descriptions, collapse_entity_descriptions,
+    collapse_relationship_descriptions, ELEMENT_SUMMARY_PROMPT,
+};
 pub use gleaning_extractor::{ExtractionCompletionStatus, GleaningConfig, GleaningEntityExtractor};
 #[cfg(feature = "gliner")]
 pub use gliner_extractor::GLiNERExtractor;

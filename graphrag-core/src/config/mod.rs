@@ -1092,6 +1092,68 @@ pub struct EntityConfig {
     /// Facts longer than this will be rejected
     #[serde(default = "default_max_fact_tokens")]
     pub max_fact_tokens: usize,
+
+    /// Element-summary collapse settings (Edge et al. 2024 §2.2).
+    #[serde(default)]
+    pub element_summary: ElementSummaryConfig,
+}
+
+/// Configuration for element-summary collapse (paper §2.2).
+///
+/// When the same entity or relationship appears in multiple chunks, this
+/// step synthesises a single coherent description from the per-instance
+/// descriptions, calling the chat backend only when the total instance
+/// length exceeds the cost-guard threshold.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElementSummaryConfig {
+    /// Master switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Minimum instances of an element required to trigger summarisation.
+    #[serde(default = "default_element_summary_min_instances")]
+    pub min_instances: usize,
+
+    /// Total character budget below which descriptions are concatenated
+    /// locally instead of being sent to the LLM.
+    #[serde(default = "default_element_summary_max_chars_concat")]
+    pub max_chars_for_concat: usize,
+
+    /// Sampling temperature passed to the chat backend during synthesis.
+    #[serde(default = "default_element_summary_temperature")]
+    pub temperature: f32,
+
+    /// Cap on tokens for the synthesised description.
+    #[serde(default = "default_element_summary_max_output_tokens")]
+    pub max_output_tokens: u32,
+}
+
+impl Default for ElementSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_instances: default_element_summary_min_instances(),
+            max_chars_for_concat: default_element_summary_max_chars_concat(),
+            temperature: default_element_summary_temperature(),
+            max_output_tokens: default_element_summary_max_output_tokens(),
+        }
+    }
+}
+
+fn default_element_summary_min_instances() -> usize {
+    2
+}
+
+fn default_element_summary_max_chars_concat() -> usize {
+    800
+}
+
+fn default_element_summary_temperature() -> f32 {
+    0.0
+}
+
+fn default_element_summary_max_output_tokens() -> u32 {
+    256
 }
 
 /// Configuration for advanced GraphRAG features (Phases 2-3)
@@ -1474,6 +1536,7 @@ impl Default for Config {
                 validation_min_confidence: default_validation_confidence(),
                 use_atomic_facts: false,
                 max_fact_tokens: default_max_fact_tokens(),
+                element_summary: ElementSummaryConfig::default(),
             },
             retrieval: RetrievalConfig {
                 top_k: default_top_k(),
@@ -1806,6 +1869,24 @@ impl Config {
                 max_fact_tokens: parsed["entities"]["max_fact_tokens"]
                     .as_usize()
                     .unwrap_or(default_max_fact_tokens()),
+                element_summary: ElementSummaryConfig {
+                    enabled: parsed["entities"]["element_summary"]["enabled"]
+                        .as_bool()
+                        .unwrap_or(true),
+                    min_instances: parsed["entities"]["element_summary"]["min_instances"]
+                        .as_usize()
+                        .unwrap_or_else(default_element_summary_min_instances),
+                    max_chars_for_concat: parsed["entities"]["element_summary"]
+                        ["max_chars_for_concat"]
+                        .as_usize()
+                        .unwrap_or_else(default_element_summary_max_chars_concat),
+                    temperature: parsed["entities"]["element_summary"]["temperature"]
+                        .as_f32()
+                        .unwrap_or_else(default_element_summary_temperature),
+                    max_output_tokens: parsed["entities"]["element_summary"]["max_output_tokens"]
+                        .as_u32()
+                        .unwrap_or_else(default_element_summary_max_output_tokens),
+                },
             },
             retrieval: RetrievalConfig {
                 top_k: parsed["retrieval"]["top_k"]
@@ -2288,6 +2369,17 @@ impl Config {
         entities["entity_types"] = json::JsonValue::from(entity_types_array);
         entities["use_gleaning"] = json::JsonValue::from(self.entities.use_gleaning);
         entities["max_gleaning_rounds"] = json::JsonValue::from(self.entities.max_gleaning_rounds);
+        let mut element_summary = json::JsonValue::new_object();
+        element_summary["enabled"] = json::JsonValue::from(self.entities.element_summary.enabled);
+        element_summary["min_instances"] =
+            json::JsonValue::from(self.entities.element_summary.min_instances);
+        element_summary["max_chars_for_concat"] =
+            json::JsonValue::from(self.entities.element_summary.max_chars_for_concat);
+        element_summary["temperature"] =
+            json::JsonValue::from(self.entities.element_summary.temperature);
+        element_summary["max_output_tokens"] =
+            json::JsonValue::from(self.entities.element_summary.max_output_tokens);
+        entities["element_summary"] = element_summary;
         config_json["entities"] = entities;
 
         // Retrieval
