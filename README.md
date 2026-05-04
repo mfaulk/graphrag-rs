@@ -388,17 +388,17 @@ Marketing the project as a "Rust implementation of GraphRAG" overstates what is 
 
 | Pipeline stage | Status | Notes |
 |---|---|---|
-| Document chunking | In progress: token-based via `tiktoken-rs` (cl100k_base) on PR #126; `main` uses a hierarchical char-based chunker | PR #126 |
+| Document chunking | In progress: token-based via `tiktoken-rs` (cl100k_base) on PR #126; `main` uses char-based chunking via `TextProcessor::chunk_text` (a `chunk_text_hierarchical` helper exists in `graphrag-core/src/text/mod.rs` but is not on the active ingestion path) | PR #126 |
 | LLM entity extraction with gleaning | In progress: paper-aligned prompts and `max_gleanings = 1` default land in PR #131; `main` defaults to `max_gleaning_rounds = 3` | PR #131 |
 | Hierarchical Leiden (super-graph contraction) | In progress: real multi-level Leiden lands in PR #128; `main` runs a single-level Leiden | PR #128 |
 | Element summaries (LLM collapse of duplicate descriptions) | Preview only: API exists in PR #131; full wiring needs `Entity::description` (Wave 3 A) | PR #131 + Wave 3 A |
 | Community reports (LLM-generated structured summaries) | Not yet implemented | Issue #95 (blocked on #94 / #97) |
-| Local Search (entity-anchored, token-budgeted retrieval) | In progress: `--mode local` lands in PR #130 | PR #130 |
+| Local Search (entity-anchored, token-budgeted retrieval) | In progress: `--mode local` retrieval flag lands in PR #130 (not yet on `main`) | PR #130 |
 | Global Search (map-reduce over community reports + helpfulness scoring) | Not yet implemented | Issue #93 |
 
-**On query modes:** the default mode is `--mode hybrid`, which is *this project's own* blend (LightRAG dual-level + PageRank/PPR + cross-encoder reranking) rather than the paper's modes. Once PR #130 merges, `--mode local` will provide the paper-aligned Local Search. Paper-aligned `--mode global` remains future work, tracked in issue #93.
+**On query modes:** today on `main` the CLI does *not* expose a `--mode {local,global,hybrid}` flag. The TUI offers `/mode ask|explain|reason`, which selects answer *style* (plain answer, answer with sources/confidence, or query-decomposition reasoning) rather than retrieval strategy; retrieval itself defaults to this project's hybrid blend (LightRAG dual-level + PageRank/PPR + cross-encoder reranking). After PR #130 merges, `graphrag query --mode local` will become available and will provide the paper-aligned Local Search. Paper-aligned `--mode global` remains future work, tracked in issue #93.
 
-**Note for benchmarking:** because Global Search is not yet implemented, comparisons against the GraphRAG paper's reported numbers should be interpreted carefully and ideally restricted to Local Search / hybrid retrieval. Until PRs #126, #128, #130, and #131 merge, several other stages (token-based chunking, hierarchical Leiden, paper-aligned gleaning defaults, element-summary collapse) are also still in flight on `main`.
+**Note for benchmarking:** today (on `main`) only the project's hybrid retrieval is available, so comparisons against the GraphRAG paper's reported numbers should be interpreted with that caveat in mind. After PR #130 merges, Local Search becomes available and is the appropriate paper-aligned retrieval mode to benchmark; Global Search remains unimplemented (#93). Until PRs #126, #128, #130, and #131 merge, several other stages (token-based chunking, hierarchical Leiden, paper-aligned gleaning defaults, element-summary collapse) are also still in flight on `main`.
 
 ### 4. CLI Usage
 
