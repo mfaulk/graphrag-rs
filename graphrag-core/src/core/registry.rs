@@ -3,6 +3,7 @@
 //! This module provides a dependency injection system that allows
 //! components to be swapped out for testing or different implementations.
 
+use crate::core::backend::DynChatBackend;
 use crate::core::traits::*;
 use crate::core::{GraphRAGError, Result};
 use std::any::{Any, TypeId};
@@ -12,9 +13,22 @@ use std::sync::Arc;
 /// Type-erased service container
 type ServiceBox = Box<dyn Any + Send + Sync>;
 
-/// Service registry for dependency injection
+/// Type alias for an async embedder trait object usable from the registry.
+/// Errors are pinned to `GraphRAGError` so consumers don't have to thread a
+/// generic `E` through every call site.
+pub type DynAsyncEmbedder = Arc<dyn AsyncEmbedder<Error = GraphRAGError> + Send + Sync>;
+
+/// Service registry for dependency injection.
+///
+/// Holds a generic `TypeId`-keyed map for arbitrary services plus typed slots
+/// for the two implementations `GraphRAG::new_with_registry` consults at
+/// construction time (`Embedder`, `ChatBackend`). The typed slots exist
+/// because `Arc<dyn Trait>` is hard to look up generically through a
+/// `TypeId` map across crate boundaries.
 pub struct ServiceRegistry {
     services: HashMap<TypeId, ServiceBox>,
+    embedder: Option<DynAsyncEmbedder>,
+    chat_backend: Option<DynChatBackend>,
 }
 
 impl ServiceRegistry {
@@ -22,6 +36,8 @@ impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
+            embedder: None,
+            chat_backend: None,
         }
     }
 
@@ -29,6 +45,31 @@ impl ServiceRegistry {
     pub fn register<T: Any + Send + Sync>(&mut self, service: T) {
         let type_id = TypeId::of::<T>();
         self.services.insert(type_id, Box::new(service));
+    }
+
+    /// Inject a pre-built async embedder. Consumed by
+    /// [`crate::GraphRAG::new_with_registry`] to override
+    /// `config.embeddings.backend` selection.
+    pub fn set_async_embedder(&mut self, embedder: DynAsyncEmbedder) {
+        self.embedder = Some(embedder);
+    }
+
+    /// Get the injected async embedder, if any.
+    pub fn async_embedder(&self) -> Option<&DynAsyncEmbedder> {
+        self.embedder.as_ref()
+    }
+
+    /// Inject a chat backend used by `ask` / `ask_explained` for the final
+    /// answer-generation step. Replaces the legacy
+    /// `GraphRAG::set_chat_backend` field but is also used as that method's
+    /// storage so existing callers keep working.
+    pub fn set_chat_backend(&mut self, backend: DynChatBackend) {
+        self.chat_backend = Some(backend);
+    }
+
+    /// Get the injected chat backend, if any.
+    pub fn chat_backend(&self) -> Option<&DynChatBackend> {
+        self.chat_backend.as_ref()
     }
 
     /// Get a service by type
@@ -127,6 +168,31 @@ impl RegistryBuilder {
         E: Embedder + Any + Send + Sync,
     {
         self.registry.register(embedder);
+        self
+    }
+
+    /// Register an async embedder. Stored in the registry's typed slot so
+    /// [`crate::GraphRAG::new_with_registry`] can consult it directly without
+    /// guessing a concrete type.
+    pub fn with_async_embedder<E>(mut self, embedder: E) -> Self
+    where
+        E: AsyncEmbedder<Error = GraphRAGError> + Send + Sync + 'static,
+    {
+        self.registry.set_async_embedder(Arc::new(embedder));
+        self
+    }
+
+    /// Register an async embedder already wrapped in `Arc`. Useful for
+    /// sharing a single instance across multiple `ServiceRegistry`s.
+    pub fn with_async_embedder_arc(mut self, embedder: DynAsyncEmbedder) -> Self {
+        self.registry.set_async_embedder(embedder);
+        self
+    }
+
+    /// Register a chat backend used for final answer synthesis in `ask` /
+    /// `ask_explained`.
+    pub fn with_chat_backend(mut self, backend: DynChatBackend) -> Self {
+        self.registry.set_chat_backend(backend);
         self
     }
 
