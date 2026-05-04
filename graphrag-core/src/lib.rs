@@ -1701,15 +1701,19 @@ impl GraphRAG {
         self.knowledge_graph.as_ref()
     }
 
-    /// Run paper-aligned Local Search and return a packed, token-budgeted
-    /// context (#102). The result is prompt-ready; the caller is responsible
-    /// for the LLM synthesis call.
+    /// Dispatch a query to the requested [`retrieval::QueryMode`].
+    ///
+    /// Single entrypoint for paper-aligned mode selection (#102). Routes
+    /// through [`retrieval::RetrievalSystem::search_with_mode`] so the CLI,
+    /// FFI, and library callers all share one code path. `budget` is only
+    /// consulted by `QueryMode::Local`.
     #[cfg(feature = "async")]
-    pub async fn query_local(
+    pub async fn search_with_mode(
         &mut self,
         query: &str,
+        mode: retrieval::QueryMode,
         budget: usize,
-    ) -> Result<retrieval::LocalContext> {
+    ) -> Result<retrieval::SearchOutput> {
         self.ensure_initialized()?;
         if self.has_documents() && !self.has_graph() {
             self.build_graph().await?;
@@ -1720,8 +1724,36 @@ impl GraphRAG {
             .ok_or_else(|| GraphRAGError::Config {
                 message: "Knowledge graph not initialized".to_string(),
             })?;
-        let ls = retrieval::LocalSearch::with_default_config(graph);
-        ls.search(query, budget)
+        let retrieval = self
+            .retrieval_system
+            .as_mut()
+            .ok_or_else(|| GraphRAGError::Config {
+                message: "Retrieval system not initialized".to_string(),
+            })?;
+        retrieval.search_with_mode(query, mode, budget, graph).await
+    }
+
+    /// Run paper-aligned Local Search and return a packed, token-budgeted
+    /// context (#102). The result is prompt-ready; the caller is responsible
+    /// for the LLM synthesis call.
+    ///
+    /// Convenience wrapper around [`Self::search_with_mode`] with
+    /// `QueryMode::Local`.
+    #[cfg(feature = "async")]
+    pub async fn query_local(
+        &mut self,
+        query: &str,
+        budget: usize,
+    ) -> Result<retrieval::LocalContext> {
+        match self
+            .search_with_mode(query, retrieval::QueryMode::Local, budget)
+            .await?
+        {
+            retrieval::SearchOutput::Local(ctx) => Ok(ctx),
+            retrieval::SearchOutput::Hybrid(_) => Err(GraphRAGError::Config {
+                message: "search_with_mode(Local) returned Hybrid output".to_string(),
+            }),
+        }
     }
 
     /// Get entity details by ID

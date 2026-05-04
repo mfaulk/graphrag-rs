@@ -434,9 +434,12 @@ graphrag query "How does Bob mentor Carol?" --mode hybrid
 graphrag query "Tell me about Alice" --mode local --budget 2048
 ```
 
-Local mode is best for narrow, entity-specific questions where you want
-a tight, deterministic context for the LLM. A future `--mode global`
-(blocked on #93) will mirror this for community-level overview queries.
+`--mode` is case-insensitive and routes through a single core entrypoint
+(`RetrievalSystem::search_with_mode`) shared by the CLI, FFI, and
+library API. Local mode is best for narrow, entity-specific questions
+where you want a tight, deterministic context for the LLM. A future
+`--mode global` (blocked on #93) will mirror this for community-level
+overview queries.
 
 Token counting currently uses a `chars / 4` heuristic. The plan is to
 switch to `tiktoken-rs` (`cl100k_base`) once PR #126 lands so OpenAI

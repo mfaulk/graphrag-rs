@@ -292,27 +292,52 @@ impl GraphRAGHandler {
         }
     }
 
-    /// Execute a Local Search query (entity-anchored, token-budgeted).
+    /// Execute a query in the requested paper-aligned mode.
     ///
-    /// Returns the packed `LocalContext`. The caller can render it to a
-    /// prompt via `LocalContext::to_prompt()` and decide whether to call the
-    /// LLM.
-    pub async fn query_local(
+    /// Routes through [`graphrag_core::GraphRAG::search_with_mode`] so the
+    /// CLI uses the same dispatch path as the library API. Returns a
+    /// `SearchOutput` discriminated by the requested mode.
+    pub async fn query_with_mode(
         &self,
         query_text: &str,
+        mode: graphrag_core::retrieval::QueryMode,
         budget: usize,
-    ) -> Result<graphrag_core::retrieval::LocalContext> {
-        tracing::info!("Executing local-mode query: {}", query_text);
+    ) -> Result<graphrag_core::retrieval::SearchOutput> {
+        tracing::info!("Executing {:?}-mode query: {}", mode, query_text);
         let mut guard = self.graphrag.lock().await;
         if let Some(ref mut graphrag) = *guard {
             graphrag
-                .query_local(query_text, budget)
+                .search_with_mode(query_text, mode, budget)
                 .await
                 .map_err(|e| eyre!(e.to_string()))
         } else {
             Err(eyre!(
                 "GraphRAG not initialized. Use /config to load a configuration first."
             ))
+        }
+    }
+
+    /// Execute a Local Search query (entity-anchored, token-budgeted).
+    ///
+    /// Convenience wrapper around [`Self::query_with_mode`] with
+    /// `QueryMode::Local`.
+    pub async fn query_local(
+        &self,
+        query_text: &str,
+        budget: usize,
+    ) -> Result<graphrag_core::retrieval::LocalContext> {
+        match self
+            .query_with_mode(
+                query_text,
+                graphrag_core::retrieval::QueryMode::Local,
+                budget,
+            )
+            .await?
+        {
+            graphrag_core::retrieval::SearchOutput::Local(ctx) => Ok(ctx),
+            graphrag_core::retrieval::SearchOutput::Hybrid(_) => {
+                Err(eyre!("search_with_mode(Local) returned Hybrid output"))
+            },
         }
     }
 
