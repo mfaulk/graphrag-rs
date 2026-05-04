@@ -48,6 +48,7 @@ impl GraphIndexerAdapter {
             confidence: extracted.confidence,
             mentions: vec![], // GraphIndexer doesn't track mentions
             embedding: None,  // No embedding in GraphIndexer
+            description: None,
             first_mentioned: None,
             last_mentioned: None,
             temporal_validity: None,

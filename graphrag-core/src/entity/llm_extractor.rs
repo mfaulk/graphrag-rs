@@ -376,16 +376,20 @@ impl LLMEntityExtractor {
             // Find mentions in chunk
             let mentions = self.find_mentions(&entity_item.name, chunk_id, chunk_text);
 
-            // Create entity with mentions
-            // Note: Description is stored in the entity but not used in current Entity struct
-            // We store it in the entity name or as a separate field if needed
-            let entity = Entity::new(
+            // Create entity with mentions; preserve the LLM-emitted description
+            // so element-summary collapse can synthesise across chunks (#97).
+            let mut entity = Entity::new(
                 entity_id,
                 entity_item.name.clone(),
                 entity_item.entity_type.clone(),
                 0.9, // High confidence since it's LLM-extracted
             )
             .with_mentions(mentions);
+
+            let desc = entity_item.description.trim();
+            if !desc.is_empty() {
+                entity = entity.with_description(desc.to_string());
+            }
 
             entities.push(entity);
         }

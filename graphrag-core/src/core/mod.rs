@@ -234,6 +234,12 @@ pub struct Entity {
     pub mentions: Vec<EntityMention>,
     /// Optional vector embedding for the entity
     pub embedding: Option<Vec<f32>>,
+    /// Free-text description of the entity. Populated by LLM-based
+    /// extractors (single-pass / gleaning) and overwritten by element-summary
+    /// collapse when the same entity is described in multiple chunks
+    /// (Edge et al. 2024 §2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 
     // Temporal fields (Phase 1.2 - Advanced GraphRAG)
     /// First time this entity was mentioned (Unix timestamp)
@@ -553,6 +559,8 @@ impl KnowledgeGraph {
                     }
                 }
 
+                let description = entity_obj["description"].as_str().map(|s| s.to_string());
+
                 let entity = Entity {
                     id,
                     name,
@@ -560,6 +568,7 @@ impl KnowledgeGraph {
                     confidence,
                     mentions,
                     embedding: None, // Embeddings not stored in JSON
+                    description,
                     first_mentioned: None,
                     last_mentioned: None,
                     temporal_validity: None,
@@ -699,6 +708,10 @@ impl KnowledgeGraph {
                 "confidence" => entity.confidence,
                 "mentions_count" => entity.mentions.len()
             };
+
+            if let Some(desc) = &entity.description {
+                entity_obj["description"] = desc.clone().into();
+            }
 
             // Add mentions with chunk references
             let mut mentions_array = json::JsonValue::new_array();
@@ -1292,6 +1305,7 @@ impl Entity {
             confidence,
             mentions: Vec::new(),
             embedding: None,
+            description: None,
             // Temporal fields default to None (backward compatible)
             first_mentioned: None,
             last_mentioned: None,
@@ -1308,6 +1322,12 @@ impl Entity {
     /// Add an embedding to the entity
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
+        self
+    }
+
+    /// Attach (or replace) the entity's free-text description.
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
         self
     }
 
