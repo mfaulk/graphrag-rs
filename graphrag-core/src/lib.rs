@@ -1151,7 +1151,28 @@ impl GraphRAG {
             None => return Ok(()),
         };
 
-        let backend = self.chat_backend.as_deref();
+        // Resolve a chat backend for synthesis. Mirrors the dispatch pattern
+        // in `generate_semantic_answer_from_results`: prefer an externally
+        // injected `ChatBackend`; otherwise fall back to the built-in
+        // OllamaClient when ollama is enabled. Without this fallback the
+        // default (no injected backend) deployment never reaches the LLM
+        // synthesis path and `temperature` / `max_output_tokens` defaults
+        // would be unreachable (#97 review).
+        let ollama_fallback = if self.chat_backend.is_none() && self.config.ollama.enabled {
+            Some(crate::ollama::OllamaChatBackend::from_config(
+                self.config.ollama.clone(),
+            ))
+        } else {
+            None
+        };
+        let backend: Option<&dyn core::backend::ChatBackend> =
+            if let Some(b) = self.chat_backend.as_deref() {
+                Some(b as &dyn core::backend::ChatBackend)
+            } else {
+                ollama_fallback
+                    .as_ref()
+                    .map(|b| b as &dyn core::backend::ChatBackend)
+            };
 
         // --- Entity-side collapse ---
         // Collect per-element descriptions keyed by (lowercased_name, type).
@@ -1178,7 +1199,7 @@ impl GraphRAG {
             "entity",
             entity_groups,
             &self.config.entities.element_summary,
-            backend.map(|b| b as &dyn core::backend::ChatBackend),
+            backend,
         )
         .await?;
 
@@ -1226,7 +1247,7 @@ impl GraphRAG {
             "relationship",
             rel_groups,
             &self.config.entities.element_summary,
-            backend.map(|b| b as &dyn core::backend::ChatBackend),
+            backend,
         )
         .await?;
 
@@ -2411,5 +2432,48 @@ mod element_summary_wiring_tests {
             "singleton edges below min_instances must keep their original \
              description"
         );
+    }
+
+    /// `apply_element_summaries` must succeed (using the local concat path)
+    /// when no `ChatBackend` was injected but `ollama.enabled = true`. The
+    /// previous wiring fell back to `None` for the backend, so the LLM
+    /// synthesis path was unreachable in default deployments. With the
+    /// Ollama fallback in place, this configuration must at minimum not
+    /// crash and must still merge per-instance descriptions when below the
+    /// cost-guard (#97 review).
+    #[tokio::test]
+    async fn apply_element_summaries_uses_local_concat_when_ollama_enabled_but_under_budget() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        // High budget keeps the test off the network — concat fires.
+        config.entities.element_summary.max_chars_for_concat = 100_000;
+        // The new code path: ollama enabled + no injected chat backend.
+        config.ollama.enabled = true;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+        let mut a1 = entity_with_description("Alice", "PERSON", "the engineer");
+        a1.id = EntityId::new("alice-1".into());
+        let mut a2 = entity_with_description("Alice", "PERSON", "the founder");
+        a2.id = EntityId::new("alice-2".into());
+        kg.add_entity(a1).unwrap();
+        kg.add_entity(a2).unwrap();
+
+        graphrag
+            .apply_element_summaries()
+            .await
+            .expect("ollama-enabled fallback path must not error under the cost-guard");
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        for entity in kg.entities() {
+            let d = entity.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("the engineer") && d.contains("the founder"),
+                "expected merged description from concat path, got {:?}",
+                entity.description
+            );
+        }
     }
 }
