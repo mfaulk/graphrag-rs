@@ -151,6 +151,20 @@ let config = Config::from_toml_file("graphrag.toml")?;
 let graphrag = GraphRAG::new(config)?;
 ```
 
+The same element-summary keys are also honoured by the alternate
+`SetConfig`-based loader (`GraphRAG::from_config_file` /
+`SetConfig::to_graphrag_config`). Place them under
+`[entity_extraction.element_summary]` instead:
+
+```toml
+[entity_extraction.element_summary]
+enabled = true
+min_instances = 2
+max_chars_for_concat = 800
+temperature = 0.0
+max_output_tokens = 256
+```
+
 ## Sectoral Templates
 
 Pre-configured templates for specific domains:

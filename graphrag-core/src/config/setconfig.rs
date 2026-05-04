@@ -1127,6 +1127,38 @@ pub struct EntityExtractionTopLevelConfig {
     /// Linking confidence threshold
     #[serde(default = "default_confidence_threshold")]
     pub linking_confidence_threshold: f32,
+
+    /// Element-summary collapse settings (Edge et al. 2024 §2.2). Optional so
+    /// existing TOML files keep working without modification — `None` means
+    /// "use the built-in defaults" rather than overriding fields. Read by
+    /// `to_graphrag_config` and applied to `Config.entities.element_summary`.
+    #[serde(default)]
+    pub element_summary: Option<ElementSummarySetConfig>,
+}
+
+/// TOML-side mirror of `crate::config::ElementSummaryConfig` for SetConfig.
+///
+/// All fields optional so the user can override only the keys they care
+/// about; unset keys fall through to the built-in defaults defined in
+/// `ElementSummaryConfig::default`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ElementSummarySetConfig {
+    /// Master switch. Maps to `ElementSummaryConfig::enabled`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Minimum instances required to trigger collapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_instances: Option<usize>,
+    /// Below this many total characters, descriptions are concatenated
+    /// locally instead of being sent to the LLM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_chars_for_concat: Option<usize>,
+    /// Sampling temperature passed to the chat backend during synthesis.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
+    /// Cap on tokens for the synthesised description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
 }
 
 impl Default for EntityExtractionTopLevelConfig {
@@ -1141,6 +1173,7 @@ impl Default for EntityExtractionTopLevelConfig {
             merge_similarity_threshold: default_merge_threshold(),
             automatic_linking: false,
             linking_confidence_threshold: default_confidence_threshold(),
+            element_summary: None,
         }
     }
 }
@@ -1866,6 +1899,29 @@ impl SetConfig {
             },
         }
 
+        // Map element-summary collapse settings (Edge et al. 2024 §2.2). Only
+        // override fields the user actually set so unspecified keys keep
+        // their built-in defaults. Without this plumbing, users loading
+        // configs through `from_config_file` could not tune or disable the
+        // feature even though the README advertises the keys (#97 review).
+        if let Some(ref es) = self.entity_extraction.element_summary {
+            if let Some(v) = es.enabled {
+                config.entities.element_summary.enabled = v;
+            }
+            if let Some(v) = es.min_instances {
+                config.entities.element_summary.min_instances = v;
+            }
+            if let Some(v) = es.max_chars_for_concat {
+                config.entities.element_summary.max_chars_for_concat = v;
+            }
+            if let Some(v) = es.temperature {
+                config.entities.element_summary.temperature = v;
+            }
+            if let Some(v) = es.max_output_tokens {
+                config.entities.element_summary.max_output_tokens = v;
+            }
+        }
+
         // Map graph building
         config.graph.similarity_threshold = self.pipeline.graph_building.min_relation_score;
         config.graph.max_connections = self.pipeline.graph_building.max_connections_per_node;
@@ -1924,5 +1980,86 @@ impl SetConfig {
         };
 
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SetConfig::to_graphrag_config preserves the built-in element-summary
+    /// defaults when no override section is provided.
+    #[test]
+    fn to_graphrag_config_keeps_element_summary_defaults_when_unset() {
+        let set_config = SetConfig::default();
+        let cfg = set_config.to_graphrag_config();
+        let defaults = crate::config::ElementSummaryConfig::default();
+        assert_eq!(cfg.entities.element_summary.enabled, defaults.enabled);
+        assert_eq!(
+            cfg.entities.element_summary.min_instances,
+            defaults.min_instances
+        );
+        assert_eq!(
+            cfg.entities.element_summary.max_chars_for_concat,
+            defaults.max_chars_for_concat
+        );
+    }
+
+    /// SetConfig::to_graphrag_config maps every overridden element-summary
+    /// field through to `Config.entities.element_summary` (#97 review).
+    #[test]
+    fn to_graphrag_config_plumbs_element_summary_overrides() {
+        let mut set_config = SetConfig::default();
+        set_config.entity_extraction.element_summary = Some(ElementSummarySetConfig {
+            enabled: Some(false),
+            min_instances: Some(5),
+            max_chars_for_concat: Some(12_345),
+            temperature: Some(0.42),
+            max_output_tokens: Some(999),
+        });
+        let cfg = set_config.to_graphrag_config();
+        assert!(!cfg.entities.element_summary.enabled);
+        assert_eq!(cfg.entities.element_summary.min_instances, 5);
+        assert_eq!(cfg.entities.element_summary.max_chars_for_concat, 12_345);
+        assert!((cfg.entities.element_summary.temperature - 0.42).abs() < f32::EPSILON);
+        assert_eq!(cfg.entities.element_summary.max_output_tokens, 999);
+    }
+
+    /// Partial overrides leave unspecified fields at the built-in default.
+    #[test]
+    fn to_graphrag_config_element_summary_partial_override_preserves_defaults() {
+        let mut set_config = SetConfig::default();
+        set_config.entity_extraction.element_summary = Some(ElementSummarySetConfig {
+            enabled: Some(false),
+            ..Default::default()
+        });
+        let cfg = set_config.to_graphrag_config();
+        let defaults = crate::config::ElementSummaryConfig::default();
+        assert!(!cfg.entities.element_summary.enabled);
+        assert_eq!(
+            cfg.entities.element_summary.min_instances, defaults.min_instances,
+            "fields not in the override block must keep their defaults"
+        );
+    }
+
+    /// The TOML keys advertised in the README round-trip through SetConfig
+    /// deserialisation and into `Config.entities.element_summary`.
+    #[test]
+    fn to_graphrag_config_element_summary_round_trips_from_toml() {
+        let toml = r#"
+[entity_extraction.element_summary]
+enabled = false
+min_instances = 4
+max_chars_for_concat = 1234
+temperature = 0.3
+max_output_tokens = 512
+"#;
+        let set_config: SetConfig = toml::from_str(toml).expect("parse");
+        let cfg = set_config.to_graphrag_config();
+        assert!(!cfg.entities.element_summary.enabled);
+        assert_eq!(cfg.entities.element_summary.min_instances, 4);
+        assert_eq!(cfg.entities.element_summary.max_chars_for_concat, 1234);
+        assert!((cfg.entities.element_summary.temperature - 0.3).abs() < f32::EPSILON);
+        assert_eq!(cfg.entities.element_summary.max_output_tokens, 512);
     }
 }
