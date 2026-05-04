@@ -567,6 +567,30 @@ Total Score: (0.0 × 0.5) + (0.5 × 0.3) + (0.3 × 0.2) = 0.21
 
 ```
 
+## Hierarchy Construction
+
+Issue #94 added real multi-level community detection. Prior to that fix, the algorithm
+produced only level 0 (`HierarchicalCommunities.hierarchy` was empty) despite the
+`hierarchical_leiden` name and the `max_levels` config knob.
+
+Current behavior:
+
+1. Run a Leiden pass (local moving + refinement) on the input graph -> level 0 partition.
+2. Build a super-graph: one super-node per community; for every original edge whose endpoints
+   live in different communities add a super-edge between the corresponding super-nodes
+   (multi-edges preserved so unweighted super-node degree = original inter-community edge
+   count). Intra-community edges are dropped.
+3. Run a Leiden pass on the super-graph -> level 1 partition; project the result back onto the
+   original `NodeIndex` space and record parent links.
+4. Repeat until either `max_levels` is reached, the partition stops collapsing
+   (`#communities(level L) == #communities(level L-1)`), or the graph collapses to a single
+   community.
+
+`HierarchicalCommunities.hierarchy` is keyed as
+`HashMap<level, HashMap<community_id, Option<(parent_level, parent_community_id)>>>`.
+Walk leaf -> root by chasing the parent at each level. Top-level (root) communities have
+explicit `None` parents.
+
 ## Testing
 
 Run tests with:
@@ -574,10 +598,12 @@ Run tests with:
 cargo test --package graphrag-core --features leiden --lib graph::leiden
 ```
 
-All 3 tests passing:
+Tests:
 - `test_leiden_basic` - End-to-end algorithm
 - `test_is_well_connected` - Connectivity check
 - `test_config_defaults` - Configuration validation
+- `test_hierarchical_two_tier_graph` - Two-tier synthetic graph yields >=2 levels with parent links
+- `test_hierarchical_max_levels_cap` - `max_levels = 1` produces only level 0, empty hierarchy
 
 ## References
 
