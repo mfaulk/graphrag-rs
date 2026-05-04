@@ -809,7 +809,12 @@ impl LeidenCommunityDetector {
         delta
     }
 
-    /// Count edges from node to a specific community
+    /// Count edges from `node` to *other* nodes in `community`.
+    ///
+    /// Self-loops are excluded: when a super-graph node carries self-loops representing
+    /// internal edges of an aggregated community, those edges always travel with the node
+    /// across moves, so they do not contribute to "edges to community members" in either
+    /// the source or destination side of a modularity-delta calculation.
     fn edges_to_community(
         &self,
         graph: &Graph<String, f32, Undirected>,
@@ -819,7 +824,7 @@ impl LeidenCommunityDetector {
     ) -> usize {
         graph
             .neighbors(node)
-            .filter(|&neighbor| communities.get(&neighbor) == Some(&community))
+            .filter(|&neighbor| neighbor != node && communities.get(&neighbor) == Some(&community))
             .count()
     }
 
@@ -859,11 +864,18 @@ impl LeidenCommunityDetector {
 /// Contract a graph by collapsing each community to a single super-node.
 ///
 /// Recipe (standard Leiden / Louvain aggregation): one super-node per community in the
-/// `assignment`. For every original edge (u, v), if `assignment[u] != assignment[v]` add a new
-/// edge between the corresponding super-nodes; intra-community edges are dropped (they would
-/// only become self-loops and the existing modularity calc ignores them anyway). Multi-edges
-/// are preserved so the unweighted degree of each super-node equals the original
-/// inter-community edge count of its underlying community.
+/// `assignment`. For every original edge (u, v):
+///   - If `assignment[u] != assignment[v]` add an inter-community edge between the
+///     corresponding super-nodes.
+///   - If `assignment[u] == assignment[v]` add **two parallel self-loops** on the super-node.
+///     Petgraph counts each self-loop once in `edges(n).count()`, so two parallel self-loops
+///     contribute 2 to the super-node's edge count — exactly matching the contribution of the
+///     original intra-community edge to `sum_n edges(n).count()` (1 to each endpoint). This
+///     preserves total weighted/unweighted degree across contractions, which is required for
+///     the modularity calculation to remain consistent across hierarchy levels.
+///
+/// Multi-edges and self-loops are preserved so the unweighted degree of each super-node equals
+/// the sum of original edge endpoints attached to its underlying community.
 ///
 /// Returns the super-graph and a `super_node -> source_community_id` mapping the caller uses
 /// to project the next-level partition back onto the original nodes.
@@ -893,11 +905,16 @@ fn build_super_graph(
             continue;
         };
         if ca == cb {
-            continue;
+            // Intra-community edge: add two parallel self-loops to preserve total degree
+            // under petgraph's edges(n).count() semantics (each self-loop counted once).
+            let s = comm_to_super[&ca];
+            super_graph.add_edge(s, s, *edge.weight());
+            super_graph.add_edge(s, s, *edge.weight());
+        } else {
+            let sa = comm_to_super[&ca];
+            let sb = comm_to_super[&cb];
+            super_graph.add_edge(sa, sb, *edge.weight());
         }
-        let sa = comm_to_super[&ca];
-        let sb = comm_to_super[&cb];
-        super_graph.add_edge(sa, sb, *edge.weight());
     }
 
     (super_graph, super_to_comm)
@@ -962,8 +979,11 @@ mod tests {
         assert!(config.use_lcc);
     }
 
-    /// Builds a synthetic two-tier graph: 2 outer cliques, each with 2 inner sub-cliques of 3 nodes.
-    /// Strong intra-sub-clique edges (10), medium intra-outer-clique bridge (3), weak inter-outer edge (1).
+    /// Builds a synthetic two-tier graph: 2 outer cliques, each containing 2 inner sub-cliques
+    /// of 3 nodes. Strong intra-sub-clique edges dominate at level 0 so the leaf partition
+    /// recovers the four sub-cliques; sparse intra-outer bridges (2 per outer-pair) plus a
+    /// single weak inter-outer edge make level-1 contraction merge same-outer sub-cliques
+    /// without merging across outers.
     fn create_two_tier_graph() -> Graph<String, f32, Undirected> {
         let mut graph = Graph::new_undirected();
         let mut nodes = Vec::with_capacity(12);
@@ -1068,5 +1088,27 @@ mod tests {
             .filter(|p| p.is_some())
             .count();
         assert_eq!(parented, 0, "expected no parent links at max_levels=1");
+    }
+
+    /// Total weighted degree must be preserved across super-graph contractions; intra-community
+    /// edges become self-loops on super-nodes rather than being dropped.
+    #[test]
+    fn test_super_graph_preserves_total_degree() {
+        let g = create_two_tier_graph();
+        let degree_g: usize = g.node_indices().map(|n| g.edges(n).count()).sum();
+
+        // Partition: assign each node deterministically to a community matching its sub-clique.
+        let mut partition: HashMap<NodeIndex, usize> = HashMap::new();
+        for (idx, node) in g.node_indices().enumerate() {
+            partition.insert(node, idx / 3); // 4 sub-cliques of 3 nodes
+        }
+
+        let (sg, _) = build_super_graph(&g, &partition);
+        let degree_sg: usize = sg.node_indices().map(|n| sg.edges(n).count()).sum();
+
+        assert_eq!(
+            degree_g, degree_sg,
+            "super-graph dropped edges: g={degree_g}, sg={degree_sg}"
+        );
     }
 }
