@@ -1056,6 +1056,23 @@ pub struct TextConfig {
     pub languages: Vec<String>,
 }
 
+/// Entity extraction strategy.
+///
+/// Resolution order at index time (see [`EntityConfig::resolved_mode`]):
+/// 1. Explicit `mode` field, when set.
+/// 2. Back-compat mapping from the legacy `use_gleaning` boolean.
+/// 3. `Algorithmic` if Ollama is disabled in the active config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityExtractionMode {
+    /// Pattern/regex/capitalization-only extraction. Never invokes the LLM.
+    Algorithmic,
+    /// One LLM call per chunk (no iterative refinement).
+    LlmSinglePass,
+    /// Iterative LLM gleaning per Edge et al. 2024 §2.1.
+    LlmGleaning,
+}
+
 /// Configuration for entity extraction
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityConfig {
@@ -1064,6 +1081,11 @@ pub struct EntityConfig {
 
     /// Types of entities to extract
     pub entity_types: Vec<String>,
+
+    /// Explicit extraction mode. When set, takes precedence over the legacy
+    /// `use_gleaning` flag below.
+    #[serde(default)]
+    pub mode: Option<EntityExtractionMode>,
 
     /// Whether to use LLM-based gleaning for entity extraction
     #[serde(default)]
@@ -1096,6 +1118,29 @@ pub struct EntityConfig {
     /// Element-summary collapse settings (Edge et al. 2024 §2.2).
     #[serde(default)]
     pub element_summary: ElementSummaryConfig,
+}
+
+impl EntityConfig {
+    /// Resolve the active extraction mode, applying the precedence rules
+    /// described on [`EntityExtractionMode`].
+    ///
+    /// `ollama_enabled` should be the value of `config.ollama.enabled` in the
+    /// surrounding `Config`; when false, this method always returns
+    /// `Algorithmic` regardless of the configured mode (the LLM paths
+    /// require a chat backend).
+    pub fn resolved_mode(&self, ollama_enabled: bool) -> EntityExtractionMode {
+        if !ollama_enabled {
+            return EntityExtractionMode::Algorithmic;
+        }
+        if let Some(m) = self.mode {
+            return m;
+        }
+        if self.use_gleaning {
+            EntityExtractionMode::LlmGleaning
+        } else {
+            EntityExtractionMode::LlmSinglePass
+        }
+    }
 }
 
 /// Configuration for element-summary collapse (paper §2.2).
@@ -1513,6 +1558,7 @@ impl Default for Config {
             entities: EntityConfig {
                 min_confidence: default_min_confidence(),
                 entity_types: default_entity_types(),
+                mode: None,
                 use_gleaning: false,
                 max_gleaning_rounds: default_max_gleaning_rounds(),
                 enable_triple_reflection: false,
@@ -1834,6 +1880,7 @@ impl Config {
                 } else {
                     default_entity_types()
                 },
+                mode: None,
                 use_gleaning: parsed["entities"]["use_gleaning"]
                     .as_bool()
                     .unwrap_or(false),
@@ -2477,5 +2524,84 @@ impl Config {
         let content = json::stringify_pretty(config_json, 2);
         fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod entity_mode_tests {
+    use super::*;
+
+    /// Algorithmic mode is forced when Ollama is disabled, even if mode says LLM.
+    #[test]
+    fn resolved_mode_ollama_disabled_forces_algorithmic() {
+        let mut cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: Some(EntityExtractionMode::LlmGleaning),
+            use_gleaning: true,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(false), EntityExtractionMode::Algorithmic);
+        cfg.mode = None;
+        assert_eq!(cfg.resolved_mode(false), EntityExtractionMode::Algorithmic);
+    }
+
+    /// Explicit mode wins over the legacy use_gleaning flag.
+    #[test]
+    fn resolved_mode_explicit_mode_wins_over_use_gleaning() {
+        let cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: Some(EntityExtractionMode::Algorithmic),
+            use_gleaning: true,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::Algorithmic);
+    }
+
+    /// Back-compat: use_gleaning=true maps to LlmGleaning when no mode is set.
+    #[test]
+    fn resolved_mode_use_gleaning_true_maps_to_gleaning() {
+        let cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: None,
+            use_gleaning: true,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::LlmGleaning);
+    }
+
+    /// Back-compat: use_gleaning=false maps to LlmSinglePass when no mode is set.
+    #[test]
+    fn resolved_mode_use_gleaning_false_maps_to_single_pass() {
+        let cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: None,
+            use_gleaning: false,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::LlmSinglePass);
     }
 }

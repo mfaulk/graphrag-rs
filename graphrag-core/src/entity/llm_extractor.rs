@@ -188,7 +188,11 @@ impl LLMEntityExtractor {
 
         tracing::debug!(
             "LLM completion check: {} (raw: {:?})",
-            if is_complete { "COMPLETE" } else { "INCOMPLETE" },
+            if is_complete {
+                "COMPLETE"
+            } else {
+                "INCOMPLETE"
+            },
             llm_response.trim()
         );
 

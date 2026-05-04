@@ -241,9 +241,10 @@ mod tests {
     async fn collapse_single_description_returns_none() {
         let cfg = ElementSummaryConfig::default();
         let backend = RecordingBackend::new("synth");
-        let out = collapse_descriptions("entity", "Tom", &["only one".into()], &cfg, Some(&backend))
-            .await
-            .unwrap();
+        let out =
+            collapse_descriptions("entity", "Tom", &["only one".into()], &cfg, Some(&backend))
+                .await
+                .unwrap();
         assert!(out.is_none());
         assert_eq!(backend.call_count(), 0, "must not call LLM for 1 instance");
     }
@@ -284,11 +285,10 @@ mod tests {
         };
         let big = "x".repeat(60);
         let backend = RecordingBackend::new("synthesized");
-        let out =
-            collapse_descriptions("entity", "Tom", &[big.clone(), big], &cfg, Some(&backend))
-                .await
-                .unwrap()
-                .unwrap();
+        let out = collapse_descriptions("entity", "Tom", &[big.clone(), big], &cfg, Some(&backend))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(out, "synthesized");
         assert_eq!(backend.call_count(), 1);
     }
