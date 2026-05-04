@@ -6,10 +6,13 @@
 //!   (c) Source-chunk text      — chunks where the seed entities were mentioned
 //!   (d) Covering community context — community summaries the seeds belong to
 //!
-//! Overflow drops from the lowest-priority tier first; tiers (b–d) are skipped
-//! whole if even one item would exceed the remaining budget. Token counting
-//! uses a `chars / 4` heuristic — accurate enough for budget gating, swappable
-//! for `tiktoken-rs` once it lands on the workspace (see PR #126).
+//! Packing is item-by-item (partial-pack), matching the Edge et al. paper:
+//! within a tier, items that fit are pushed into the context; the first item
+//! that overflows the remaining budget is recorded in `dropped_tier` and the
+//! rest of that tier — *and every lower-priority tier* — is skipped. Earlier
+//! items already pushed are kept. Token counting uses a `chars / 4` heuristic
+//! — accurate enough for budget gating, swappable for `tiktoken-rs` once it
+//! lands on the workspace (see PR #126).
 
 use crate::{
     core::{ChunkId, Entity, EntityId, KnowledgeGraph, Relationship},
@@ -18,6 +21,11 @@ use crate::{
 use std::collections::HashSet;
 
 /// Token budget tiers, in pack-priority order. Lower index = higher priority.
+///
+/// Tiers are packed item-by-item (partial-pack). When a single item exceeds
+/// the remaining budget, that tier records itself in `LocalContext::dropped_tier`
+/// and the packer skips every lower-priority tier; earlier items already
+/// pushed within the tier are retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocalContextTier {
     /// Entity descriptions (highest priority).
@@ -65,9 +73,11 @@ impl Default for LocalSearchConfig {
 
 /// Packed local-search context, organized by priority tier.
 ///
-/// Each `Vec<String>` holds the items that fit in the budget for that tier.
-/// `dropped_tier` records the first tier that overflowed (if any) so callers
-/// can surface budget-exhaustion to users.
+/// Each `Vec<String>` holds the items that fit in the budget for that tier
+/// (partial-pack: items below the budget are kept; the first item that would
+/// overflow stops packing for that tier and every lower-priority tier).
+/// `dropped_tier` records the first tier whose items hit the budget cap
+/// (if any) so callers can surface budget-exhaustion to users.
 #[derive(Debug, Clone, Default)]
 pub struct LocalContext {
     /// Names of the seed entities the context was anchored on.
@@ -84,7 +94,9 @@ pub struct LocalContext {
     pub total_tokens: usize,
     /// Token budget the context was packed against.
     pub budget: usize,
-    /// First tier that hit the budget cap, if any.
+    /// First tier whose items hit the budget cap, if any. The named tier may
+    /// still have packed earlier items before the overflow item triggered
+    /// `dropped` (partial-pack semantics).
     pub dropped_tier: Option<LocalContextTier>,
 }
 
@@ -538,6 +550,98 @@ mod tests {
         assert_eq!(LocalContextTier::Relationships.label(), "Relationships");
         assert_eq!(LocalContextTier::SourceChunks.label(), "Sources");
         assert_eq!(LocalContextTier::Community.label(), "Communities");
+    }
+
+    /// Partial-pack semantics: when the budget fits the first relationship
+    /// but not the second, exactly one relationship is packed and
+    /// `dropped_tier == Some(Relationships)`. Pins finding #2 from the #102
+    /// review (the doc previously over-promised "whole-tier-skip").
+    #[test]
+    fn local_search_partial_packs_relationships_when_budget_allows_some() {
+        let mut g = KnowledgeGraph::new();
+        g.add_chunk(make_chunk("c1", "doc1", "Alice and Bob."))
+            .unwrap();
+
+        let alice = Entity::new(
+            EntityId::new("alice".into()),
+            "Alice".into(),
+            "PERSON".into(),
+            0.95,
+        );
+        let bob = Entity::new(
+            EntityId::new("bob".into()),
+            "Bob".into(),
+            "PERSON".into(),
+            0.95,
+        );
+        let carol = Entity::new(
+            EntityId::new("carol".into()),
+            "Carol".into(),
+            "PERSON".into(),
+            0.95,
+        );
+        g.add_entity(alice.clone()).unwrap();
+        g.add_entity(bob.clone()).unwrap();
+        g.add_entity(carol.clone()).unwrap();
+
+        let r_light = Relationship::new(
+            EntityId::new("alice".into()),
+            EntityId::new("bob".into()),
+            "MET".into(),
+            0.9,
+        );
+        let r_heavy = Relationship::new(
+            EntityId::new("alice".into()),
+            EntityId::new("carol".into()),
+            "COLLABORATED_EXTENSIVELY_WITH".into(),
+            0.9,
+        );
+        // Insert the heavy edge first; petgraph yields outgoing edges in
+        // reverse insertion order, so the light edge is encountered first
+        // by the partial packer (and fits), then the heavy edge overflows.
+        g.add_relationship(r_heavy.clone()).unwrap();
+        g.add_relationship(r_light.clone()).unwrap();
+
+        // Pre-compute exact costs to bracket the budget.
+        let alice_desc = format_entity_description(&alice);
+        let r_light_desc = format_relationship(&alice, &bob, &r_light);
+        let r_heavy_desc = format_relationship(&alice, &carol, &r_heavy);
+        let entity_cost = estimate_tokens(&alice_desc);
+        let r_light_cost = estimate_tokens(&r_light_desc);
+        let r_heavy_cost = estimate_tokens(&r_heavy_desc);
+        // Sanity: heavy relationship must be strictly heavier than the light
+        // one so the budget below can fit one but not both.
+        assert!(
+            r_heavy_cost > r_light_cost,
+            "fixture must have r_heavy heavier than r_light ({} vs {})",
+            r_heavy_cost,
+            r_light_cost
+        );
+
+        // Budget = entities + lighter relationship. The heavier one must
+        // overflow and trip `dropped_tier == Relationships`.
+        let budget = entity_cost + r_light_cost;
+
+        let ls = LocalSearch::new(
+            &g,
+            LocalSearchConfig {
+                budget,
+                top_k_entities: 1, // only Alice — keeps tier (a) deterministic
+                include_neighbors: true,
+            },
+        );
+        let ctx = ls.search("Tell me about Alice", budget).unwrap();
+
+        assert_eq!(ctx.entity_descriptions.len(), 1);
+        assert_eq!(
+            ctx.relationship_descriptions.len(),
+            1,
+            "partial-pack: exactly one relationship must fit, got {:?}",
+            ctx.relationship_descriptions
+        );
+        assert_eq!(ctx.dropped_tier, Some(LocalContextTier::Relationships));
+        // And tier (c) must be skipped because dropped is set.
+        assert!(ctx.source_chunks.is_empty());
     }
 
     /// Word-level matching must select short acronym entities like `AI` that
