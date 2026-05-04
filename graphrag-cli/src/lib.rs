@@ -95,6 +95,15 @@ pub enum Commands {
         /// Configuration file (required if not already initialized)
         #[arg(short, long)]
         config: Option<PathBuf>,
+
+        /// Retrieval mode: "hybrid" (default, multi-strategy) or "local"
+        /// (entity-anchored, token-budgeted; Edge et al. 2024 Local Search).
+        #[arg(long, default_value = "hybrid", value_parser = ["hybrid", "local"])]
+        mode: String,
+
+        /// Token budget for `--mode local` context packer. Ignored otherwise.
+        #[arg(long, default_value_t = 2048)]
+        budget: usize,
     },
 
     /// List entities in the knowledge graph (deprecated: prefer TUI with /entities)
@@ -212,7 +221,12 @@ pub async fn run() -> Result<()> {
                 println!("✅ {}", result);
             }
         },
-        Some(Commands::Query { query, config }) => {
+        Some(Commands::Query {
+            query,
+            config,
+            mode,
+            budget,
+        }) => {
             setup_logging(cli.debug)?;
             eprintln!(
                 "⚠️  `query` is deprecated. Prefer: graphrag tui, then /query {}",
@@ -220,20 +234,52 @@ pub async fn run() -> Result<()> {
             );
 
             let handler = init_handler(config).await?;
-            let (answer, raw_results) = handler.query_with_raw(&query).await?;
 
-            if cli.format == "json" {
-                println!(
-                    "{}",
-                    serde_json::json!({"query": query, "answer": answer, "sources": raw_results})
-                );
+            if mode == "local" {
+                let ctx = handler.query_local(&query, budget).await?;
+                if cli.format == "json" {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "query": query,
+                            "mode": "local",
+                            "budget": budget,
+                            "total_tokens": ctx.total_tokens,
+                            "seed_entities": ctx.seed_entities,
+                            "entity_descriptions": ctx.entity_descriptions,
+                            "relationship_descriptions": ctx.relationship_descriptions,
+                            "source_chunks": ctx.source_chunks,
+                            "community_context": ctx.community_context,
+                            "dropped_tier": ctx.dropped_tier.map(|t| t.label()),
+                        })
+                    );
+                } else {
+                    println!("📝 Query: {}\n", query);
+                    println!(
+                        "🎯 Mode: local  |  Budget: {} tokens  |  Used: {} tokens",
+                        budget, ctx.total_tokens
+                    );
+                    if let Some(tier) = ctx.dropped_tier {
+                        println!("⚠️  Truncated at tier: {}", tier.label());
+                    }
+                    println!("\n{}", ctx.to_prompt());
+                }
             } else {
-                println!("📝 Query: {}\n", query);
-                println!("💡 Answer:\n{}\n", answer);
-                if !raw_results.is_empty() {
-                    println!("📚 Sources:");
-                    for (i, src) in raw_results.iter().enumerate() {
-                        println!("   {}. {}", i + 1, src);
+                let (answer, raw_results) = handler.query_with_raw(&query).await?;
+
+                if cli.format == "json" {
+                    println!(
+                        "{}",
+                        serde_json::json!({"query": query, "answer": answer, "sources": raw_results})
+                    );
+                } else {
+                    println!("📝 Query: {}\n", query);
+                    println!("💡 Answer:\n{}\n", answer);
+                    if !raw_results.is_empty() {
+                        println!("📚 Sources:");
+                        for (i, src) in raw_results.iter().enumerate() {
+                            println!("   {}. {}", i + 1, src);
+                        }
                     }
                 }
             }
