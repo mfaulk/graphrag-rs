@@ -238,7 +238,9 @@ impl ParquetPersistence {
             return Ok(());
         }
 
-        // Build Arrow schema for entities
+        // Build Arrow schema for entities. `description` is nullable so old
+        // parquet files written before #97 still load (the reader looks the
+        // column up by name and tolerates its absence).
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
@@ -250,6 +252,7 @@ impl ParquetPersistence {
                 DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
                 true,
             ),
+            Field::new("description", DataType::Utf8, true),
         ]));
 
         // Convert entities to Arrow arrays
@@ -279,6 +282,9 @@ impl ParquetPersistence {
         }
         let embeddings = embedding_builder.finish();
 
+        // Build descriptions array (nullable Utf8).
+        let descriptions: StringArray = entities.iter().map(|e| e.description.as_deref()).collect();
+
         // Create RecordBatch
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -289,6 +295,7 @@ impl ParquetPersistence {
                 Arc::new(confidences),
                 Arc::new(mention_counts),
                 Arc::new(embeddings),
+                Arc::new(descriptions),
             ],
         )
         .map_err(|e| GraphRAGError::Config {
@@ -477,6 +484,16 @@ impl ParquetPersistence {
                     message: "Invalid embedding column type".to_string(),
                 })?;
 
+            // `description` was added in #97. Resolve it by name so that
+            // legacy parquet files written before this column existed still
+            // load — `column_by_name` returns `None` and we leave description
+            // unset for those rows.
+            let descriptions = batch
+                .schema()
+                .index_of("description")
+                .ok()
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<StringArray>());
+
             for i in 0..batch.num_rows() {
                 // Extract embedding
                 let embedding = if !embeddings.is_null(i) {
@@ -506,6 +523,13 @@ impl ParquetPersistence {
                     confidences.value(i),
                 );
                 entity.embedding = embedding;
+                entity.description = descriptions.and_then(|arr| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                });
                 entities.push(entity);
             }
         }
@@ -1493,6 +1517,55 @@ mod tests {
         let entities = persistence.load_entities().unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Test Entity");
+    }
+
+    /// Entity descriptions survive a parquet round-trip (#97).
+    #[test]
+    #[cfg(feature = "persistent-storage")]
+    fn entity_description_survives_save_and_load_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ParquetPersistence::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        graph
+            .add_entity(
+                Entity::new(
+                    EntityId::new("alice".to_string()),
+                    "Alice".to_string(),
+                    "PERSON".to_string(),
+                    0.9,
+                )
+                .with_description("Alice the engineer | Alice the founder".to_string()),
+            )
+            .unwrap();
+        graph
+            .add_entity(Entity::new(
+                EntityId::new("bob".to_string()),
+                "Bob".to_string(),
+                "PERSON".to_string(),
+                0.8,
+            ))
+            .unwrap();
+
+        persistence.save_entities(&graph).unwrap();
+        let entities = persistence.load_entities().unwrap();
+
+        let alice = entities
+            .iter()
+            .find(|e| e.name == "Alice")
+            .expect("alice present");
+        assert_eq!(
+            alice.description.as_deref(),
+            Some("Alice the engineer | Alice the founder")
+        );
+        let bob = entities
+            .iter()
+            .find(|e| e.name == "Bob")
+            .expect("bob present");
+        assert!(
+            bob.description.is_none(),
+            "entities without a description must remain None after round-trip"
+        );
     }
 
     // Regression for #24: entity mentions must survive a save/load round
