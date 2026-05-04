@@ -55,6 +55,16 @@ pub struct RetrievalSystem {
     /// or by `with_embedder` when an embedder is injected via the registry.
     #[cfg(feature = "async")]
     embedder: Option<crate::core::registry::DynAsyncEmbedder>,
+    /// Cached output dimension of the configured async embedder. Used to
+    /// size the hash fallback so an OpenAI-indexed corpus (1536 dim) is
+    /// never queried with a config-sized vector (e.g. 768) — that
+    /// mismatch makes cosine similarity return 0 and the search returns
+    /// nothing. Seeded from `AsyncEmbedder::dimension()` at construction
+    /// and refined in `embed_text` after the first successful embed if
+    /// the provider's reported value disagrees with reality (issue #91
+    /// review).
+    #[cfg(feature = "async")]
+    fallback_dim: std::sync::Mutex<usize>,
     /// Whether to silently fall back to the hash generator when the
     /// configured embedder fails at runtime. Mirrors
     /// `config.embeddings.fallback_to_hash`.
@@ -109,11 +119,10 @@ impl RetrievalSystem {
         let vector_store =
             std::sync::Arc::new(crate::vector::memory_store::MemoryVectorStore::new());
 
-        // Use the configured embedding dimension for the hash fallback so the
-        // hot retrieval path actually respects `[embeddings]` config. The
-        // hash generator is also used when the configured backend is "hash"
-        // or when fallback_to_hash kicks in after a runtime API failure.
-        let embedding_dim = config.embeddings.dimension.max(1);
+        // Configured dimension is the *initial* fallback size; once the
+        // embedder produces a real vector, `embed_text` updates the
+        // fallback to match (issue #91 review).
+        let configured_dim = config.embeddings.dimension.max(1);
 
         // Resolve the embedder: registry override wins; otherwise dispatch
         // on `config.embeddings.backend`. A construction failure is fatal
@@ -140,10 +149,20 @@ impl RetrievalSystem {
             }
         };
 
+        // Trust the embedder's `dimension()` over the config: providers
+        // know their model's actual output size, and a typo in
+        // `[embeddings].dimension` would otherwise produce length-mismatched
+        // hash fallbacks that silently zero out cosine similarities.
+        let fallback_dim = embedder
+            .as_ref()
+            .map(|e| e.dimension().max(1))
+            .unwrap_or(configured_dim);
+
         Ok(Self {
             vector_store,
-            embedding_generator: std::sync::Mutex::new(EmbeddingGenerator::new(embedding_dim)),
+            embedding_generator: std::sync::Mutex::new(EmbeddingGenerator::new(fallback_dim)),
             embedder,
+            fallback_dim: std::sync::Mutex::new(fallback_dim),
             fallback_to_hash: config.embeddings.fallback_to_hash,
             config: retrieval_config,
             #[cfg(feature = "parallel-processing")]
@@ -205,7 +224,28 @@ impl RetrievalSystem {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
         if let Some(embedder) = self.embedder.as_ref().cloned() {
             match embedder.embed(text).await {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    // Track the actual provider dimension so any later
+                    // hash fallback produces vectors that match the
+                    // already-indexed embeddings. The provider's
+                    // self-reported `dimension()` may not match what it
+                    // actually returns (e.g. a model swap), and the user's
+                    // config may not match either; the wire format is the
+                    // source of truth (issue #91 review).
+                    if !v.is_empty() {
+                        if let Ok(mut dim) = self.fallback_dim.lock() {
+                            if *dim != v.len() {
+                                *dim = v.len();
+                                if let Ok(mut gen) = self.embedding_generator.lock() {
+                                    if gen.dimension() != v.len() {
+                                        *gen = EmbeddingGenerator::new(v.len());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(v);
+                },
                 Err(e) => {
                     if self.fallback_to_hash {
                         #[cfg(feature = "tracing")]
@@ -637,12 +677,16 @@ impl RetrievalSystem {
         // EmbeddingGenerator operations can be parallelized with rayon
 
         let retrieval_config = RetrievalConfig::default();
+        #[cfg(feature = "async")]
+        let fallback_dim = std::sync::Mutex::new(embedding_generator.dimension().max(1));
 
         Ok(Self {
             vector_store,
             embedding_generator: std::sync::Mutex::new(embedding_generator),
             #[cfg(feature = "async")]
             embedder: None,
+            #[cfg(feature = "async")]
+            fallback_dim,
             fallback_to_hash: true,
             config: retrieval_config,
             parallel_processor: Some(parallel_processor),

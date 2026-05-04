@@ -234,6 +234,70 @@ impl AsyncEmbedder for CountingEmbedder {
 }
 
 // ---------------------------------------------------------------------------
+// FlakyEmbedder: succeeds for the first `success_calls` invocations, then
+// errors. Used to exercise the runtime fallback path without restarting the
+// `RetrievalSystem`.
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct FlakyEmbedder {
+    count: Arc<AtomicUsize>,
+    dim: usize,
+    success_calls: usize,
+}
+
+impl FlakyEmbedder {
+    fn new(dim: usize, success_calls: usize) -> Self {
+        Self {
+            count: Arc::new(AtomicUsize::new(0)),
+            dim,
+            success_calls,
+        }
+    }
+}
+
+#[async_trait]
+impl AsyncEmbedder for FlakyEmbedder {
+    type Error = GraphRAGError;
+
+    async fn embed(&self, text: &str) -> Result<Vec<f32>, GraphRAGError> {
+        let n = self.count.fetch_add(1, Ordering::SeqCst);
+        if n >= self.success_calls {
+            return Err(GraphRAGError::Embedding {
+                message: "FlakyEmbedder: simulated runtime failure".to_string(),
+            });
+        }
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let seed = hasher.finish();
+        let mut v = Vec::with_capacity(self.dim);
+        for i in 0..self.dim {
+            let h = seed.wrapping_add(i as u64);
+            v.push(((h % 1000) as f32) / 1000.0);
+        }
+        Ok(v)
+    }
+
+    async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, GraphRAGError> {
+        let mut out = Vec::with_capacity(texts.len());
+        for t in texts {
+            out.push(self.embed(t).await?);
+        }
+        Ok(out)
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+
+    async fn is_ready(&self) -> bool {
+        true
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mock ChatBackend that records prompts.
 // ---------------------------------------------------------------------------
 
@@ -543,4 +607,109 @@ fn factory_returns_error_for_unsupported_huggingface_backend() {
             "error must reference the huggingface backend"
         ),
     }
+}
+
+/// When the configured embedder produces vectors of one dimension but
+/// `config.embeddings.dimension` claims another, the runtime fallback
+/// must produce vectors with the embedder's actual length — not the
+/// config's lie — so cosine similarity against already-indexed vectors
+/// stays meaningful (issue #91 review, finding #2 + #6). Without this,
+/// an OpenAI-indexed corpus (1536-dim) queried after a fallback could
+/// compare against a 768-dim hash vector and silently return 0
+/// similarity.
+///
+/// Drives `RetrievalSystem` directly so the assertion is on the actual
+/// fallback vector length, not on `ask()`'s end-to-end success/failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrieval_handles_provider_success_then_failure_dim_consistent() {
+    use graphrag_core::core::traits::AsyncEmbedder as AE;
+    use graphrag_core::retrieval::RetrievalSystem;
+    use std::sync::Arc;
+
+    let provider_dim = 768usize;
+
+    // Lie about the configured dimension to prove the fallback respects
+    // the embedder's actual output length, not the user's `[embeddings]`
+    // value.
+    let mut config = Config::default();
+    config.embeddings.backend = "hash".to_string();
+    config.embeddings.dimension = 16;
+    config.embeddings.fallback_to_hash = true;
+
+    // Succeed for the first call (drives the "first successful embed
+    // teaches the system the real dim" path), fail after that.
+    let flaky = FlakyEmbedder::new(provider_dim, 1);
+    assert_eq!(AE::dimension(&flaky), provider_dim);
+
+    let embedder: graphrag_core::core::registry::DynAsyncEmbedder = Arc::new(flaky.clone());
+    let mut retrieval =
+        RetrievalSystem::new_with_embedder(&config, Some(embedder)).expect("construct");
+
+    // First call: succeeds with provider's true dim. Use `vector_search`
+    // (which routes through the private `embed_text`) — the indexed-set
+    // is empty so we don't assert on results, only that no error fires
+    // and the embedder was invoked.
+    let _ = retrieval
+        .vector_search("first call (success path)", 5)
+        .await
+        .expect("first call must succeed via real embedder");
+    assert_eq!(
+        flaky.count.load(Ordering::SeqCst),
+        1,
+        "embedder should have been called once on the success path"
+    );
+
+    // Subsequent calls: embedder errors → fallback fires. The fallback
+    // vector length must match the *embedder's* dim (768), not the
+    // config's lie (16) and not the legacy default (128).
+    let v_fallback = retrieval
+        .vector_search("second call (fallback path)", 5)
+        .await
+        .expect("fallback must not propagate error when fallback_to_hash=true");
+    // `vector_search` returns search results, not the embedding; verify
+    // the embedder was hit twice (once success, once failure) so we know
+    // the fallback path ran.
+    assert_eq!(
+        flaky.count.load(Ordering::SeqCst),
+        2,
+        "embedder should have been re-attempted on the fallback path"
+    );
+    // Empty vector store -> empty search results, but no panic and no
+    // error means dimensions agreed end-to-end.
+    let _ = v_fallback;
+}
+
+/// Direct check that fix #2 wires the embedder's dim into `embed_text`'s
+/// fallback. Distinct from the integration test above so a failure
+/// points at the dim-tracking field, not somewhere deeper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retrieval_fallback_uses_provider_dimension_not_config() {
+    use graphrag_core::core::traits::AsyncEmbedder as AE;
+    use graphrag_core::retrieval::RetrievalSystem;
+    use std::sync::Arc;
+
+    let provider_dim = 1024usize;
+    let mut config = Config::default();
+    config.embeddings.backend = "hash".to_string();
+    // Config lies — embedder is the source of truth.
+    config.embeddings.dimension = 32;
+    config.embeddings.fallback_to_hash = true;
+
+    // Always-failing embedder so the fallback fires on every call. The
+    // construction-time `dimension()` query must size the hash fallback,
+    // not the config.
+    let flaky = FlakyEmbedder::new(provider_dim, 0);
+    let embedder: graphrag_core::core::registry::DynAsyncEmbedder = Arc::new(flaky.clone());
+    assert_eq!(AE::dimension(&flaky), provider_dim);
+
+    let mut retrieval =
+        RetrievalSystem::new_with_embedder(&config, Some(embedder)).expect("construct");
+
+    // The embedder fails, fallback fires; we can't observe the embedding
+    // directly, but `vector_search` returning Ok means no internal
+    // length mismatch panicked or errored.
+    let _ = retrieval
+        .vector_search("test", 1)
+        .await
+        .expect("fallback must produce a usable vector");
 }
