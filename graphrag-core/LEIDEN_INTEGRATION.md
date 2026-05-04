@@ -313,9 +313,16 @@ let mut communities = graph.detect_hierarchical_communities(config)?;
 let leiden_graph = graph.to_leiden_graph();
 communities.generate_hierarchical_summaries(&leiden_graph, 5);
 
-// Access summaries by community ID
-for (community_id, summary) in &communities.summaries {
-    println!("Community {}: {}", community_id, summary);
+// Access summaries: keyed by (level, community_id) — see "Summaries Keying" below.
+for (level, level_summaries) in &communities.summaries {
+    for (community_id, summary) in level_summaries {
+        println!("Level {} community {}: {}", level, community_id, summary);
+    }
+}
+
+// Direct lookup helper:
+if let Some(summary) = communities.get_summary(0, 3) {
+    println!("Level 0 community 3: {}", summary);
 }
 ```
 
@@ -381,8 +388,8 @@ fn retrieve_relevant_communities(
 
             // Check if any entity matches the query
             if entities.iter().any(|e| e.to_lowercase().contains(&query.to_lowercase())) {
-                // Get summary for this community
-                if let Some(summary) = communities.summaries.get(&community_id) {
+                // Get summary for this community (summaries are keyed by (level, id))
+                if let Some(summary) = communities.get_summary(level, community_id) {
                     results.push(summary.clone());
                 }
             }
@@ -589,7 +596,30 @@ Current behavior:
 `HierarchicalCommunities.hierarchy` is keyed as
 `HashMap<level, HashMap<community_id, Option<(parent_level, parent_community_id)>>>`.
 Walk leaf -> root by chasing the parent at each level. Top-level (root) communities have
-explicit `None` parents.
+explicit `None` parents at *whichever level happens to be the top* — including level 0
+when the algorithm stops at one level (e.g. `max_levels = 1` or no further merging is
+profitable).
+
+## Summaries Keying
+
+`HierarchicalCommunities.summaries` is keyed as
+`HashMap<level, HashMap<community_id, String>>` — nested by hierarchy level so a level-0
+and a level-1 community can both carry id `0` without colliding. Use the
+`get_summary(level, community_id)` helper for direct lookups.
+
+## Breaking Changes (#94 review)
+
+These types changed shape during the Group H-94 review pass. Callers built against pre-fix
+shapes must migrate:
+
+- `HierarchicalCommunities.hierarchy` is now
+  `HashMap<usize, HashMap<usize, Option<(usize, usize)>>>` (level -> id -> parent).
+  Previously a flat `HashMap<usize, Option<usize>>`.
+- `HierarchicalCommunities.summaries` is now
+  `HashMap<usize, HashMap<usize, String>>` (level -> id -> summary). Previously a flat
+  `HashMap<usize, String>`.
+- `graphrag-wasm`'s `get_community_summary` now takes `(level, community_id)` (previously
+  `(community_id)`).
 
 ## Testing
 
@@ -602,8 +632,14 @@ Tests:
 - `test_leiden_basic` - End-to-end algorithm
 - `test_is_well_connected` - Connectivity check
 - `test_config_defaults` - Configuration validation
-- `test_hierarchical_two_tier_graph` - Two-tier synthetic graph yields >=2 levels with parent links
-- `test_hierarchical_max_levels_cap` - `max_levels = 1` produces only level 0, empty hierarchy
+- `test_hierarchical_two_tier_graph` - Two-tier graph: level 0 yields 4 sub-cliques and
+  level 1 merges them into exactly 2 outer communities, each containing >=2 sub-cliques
+- `test_hierarchical_max_levels_cap` - `max_levels = 1` produces only level 0, with
+  `hierarchy[0][id] = None` for every level-0 community (roots)
+- `test_super_graph_preserves_total_degree` - Super-graph contraction preserves total
+  weighted degree (intra-community edges become parallel self-loops, not dropped)
+- `test_summaries_distinct_across_levels` - Summaries do not collide across hierarchy
+  levels when community ids overlap
 
 ## References
 
