@@ -745,3 +745,64 @@ impl OllamaClient {
         })
     }
 }
+
+/// `ChatBackend` adapter wrapping an `OllamaClient`.
+///
+/// Lets features that dispatch through the abstract `ChatBackend` trait
+/// (e.g. element-summary collapse) fall back to the built-in Ollama client
+/// when no external backend was injected via
+/// [`crate::GraphRAG::set_chat_backend`] (#97 review).
+#[cfg(feature = "async")]
+pub struct OllamaChatBackend {
+    client: OllamaClient,
+}
+
+#[cfg(feature = "async")]
+impl OllamaChatBackend {
+    /// Build a new adapter from an existing client.
+    pub fn new(client: OllamaClient) -> Self {
+        Self { client }
+    }
+
+    /// Build a new adapter directly from an `OllamaConfig`.
+    pub fn from_config(config: OllamaConfig) -> Self {
+        Self {
+            client: OllamaClient::new(config),
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+#[async_trait::async_trait]
+impl crate::core::backend::ChatBackend for OllamaChatBackend {
+    async fn complete(
+        &self,
+        prompt: &str,
+        params: &crate::core::backend::ChatParams,
+    ) -> Result<String> {
+        let ollama_params = OllamaGenerationParams {
+            num_predict: params.max_tokens,
+            temperature: params.temperature,
+            num_ctx: params.num_ctx,
+            ..Default::default()
+        };
+        self.client
+            .generate_with_params(prompt, ollama_params)
+            .await
+    }
+}
+
+#[cfg(all(test, feature = "async"))]
+mod chat_backend_tests {
+    use super::*;
+    use crate::core::backend::ChatBackend;
+
+    /// `OllamaChatBackend` constructs from a config and is usable as a
+    /// trait object — required so element-summary collapse can fall back
+    /// to Ollama when no external backend was injected (#97 review).
+    #[test]
+    fn ollama_chat_backend_constructs_and_is_object_safe() {
+        let backend = OllamaChatBackend::from_config(OllamaConfig::default());
+        let _trait_obj: &dyn ChatBackend = &backend;
+    }
+}

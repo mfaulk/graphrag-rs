@@ -238,7 +238,9 @@ impl ParquetPersistence {
             return Ok(());
         }
 
-        // Build Arrow schema for entities
+        // Build Arrow schema for entities. `description` is nullable so old
+        // parquet files written before #97 still load (the reader looks the
+        // column up by name and tolerates its absence).
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("name", DataType::Utf8, false),
@@ -250,6 +252,7 @@ impl ParquetPersistence {
                 DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
                 true,
             ),
+            Field::new("description", DataType::Utf8, true),
         ]));
 
         // Convert entities to Arrow arrays
@@ -279,6 +282,9 @@ impl ParquetPersistence {
         }
         let embeddings = embedding_builder.finish();
 
+        // Build descriptions array (nullable Utf8).
+        let descriptions: StringArray = entities.iter().map(|e| e.description.as_deref()).collect();
+
         // Create RecordBatch
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -289,6 +295,7 @@ impl ParquetPersistence {
                 Arc::new(confidences),
                 Arc::new(mention_counts),
                 Arc::new(embeddings),
+                Arc::new(descriptions),
             ],
         )
         .map_err(|e| GraphRAGError::Config {
@@ -477,6 +484,16 @@ impl ParquetPersistence {
                     message: "Invalid embedding column type".to_string(),
                 })?;
 
+            // `description` was added in #97. Resolve it by name so that
+            // legacy parquet files written before this column existed still
+            // load — `column_by_name` returns `None` and we leave description
+            // unset for those rows.
+            let descriptions = batch
+                .schema()
+                .index_of("description")
+                .ok()
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<StringArray>());
+
             for i in 0..batch.num_rows() {
                 // Extract embedding
                 let embedding = if !embeddings.is_null(i) {
@@ -506,6 +523,13 @@ impl ParquetPersistence {
                     confidences.value(i),
                 );
                 entity.embedding = embedding;
+                entity.description = descriptions.and_then(|arr| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                });
                 entities.push(entity);
             }
         }
@@ -639,7 +663,9 @@ impl ParquetPersistence {
             return Ok(());
         }
 
-        // Build Arrow schema for relationships
+        // Build Arrow schema for relationships. `description` is nullable so
+        // older parquet files (no column at all) load cleanly via
+        // `column_by_name` when the column is absent (#97 review).
         let schema = Arc::new(Schema::new(vec![
             Field::new("source", DataType::Utf8, false),
             Field::new("target", DataType::Utf8, false),
@@ -650,6 +676,7 @@ impl ParquetPersistence {
                 DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
                 true,
             ),
+            Field::new("description", DataType::Utf8, true),
         ]));
 
         // Convert relationships to Arrow arrays
@@ -677,6 +704,12 @@ impl ParquetPersistence {
         }
         let contexts = context_builder.finish();
 
+        // Build descriptions array (nullable Utf8).
+        let descriptions: StringArray = relationships
+            .iter()
+            .map(|r| r.description.as_deref())
+            .collect();
+
         // Create RecordBatch
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -686,6 +719,7 @@ impl ParquetPersistence {
                 Arc::new(types),
                 Arc::new(confidences),
                 Arc::new(contexts),
+                Arc::new(descriptions),
             ],
         )
         .map_err(|e| GraphRAGError::Config {
@@ -782,6 +816,15 @@ impl ParquetPersistence {
                     message: "Invalid confidence column type".to_string(),
                 })?;
 
+            // `description` was added in #97 review. Resolve it by name so
+            // that legacy parquet files written before this column existed
+            // still load.
+            let rel_descriptions = batch
+                .schema()
+                .index_of("description")
+                .ok()
+                .and_then(|idx| batch.column(idx).as_any().downcast_ref::<StringArray>());
+
             let contexts = batch
                 .column(4)
                 .as_any()
@@ -809,13 +852,20 @@ impl ParquetPersistence {
                     }
                 }
 
-                let relationship = Relationship::new(
+                let mut relationship = Relationship::new(
                     EntityId::new(sources.value(i).to_string()),
                     EntityId::new(targets.value(i).to_string()),
                     types.value(i).to_string(),
                     confidences.value(i),
                 )
                 .with_context(context);
+                relationship.description = rel_descriptions.and_then(|arr| {
+                    if arr.is_null(i) {
+                        None
+                    } else {
+                        Some(arr.value(i).to_string())
+                    }
+                });
 
                 relationships.push(relationship);
             }
@@ -1493,6 +1543,117 @@ mod tests {
         let entities = persistence.load_entities().unwrap();
         assert_eq!(entities.len(), 1);
         assert_eq!(entities[0].name, "Test Entity");
+    }
+
+    /// Entity descriptions survive a parquet round-trip (#97).
+    #[test]
+    #[cfg(feature = "persistent-storage")]
+    fn entity_description_survives_save_and_load_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ParquetPersistence::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        graph
+            .add_entity(
+                Entity::new(
+                    EntityId::new("alice".to_string()),
+                    "Alice".to_string(),
+                    "PERSON".to_string(),
+                    0.9,
+                )
+                .with_description("Alice the engineer | Alice the founder".to_string()),
+            )
+            .unwrap();
+        graph
+            .add_entity(Entity::new(
+                EntityId::new("bob".to_string()),
+                "Bob".to_string(),
+                "PERSON".to_string(),
+                0.8,
+            ))
+            .unwrap();
+
+        persistence.save_entities(&graph).unwrap();
+        let entities = persistence.load_entities().unwrap();
+
+        let alice = entities
+            .iter()
+            .find(|e| e.name == "Alice")
+            .expect("alice present");
+        assert_eq!(
+            alice.description.as_deref(),
+            Some("Alice the engineer | Alice the founder")
+        );
+        let bob = entities
+            .iter()
+            .find(|e| e.name == "Bob")
+            .expect("bob present");
+        assert!(
+            bob.description.is_none(),
+            "entities without a description must remain None after round-trip"
+        );
+    }
+
+    /// Relationship descriptions survive a parquet round-trip (#97 review).
+    #[test]
+    #[cfg(feature = "persistent-storage")]
+    fn relationship_description_survives_save_and_load_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let persistence = ParquetPersistence::new(temp_dir.path().to_path_buf()).unwrap();
+
+        let mut graph = KnowledgeGraph::new();
+        let alice_id = EntityId::new("alice".to_string());
+        let bob_id = EntityId::new("bob".to_string());
+        graph
+            .add_entity(Entity::new(
+                alice_id.clone(),
+                "Alice".into(),
+                "PERSON".into(),
+                0.9,
+            ))
+            .unwrap();
+        graph
+            .add_entity(Entity::new(
+                bob_id.clone(),
+                "Bob".into(),
+                "PERSON".into(),
+                0.9,
+            ))
+            .unwrap();
+        graph
+            .add_relationship(
+                Relationship::new(alice_id.clone(), bob_id.clone(), "WORKS_WITH".into(), 0.85)
+                    .with_description("collaborate on indexing | co-authored design doc".into()),
+            )
+            .unwrap();
+        graph
+            .add_relationship(Relationship::new(
+                alice_id.clone(),
+                bob_id.clone(),
+                "REPORTS_TO".into(),
+                0.5,
+            ))
+            .unwrap();
+
+        persistence.save_relationships(&graph).unwrap();
+        let loaded = persistence.load_relationships().unwrap();
+
+        let with_desc = loaded
+            .iter()
+            .find(|r| r.relation_type == "WORKS_WITH")
+            .expect("WORKS_WITH edge present");
+        assert_eq!(
+            with_desc.description.as_deref(),
+            Some("collaborate on indexing | co-authored design doc")
+        );
+        let no_desc = loaded
+            .iter()
+            .find(|r| r.relation_type == "REPORTS_TO")
+            .expect("REPORTS_TO edge present");
+        assert!(
+            no_desc.description.is_none(),
+            "relationships without a description must remain None after round-trip"
+        );
     }
 
     // Regression for #24: entity mentions must survive a save/load round

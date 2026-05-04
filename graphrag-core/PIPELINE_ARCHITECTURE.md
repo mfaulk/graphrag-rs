@@ -130,6 +130,11 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 | **Extraction** | `entity_extraction.approach` | enum | hybrid | Extraction method |
 | | `entity_extraction.entity_types` | list | [...] | Target entities |
 | | `entity_extraction.use_gleaning` | bool | true | Multi-pass extraction |
+| | `entities.element_summary.enabled` | bool | true | Wired into `build_graph`; collapse multi-chunk descriptions (§2.2) |
+| | `entities.element_summary.min_instances` | int | 2 | Min descriptions before collapsing |
+| | `entities.element_summary.max_chars_for_concat` | int | 800 | Below budget, concatenate locally instead of calling the LLM |
+| | `entities.element_summary.temperature` | float | 0.0 | Sampling temperature for synthesis |
+| | `entities.element_summary.max_output_tokens` | int | 256 | Cap on synthesised description length |
 | | `relationship_extraction.enabled` | bool | true | Extract relationships |
 | **Graph** | `graph.enable_pagerank` | bool | true | Calculate PageRank |
 | | `graph.max_connections` | int | 50 | Max node degree |

@@ -703,6 +703,7 @@ mod tests {
             relation_type: "PRODUCES".to_string(),
             confidence: 0.8,
             context: vec![],
+            description: None,
             embedding: None,
             temporal_type: None,
             temporal_range: None,

@@ -1089,6 +1089,7 @@ impl GraphRAG {
                             relation_type: relation_type.clone(),
                             confidence: self.config.graph.relationship_confidence_threshold,
                             context: vec![chunk.id.clone()],
+                            description: None,
                             embedding: None,
                             temporal_type: None,
                             temporal_range: None,
@@ -1115,8 +1116,151 @@ impl GraphRAG {
             } // End of extract_relationships check
         } // End of pattern-based extraction
 
+        // Element-summary collapse (paper §2.2): when the same entity is
+        // described in multiple chunks, synthesise one coherent description
+        // per element so downstream community-report and global-search
+        // consumers see a single canonical description per entity (#97).
+        // Skipped when the master switch is off; see
+        // `entity::element_summary::collapse_descriptions` for the
+        // per-element behaviour and cost-guard semantics.
+        self.apply_element_summaries().await?;
+
         // Persist to workspace if storage is configured
         self.save_to_workspace()?;
+
+        Ok(())
+    }
+
+    /// Run element-summary collapse over the current knowledge graph.
+    ///
+    /// Groups entities by `(lowercased_name, type)` and relationships by
+    /// `(lowercased_source_id, lowercased_target_id, relation_type)`, then
+    /// collapses their descriptions through the configured chat backend (or
+    /// local concat below the cost-guard) and writes the synthesised
+    /// description back onto every node/edge in the group.
+    #[cfg(feature = "async")]
+    async fn apply_element_summaries(&mut self) -> Result<()> {
+        use std::collections::HashMap;
+
+        if !self.config.entities.element_summary.enabled {
+            return Ok(());
+        }
+
+        let graph = match self.knowledge_graph.as_mut() {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+
+        // Resolve a chat backend for synthesis. Mirrors the dispatch pattern
+        // in `generate_semantic_answer_from_results`: prefer an externally
+        // injected `ChatBackend`; otherwise fall back to the built-in
+        // OllamaClient when ollama is enabled. Without this fallback the
+        // default (no injected backend) deployment never reaches the LLM
+        // synthesis path and `temperature` / `max_output_tokens` defaults
+        // would be unreachable (#97 review).
+        let ollama_fallback = if self.chat_backend.is_none() && self.config.ollama.enabled {
+            Some(crate::ollama::OllamaChatBackend::from_config(
+                self.config.ollama.clone(),
+            ))
+        } else {
+            None
+        };
+        let backend: Option<&dyn core::backend::ChatBackend> =
+            if let Some(b) = self.chat_backend.as_deref() {
+                Some(b as &dyn core::backend::ChatBackend)
+            } else {
+                ollama_fallback
+                    .as_ref()
+                    .map(|b| b as &dyn core::backend::ChatBackend)
+            };
+
+        // --- Entity-side collapse ---
+        // Collect per-element descriptions keyed by (lowercased_name, type).
+        // We iterate the actual graph nodes rather than `entity_index` because
+        // LLM extractors can emit duplicate `EntityId`s (deterministic IDs
+        // from `(entity_type, normalized_name)`); when that happens
+        // `entity_index` only retains the latest `NodeIndex`, leaving older
+        // nodes reachable via `entities()` but invisible to `get_entity_mut`.
+        let mut entity_groups: HashMap<(String, String), (String, Vec<String>)> = HashMap::new();
+        for entity in graph.entities() {
+            let key = (entity.name.to_lowercase(), entity.entity_type.clone());
+            let entry = entity_groups
+                .entry(key)
+                .or_insert_with(|| (entity.name.clone(), Vec::new()));
+            if let Some(desc) = &entity.description {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    entry.1.push(trimmed.to_string());
+                }
+            }
+        }
+
+        let entity_summaries = entity::element_summary::collapse_all(
+            "entity",
+            entity_groups,
+            &self.config.entities.element_summary,
+            backend,
+        )
+        .await?;
+
+        // Write the synthesised description back onto every entity node in
+        // the group. Groups that fell below `min_instances` are absent from
+        // `entity_summaries` and keep their existing per-instance descriptions.
+        // Iterating `entities_mut()` is essential here: when two extractor
+        // emissions share an `EntityId`, both graph nodes must receive the
+        // synthesised description even though only one is reachable through
+        // the index (#97 review).
+        for entity in graph.entities_mut() {
+            let key = (entity.name.to_lowercase(), entity.entity_type.clone());
+            if let Some(summary) = entity_summaries.get(&key) {
+                entity.description = Some(summary.clone());
+            }
+        }
+
+        // --- Relationship-side collapse ---
+        // Same pattern for edges: group by (source_id, target_id,
+        // relation_type) so two extractor emissions describing the same
+        // semantic edge are merged. Multi-graph edges with the same triple
+        // (different chunks producing the same edge) all receive the merged
+        // description (#97 review).
+        type RelKey = (String, String, String);
+        let mut rel_groups: HashMap<RelKey, (String, Vec<String>)> = HashMap::new();
+        for rel in graph.relationships() {
+            let key = (
+                rel.source.0.to_lowercase(),
+                rel.target.0.to_lowercase(),
+                rel.relation_type.clone(),
+            );
+            let display = format!("{} -[{}]-> {}", rel.source, rel.relation_type, rel.target);
+            let entry = rel_groups
+                .entry(key)
+                .or_insert_with(|| (display, Vec::new()));
+            if let Some(desc) = &rel.description {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    entry.1.push(trimmed.to_string());
+                }
+            }
+        }
+
+        let rel_summaries = entity::element_summary::collapse_all(
+            "relationship",
+            rel_groups,
+            &self.config.entities.element_summary,
+            backend,
+        )
+        .await?;
+
+        for rel in graph.relationships_mut() {
+            let key = (
+                rel.source.0.to_lowercase(),
+                rel.target.0.to_lowercase(),
+                rel.relation_type.clone(),
+            );
+            if let Some(summary) = rel_summaries.get(&key) {
+                rel.description = Some(summary.clone());
+            }
+        }
 
         Ok(())
     }
@@ -1174,6 +1318,7 @@ impl GraphRAG {
                         relation_type: relation_type.clone(),
                         confidence: self.config.graph.relationship_confidence_threshold,
                         context: vec![chunk.id.clone()],
+                        description: None,
                         embedding: None,
                         temporal_type: None,
                         temporal_range: None,
@@ -2001,5 +2146,334 @@ mod tests {
             .with_top_k(10)
             .build();
         assert!(graphrag.is_ok());
+    }
+}
+
+#[cfg(all(test, feature = "async"))]
+mod element_summary_wiring_tests {
+    use super::*;
+    use crate::core::backend::{ChatBackend, ChatParams};
+    use crate::core::{ChunkId, Entity, EntityId, EntityMention};
+    use crate::entity::element_summary::RecordingBackend;
+    use std::sync::Arc;
+
+    fn entity_with_description(name: &str, kind: &str, desc: &str) -> Entity {
+        Entity::new(
+            EntityId::new(format!("{}_{}", kind, name.to_lowercase())),
+            name.to_string(),
+            kind.to_string(),
+            0.9,
+        )
+        .with_mentions(vec![EntityMention {
+            chunk_id: ChunkId::new(format!("c-{}", name.to_lowercase())),
+            start_offset: 0,
+            end_offset: name.len(),
+            confidence: 0.9,
+        }])
+        .with_description(desc.to_string())
+    }
+
+    /// build_graph's element-summary step replaces per-instance descriptions
+    /// with the synthesised text whenever an entity meets `min_instances`.
+    /// Below the cost-guard the LLM is skipped and concatenation is used.
+    #[tokio::test]
+    async fn apply_element_summaries_collapses_when_min_instances_met() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        // Stay under the cost-guard so the LLM is not consulted; the
+        // collapser concatenates the descriptions locally.
+        config.entities.element_summary.max_chars_for_concat = 800;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+        // Two distinct Entity rows for "Alice" — different ids, same
+        // (lowercased name, type). The collapser must merge them.
+        let mut alice1 = entity_with_description("Alice", "PERSON", "the engineer");
+        alice1.id = EntityId::new("alice-1".into());
+        let mut alice2 = entity_with_description("Alice", "PERSON", "the founder");
+        alice2.id = EntityId::new("alice-2".into());
+        // A singleton entity stays untouched (below min_instances).
+        let bob = entity_with_description("Bob", "PERSON", "the analyst");
+        kg.add_entity(alice1).unwrap();
+        kg.add_entity(alice2).unwrap();
+        kg.add_entity(bob).unwrap();
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        let alices: Vec<&Entity> = kg
+            .entities()
+            .filter(|e| e.name.eq_ignore_ascii_case("alice"))
+            .collect();
+        assert_eq!(alices.len(), 2);
+        for a in &alices {
+            let d = a.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("the engineer") && d.contains("the founder"),
+                "expected collapsed description to merge instances, got {:?}",
+                a.description
+            );
+        }
+
+        let bob = kg
+            .entities()
+            .find(|e| e.name == "Bob")
+            .expect("bob present");
+        assert_eq!(bob.description.as_deref(), Some("the analyst"));
+    }
+
+    /// When the cost-guard threshold is set to zero the collapser must
+    /// reach the configured chat backend for any group meeting
+    /// `min_instances` and must replace the description with the LLM
+    /// response.
+    #[tokio::test]
+    async fn apply_element_summaries_invokes_chat_backend_above_budget() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        config.entities.element_summary.max_chars_for_concat = 0;
+
+        let backend = Arc::new(RecordingBackend::new("Synthesised: Alice"));
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        graphrag.set_chat_backend(Some(backend.clone() as Arc<dyn ChatBackend>));
+
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+        let mut a1 = entity_with_description("Alice", "PERSON", "the engineer");
+        a1.id = EntityId::new("alice-1".into());
+        let mut a2 = entity_with_description("Alice", "PERSON", "the founder");
+        a2.id = EntityId::new("alice-2".into());
+        kg.add_entity(a1).unwrap();
+        kg.add_entity(a2).unwrap();
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        assert!(
+            backend.call_count() >= 1,
+            "chat backend should be called when over the cost-guard"
+        );
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        for entity in kg.entities() {
+            assert_eq!(
+                entity.description.as_deref(),
+                Some("Synthesised: Alice"),
+                "entity {} should carry the synthesised description",
+                entity.name
+            );
+        }
+        // Silence unused `ChatParams` clippy hint — the backend record is
+        // exercised through the trait object above.
+        let _ = ChatParams::default();
+    }
+
+    /// Disabling element-summary keeps every entity's existing description.
+    #[tokio::test]
+    async fn apply_element_summaries_no_op_when_disabled() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = false;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+        let mut a1 = entity_with_description("Alice", "PERSON", "the engineer");
+        a1.id = EntityId::new("alice-1".into());
+        let mut a2 = entity_with_description("Alice", "PERSON", "the founder");
+        a2.id = EntityId::new("alice-2".into());
+        kg.add_entity(a1).unwrap();
+        kg.add_entity(a2).unwrap();
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        let descs: Vec<_> = kg
+            .entities()
+            .filter_map(|e| e.description.clone())
+            .collect();
+        assert!(descs.contains(&"the engineer".to_string()));
+        assert!(descs.contains(&"the founder".to_string()));
+    }
+
+    /// `add_entity` creates one graph node per call but `entity_index` only
+    /// keeps the latest `NodeIndex` for a given `EntityId`. When LLM
+    /// extractors emit deterministic IDs from `(entity_type, normalized_name)`,
+    /// the same id can appear twice and the older node becomes orphaned in
+    /// the index. `apply_element_summaries` must still update both nodes
+    /// (see #97 review): callers iterating over `entities()` should observe
+    /// the synthesised description on every node sharing the group key, not
+    /// just the index-canonical one.
+    #[tokio::test]
+    async fn apply_element_summaries_updates_all_entity_nodes_sharing_id() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        config.entities.element_summary.max_chars_for_concat = 800;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+
+        // Two Entity rows with the SAME id but different descriptions —
+        // mirrors the deterministic-id path in LLM extractors where the
+        // same `(entity_type, normalized_name)` shows up in two chunks.
+        let shared_id = EntityId::new("person_alice".into());
+        let mut alice1 = entity_with_description("Alice", "PERSON", "the engineer");
+        alice1.id = shared_id.clone();
+        let mut alice2 = entity_with_description("Alice", "PERSON", "the founder");
+        alice2.id = shared_id.clone();
+        kg.add_entity(alice1).unwrap();
+        kg.add_entity(alice2).unwrap();
+        // Sanity check: two graph nodes exist even though entity_index can
+        // only point at one of them.
+        assert_eq!(kg.entities().count(), 2);
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        let alices: Vec<&Entity> = kg
+            .entities()
+            .filter(|e| e.name.eq_ignore_ascii_case("alice"))
+            .collect();
+        assert_eq!(alices.len(), 2);
+        for a in &alices {
+            let d = a.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("the engineer") && d.contains("the founder"),
+                "expected every duplicate-id node to receive the collapsed \
+                 description, got {:?}",
+                a.description
+            );
+        }
+    }
+
+    /// Element-summary collapse must also operate on Relationships: when the
+    /// same (source, target, relation_type) edge is described in multiple
+    /// chunks, every duplicate edge should carry the merged description
+    /// (#97 review).
+    #[tokio::test]
+    async fn apply_element_summaries_collapses_relationship_descriptions() {
+        use crate::core::Relationship;
+
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        config.entities.element_summary.max_chars_for_concat = 800;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+
+        let alice_id = EntityId::new("person_alice".into());
+        let bob_id = EntityId::new("person_bob".into());
+        let mut alice = entity_with_description("Alice", "PERSON", "the engineer");
+        alice.id = alice_id.clone();
+        let mut bob = entity_with_description("Bob", "PERSON", "the analyst");
+        bob.id = bob_id.clone();
+        kg.add_entity(alice).unwrap();
+        kg.add_entity(bob).unwrap();
+
+        // Two extractor emissions for the SAME edge with different
+        // descriptions — mirrors what happens when the same relationship
+        // shows up in two chunks.
+        let rel1 = Relationship::new(
+            alice_id.clone(),
+            bob_id.clone(),
+            "WORKS_WITH".to_string(),
+            0.9,
+        )
+        .with_description("collaborate on the indexing pipeline".into());
+        let rel2 = Relationship::new(
+            alice_id.clone(),
+            bob_id.clone(),
+            "WORKS_WITH".to_string(),
+            0.8,
+        )
+        .with_description("co-authored the Q1 design doc".into());
+        kg.add_relationship(rel1).unwrap();
+        kg.add_relationship(rel2).unwrap();
+        // A singleton edge (below min_instances) must stay untouched.
+        let other = Relationship::new(
+            alice_id.clone(),
+            bob_id.clone(),
+            "REPORTS_TO".to_string(),
+            0.5,
+        )
+        .with_description("dotted-line manager".into());
+        kg.add_relationship(other).unwrap();
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        let works_with: Vec<&Relationship> = kg
+            .relationships()
+            .filter(|r| r.relation_type == "WORKS_WITH")
+            .collect();
+        assert_eq!(works_with.len(), 2);
+        for r in &works_with {
+            let d = r.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("indexing pipeline") && d.contains("Q1 design doc"),
+                "expected every duplicate edge to carry the merged \
+                 description, got {:?}",
+                r.description
+            );
+        }
+
+        let reports_to = kg
+            .relationships()
+            .find(|r| r.relation_type == "REPORTS_TO")
+            .expect("REPORTS_TO edge present");
+        assert_eq!(
+            reports_to.description.as_deref(),
+            Some("dotted-line manager"),
+            "singleton edges below min_instances must keep their original \
+             description"
+        );
+    }
+
+    /// `apply_element_summaries` must succeed (using the local concat path)
+    /// when no `ChatBackend` was injected but `ollama.enabled = true`. The
+    /// previous wiring fell back to `None` for the backend, so the LLM
+    /// synthesis path was unreachable in default deployments. With the
+    /// Ollama fallback in place, this configuration must at minimum not
+    /// crash and must still merge per-instance descriptions when below the
+    /// cost-guard (#97 review).
+    #[tokio::test]
+    async fn apply_element_summaries_uses_local_concat_when_ollama_enabled_but_under_budget() {
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        // High budget keeps the test off the network — concat fires.
+        config.entities.element_summary.max_chars_for_concat = 100_000;
+        // The new code path: ollama enabled + no injected chat backend.
+        config.ollama.enabled = true;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+        let mut a1 = entity_with_description("Alice", "PERSON", "the engineer");
+        a1.id = EntityId::new("alice-1".into());
+        let mut a2 = entity_with_description("Alice", "PERSON", "the founder");
+        a2.id = EntityId::new("alice-2".into());
+        kg.add_entity(a1).unwrap();
+        kg.add_entity(a2).unwrap();
+
+        graphrag
+            .apply_element_summaries()
+            .await
+            .expect("ollama-enabled fallback path must not error under the cost-guard");
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        for entity in kg.entities() {
+            let d = entity.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("the engineer") && d.contains("the founder"),
+                "expected merged description from concat path, got {:?}",
+                entity.description
+            );
+        }
     }
 }

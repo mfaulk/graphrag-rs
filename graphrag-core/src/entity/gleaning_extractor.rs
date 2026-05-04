@@ -281,7 +281,12 @@ impl GleaningEntityExtractor {
             .map(|e| EntityData {
                 name: e.name.clone(),
                 entity_type: e.entity_type.clone(),
-                description: format!("{} (confidence: {:.2})", e.entity_type, e.confidence),
+                // Round-trip the entity's description so multi-pass gleaning
+                // can carry it forward; fall back to a confidence summary
+                // when the entity has no LLM-emitted description yet (#97).
+                description: e.description.clone().unwrap_or_else(|| {
+                    format!("{} (confidence: {:.2})", e.entity_type, e.confidence)
+                }),
             })
             .collect()
     }
@@ -322,14 +327,20 @@ impl GleaningEntityExtractor {
             // Find mentions in chunk
             let mentions = self.find_mentions(&entity_item.name, chunk_id, chunk_text);
 
-            // Create entity with mentions
-            let entity = Entity::new(
+            // Create entity with mentions; preserve the LLM-emitted description
+            // so element-summary collapse can synthesise across chunks (#97).
+            let mut entity = Entity::new(
                 entity_id,
                 entity_item.name.clone(),
                 entity_item.entity_type.clone(),
                 0.9, // High confidence since LLM-extracted
             )
             .with_mentions(mentions);
+
+            let desc = entity_item.description.trim();
+            if !desc.is_empty() {
+                entity = entity.with_description(desc.to_string());
+            }
 
             entities.push(entity);
         }
@@ -399,12 +410,21 @@ impl GleaningEntityExtractor {
             let target_entity = name_to_entity.get(&rel_item.target.to_lowercase());
 
             if let (Some(source), Some(target)) = (source_entity, target_entity) {
+                // Mirror llm_extractor: keep the free-text description so
+                // element-summary collapse can merge multi-chunk emissions
+                // (Edge et al. 2024 §2.2).
+                let description = if rel_item.description.trim().is_empty() {
+                    None
+                } else {
+                    Some(rel_item.description.clone())
+                };
                 let relationship = Relationship {
                     source: source.id.clone(),
                     target: target.id.clone(),
                     relation_type: rel_item.description.clone(),
                     confidence: rel_item.strength as f32,
                     context: vec![],
+                    description,
                     embedding: None,
                     temporal_type: None,
                     temporal_range: None,

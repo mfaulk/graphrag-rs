@@ -376,16 +376,20 @@ impl LLMEntityExtractor {
             // Find mentions in chunk
             let mentions = self.find_mentions(&entity_item.name, chunk_id, chunk_text);
 
-            // Create entity with mentions
-            // Note: Description is stored in the entity but not used in current Entity struct
-            // We store it in the entity name or as a separate field if needed
-            let entity = Entity::new(
+            // Create entity with mentions; preserve the LLM-emitted description
+            // so element-summary collapse can synthesise across chunks (#97).
+            let mut entity = Entity::new(
                 entity_id,
                 entity_item.name.clone(),
                 entity_item.entity_type.clone(),
                 0.9, // High confidence since it's LLM-extracted
             )
             .with_mentions(mentions);
+
+            let desc = entity_item.description.trim();
+            if !desc.is_empty() {
+                entity = entity.with_description(desc.to_string());
+            }
 
             entities.push(entity);
         }
@@ -451,12 +455,24 @@ impl LLMEntityExtractor {
             let target_entity = name_to_entity.get(&rel_item.target.to_lowercase());
 
             if let (Some(source), Some(target)) = (source_entity, target_entity) {
+                // The LLM emits free-text in `RelationshipData::description`;
+                // copy it onto `Relationship::description` so element-summary
+                // collapse has something to merge per (source, target,
+                // relation_type) group. `relation_type` keeps the same value
+                // for backward compatibility with existing graph-traversal
+                // consumers.
+                let description = if rel_item.description.trim().is_empty() {
+                    None
+                } else {
+                    Some(rel_item.description.clone())
+                };
                 let relationship = Relationship {
                     source: source.id.clone(),
                     target: target.id.clone(),
                     relation_type: rel_item.description.clone(),
                     confidence: rel_item.strength as f32,
                     context: vec![], // No context chunks for this relationship
+                    description,
                     embedding: None,
                     temporal_type: None,
                     temporal_range: None,

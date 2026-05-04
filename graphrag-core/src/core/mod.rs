@@ -234,6 +234,12 @@ pub struct Entity {
     pub mentions: Vec<EntityMention>,
     /// Optional vector embedding for the entity
     pub embedding: Option<Vec<f32>>,
+    /// Free-text description of the entity. Populated by LLM-based
+    /// extractors (single-pass / gleaning) and overwritten by element-summary
+    /// collapse when the same entity is described in multiple chunks
+    /// (Edge et al. 2024 §2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 
     // Temporal fields (Phase 1.2 - Advanced GraphRAG)
     /// First time this entity was mentioned (Unix timestamp)
@@ -274,6 +280,13 @@ pub struct Relationship {
     /// Chunk IDs providing context for this relationship
     pub context: Vec<ChunkId>,
 
+    /// Free-text description of the relationship. Populated by LLM-based
+    /// extractors and overwritten by element-summary collapse when the same
+    /// (source, target, relation_type) triple is described in multiple
+    /// chunks (Edge et al. 2024 §2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     /// Optional embedding vector for semantic similarity matching
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub embedding: Option<Vec<f32>>,
@@ -299,12 +312,19 @@ impl Relationship {
             relation_type,
             confidence,
             context: Vec::new(),
+            description: None,
             embedding: None,
             // Temporal fields default to None (backward compatible)
             temporal_type: None,
             temporal_range: None,
             causal_strength: None,
         }
+    }
+
+    /// Set the free-text description for this relationship.
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
+        self
     }
 
     /// Add context chunks to the relationship
@@ -553,6 +573,8 @@ impl KnowledgeGraph {
                     }
                 }
 
+                let description = entity_obj["description"].as_str().map(|s| s.to_string());
+
                 let entity = Entity {
                     id,
                     name,
@@ -560,6 +582,7 @@ impl KnowledgeGraph {
                     confidence,
                     mentions,
                     embedding: None, // Embeddings not stored in JSON
+                    description,
                     first_mentioned: None,
                     last_mentioned: None,
                     temporal_validity: None,
@@ -699,6 +722,10 @@ impl KnowledgeGraph {
                 "confidence" => entity.confidence,
                 "mentions_count" => entity.mentions.len()
             };
+
+            if let Some(desc) = &entity.description {
+                entity_obj["description"] = desc.clone().into();
+            }
 
             // Add mentions with chunk references
             let mut mentions_array = json::JsonValue::new_array();
@@ -934,6 +961,13 @@ impl KnowledgeGraph {
     /// Get all relationships as an iterator
     pub fn relationships(&self) -> impl Iterator<Item = &Relationship> {
         self.graph.edge_weights()
+    }
+
+    /// Get all relationships as a mutable iterator. Element-summary writeback
+    /// uses this to update every edge in a (source, target, relation_type)
+    /// group rather than relying on a per-id index.
+    pub fn relationships_mut(&mut self) -> impl Iterator<Item = &mut Relationship> {
+        self.graph.edge_weights_mut()
     }
 
     /// Clear all entities and relationships while preserving documents and chunks
@@ -1292,6 +1326,7 @@ impl Entity {
             confidence,
             mentions: Vec::new(),
             embedding: None,
+            description: None,
             // Temporal fields default to None (backward compatible)
             first_mentioned: None,
             last_mentioned: None,
@@ -1308,6 +1343,12 @@ impl Entity {
     /// Add an embedding to the entity
     pub fn with_embedding(mut self, embedding: Vec<f32>) -> Self {
         self.embedding = Some(embedding);
+        self
+    }
+
+    /// Attach (or replace) the entity's free-text description.
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
         self
     }
 

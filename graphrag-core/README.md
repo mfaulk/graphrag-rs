@@ -131,12 +131,38 @@ min_confidence = 0.7
 use_gleaning = true
 max_gleaning_rounds = 3
 entity_types = ["PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT"]
+
+# Element-summary collapse (Edge et al. 2024 §2.2): synthesise a single
+# coherent description per entity that appears in multiple chunks. Wired
+# into `build_graph` after extraction; below `max_chars_for_concat` total
+# characters the descriptions are joined locally instead of being sent to
+# the chat backend, saving an LLM call.
+[entities.element_summary]
+enabled = true
+min_instances = 2
+max_chars_for_concat = 800
+temperature = 0.0
+max_output_tokens = 256
 ```
 
 Load with:
 ```rust
 let config = Config::from_toml_file("graphrag.toml")?;
 let graphrag = GraphRAG::new(config)?;
+```
+
+The same element-summary keys are also honoured by the alternate
+`SetConfig`-based loader (`GraphRAG::from_config_file` /
+`SetConfig::to_graphrag_config`). Place them under
+`[entity_extraction.element_summary]` instead:
+
+```toml
+[entity_extraction.element_summary]
+enabled = true
+min_instances = 2
+max_chars_for_concat = 800
+temperature = 0.0
+max_output_tokens = 256
 ```
 
 ## Sectoral Templates
