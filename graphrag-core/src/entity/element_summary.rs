@@ -11,9 +11,10 @@
 //! `GraphRAG::build_graph` invokes [`collapse_all`] after entity/relationship
 //! extraction and before persistence whenever the LLM extraction paths run
 //! (single-pass or gleaning) and `entities.element_summary.enabled` is set.
-//! The synthesised description is written back onto `core::Entity::description`
-//! and `core::Relationship` context, so downstream community-report and
-//! global-search consumers see one coherent description per element.
+//! The synthesised description is written back onto
+//! `core::Entity::description` and `core::Relationship::description`, so
+//! downstream community-report and global-search consumers see one coherent
+//! description per element.
 //!
 //! The collapse helpers ([`collapse_descriptions`], [`collapse_all`],
 //! [`collapse_entity_descriptions`], [`collapse_relationship_descriptions`])

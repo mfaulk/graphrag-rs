@@ -134,6 +134,7 @@ impl GraphBuilder {
                         relation_type,
                         confidence: 0.8, // Default confidence for extracted relationships
                         context: vec![chunk.id.clone()],
+                        description: None,
                         embedding: None,
                         temporal_type: None,
                         temporal_range: None,
@@ -268,6 +269,7 @@ impl GraphBuilder {
                         relation_type: "SEMANTICALLY_SIMILAR".to_string(),
                         confidence: similarity,
                         context: Vec::new(),
+                        description: None,
                         embedding: None,
                         temporal_type: None,
                         temporal_range: None,

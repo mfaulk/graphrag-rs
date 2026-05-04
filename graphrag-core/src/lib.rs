@@ -1089,6 +1089,7 @@ impl GraphRAG {
                             relation_type: relation_type.clone(),
                             confidence: self.config.graph.relationship_confidence_threshold,
                             context: vec![chunk.id.clone()],
+                            description: None,
                             embedding: None,
                             temporal_type: None,
                             temporal_range: None,
@@ -1132,10 +1133,11 @@ impl GraphRAG {
 
     /// Run element-summary collapse over the current knowledge graph.
     ///
-    /// Groups entities by `(lowercased_name, type)`, collapses their
-    /// descriptions through the configured chat backend (or local concat
-    /// below the cost-guard), and writes the synthesised description back
-    /// onto every entity in the group.
+    /// Groups entities by `(lowercased_name, type)` and relationships by
+    /// `(lowercased_source_id, lowercased_target_id, relation_type)`, then
+    /// collapses their descriptions through the configured chat backend (or
+    /// local concat below the cost-guard) and writes the synthesised
+    /// description back onto every node/edge in the group.
     #[cfg(feature = "async")]
     async fn apply_element_summaries(&mut self) -> Result<()> {
         use std::collections::HashMap;
@@ -1149,16 +1151,19 @@ impl GraphRAG {
             None => return Ok(()),
         };
 
+        let backend = self.chat_backend.as_deref();
+
+        // --- Entity-side collapse ---
         // Collect per-element descriptions keyed by (lowercased_name, type).
         // We iterate the actual graph nodes rather than `entity_index` because
         // LLM extractors can emit duplicate `EntityId`s (deterministic IDs
         // from `(entity_type, normalized_name)`); when that happens
         // `entity_index` only retains the latest `NodeIndex`, leaving older
         // nodes reachable via `entities()` but invisible to `get_entity_mut`.
-        let mut groups: HashMap<(String, String), (String, Vec<String>)> = HashMap::new();
+        let mut entity_groups: HashMap<(String, String), (String, Vec<String>)> = HashMap::new();
         for entity in graph.entities() {
             let key = (entity.name.to_lowercase(), entity.entity_type.clone());
-            let entry = groups
+            let entry = entity_groups
                 .entry(key)
                 .or_insert_with(|| (entity.name.clone(), Vec::new()));
             if let Some(desc) = &entity.description {
@@ -1169,10 +1174,9 @@ impl GraphRAG {
             }
         }
 
-        let backend = self.chat_backend.as_deref();
-        let summaries = entity::element_summary::collapse_all(
+        let entity_summaries = entity::element_summary::collapse_all(
             "entity",
-            groups,
+            entity_groups,
             &self.config.entities.element_summary,
             backend.map(|b| b as &dyn core::backend::ChatBackend),
         )
@@ -1180,15 +1184,60 @@ impl GraphRAG {
 
         // Write the synthesised description back onto every entity node in
         // the group. Groups that fell below `min_instances` are absent from
-        // `summaries` and keep their existing per-instance descriptions.
+        // `entity_summaries` and keep their existing per-instance descriptions.
         // Iterating `entities_mut()` is essential here: when two extractor
         // emissions share an `EntityId`, both graph nodes must receive the
         // synthesised description even though only one is reachable through
         // the index (#97 review).
         for entity in graph.entities_mut() {
             let key = (entity.name.to_lowercase(), entity.entity_type.clone());
-            if let Some(summary) = summaries.get(&key) {
+            if let Some(summary) = entity_summaries.get(&key) {
                 entity.description = Some(summary.clone());
+            }
+        }
+
+        // --- Relationship-side collapse ---
+        // Same pattern for edges: group by (source_id, target_id,
+        // relation_type) so two extractor emissions describing the same
+        // semantic edge are merged. Multi-graph edges with the same triple
+        // (different chunks producing the same edge) all receive the merged
+        // description (#97 review).
+        type RelKey = (String, String, String);
+        let mut rel_groups: HashMap<RelKey, (String, Vec<String>)> = HashMap::new();
+        for rel in graph.relationships() {
+            let key = (
+                rel.source.0.to_lowercase(),
+                rel.target.0.to_lowercase(),
+                rel.relation_type.clone(),
+            );
+            let display = format!("{} -[{}]-> {}", rel.source, rel.relation_type, rel.target);
+            let entry = rel_groups
+                .entry(key)
+                .or_insert_with(|| (display, Vec::new()));
+            if let Some(desc) = &rel.description {
+                let trimmed = desc.trim();
+                if !trimmed.is_empty() {
+                    entry.1.push(trimmed.to_string());
+                }
+            }
+        }
+
+        let rel_summaries = entity::element_summary::collapse_all(
+            "relationship",
+            rel_groups,
+            &self.config.entities.element_summary,
+            backend.map(|b| b as &dyn core::backend::ChatBackend),
+        )
+        .await?;
+
+        for rel in graph.relationships_mut() {
+            let key = (
+                rel.source.0.to_lowercase(),
+                rel.target.0.to_lowercase(),
+                rel.relation_type.clone(),
+            );
+            if let Some(summary) = rel_summaries.get(&key) {
+                rel.description = Some(summary.clone());
             }
         }
 
@@ -1248,6 +1297,7 @@ impl GraphRAG {
                         relation_type: relation_type.clone(),
                         confidence: self.config.graph.relationship_confidence_threshold,
                         context: vec![chunk.id.clone()],
+                        description: None,
                         embedding: None,
                         temporal_type: None,
                         temporal_range: None,
@@ -2276,5 +2326,90 @@ mod element_summary_wiring_tests {
                 a.description
             );
         }
+    }
+
+    /// Element-summary collapse must also operate on Relationships: when the
+    /// same (source, target, relation_type) edge is described in multiple
+    /// chunks, every duplicate edge should carry the merged description
+    /// (#97 review).
+    #[tokio::test]
+    async fn apply_element_summaries_collapses_relationship_descriptions() {
+        use crate::core::Relationship;
+
+        let mut config = Config::default();
+        config.entities.element_summary.enabled = true;
+        config.entities.element_summary.min_instances = 2;
+        config.entities.element_summary.max_chars_for_concat = 800;
+
+        let mut graphrag = GraphRAG::new(config).expect("GraphRAG::new");
+        graphrag.knowledge_graph = Some(KnowledgeGraph::new());
+        let kg = graphrag.knowledge_graph.as_mut().unwrap();
+
+        let alice_id = EntityId::new("person_alice".into());
+        let bob_id = EntityId::new("person_bob".into());
+        let mut alice = entity_with_description("Alice", "PERSON", "the engineer");
+        alice.id = alice_id.clone();
+        let mut bob = entity_with_description("Bob", "PERSON", "the analyst");
+        bob.id = bob_id.clone();
+        kg.add_entity(alice).unwrap();
+        kg.add_entity(bob).unwrap();
+
+        // Two extractor emissions for the SAME edge with different
+        // descriptions — mirrors what happens when the same relationship
+        // shows up in two chunks.
+        let rel1 = Relationship::new(
+            alice_id.clone(),
+            bob_id.clone(),
+            "WORKS_WITH".to_string(),
+            0.9,
+        )
+        .with_description("collaborate on the indexing pipeline".into());
+        let rel2 = Relationship::new(
+            alice_id.clone(),
+            bob_id.clone(),
+            "WORKS_WITH".to_string(),
+            0.8,
+        )
+        .with_description("co-authored the Q1 design doc".into());
+        kg.add_relationship(rel1).unwrap();
+        kg.add_relationship(rel2).unwrap();
+        // A singleton edge (below min_instances) must stay untouched.
+        let other = Relationship::new(
+            alice_id.clone(),
+            bob_id.clone(),
+            "REPORTS_TO".to_string(),
+            0.5,
+        )
+        .with_description("dotted-line manager".into());
+        kg.add_relationship(other).unwrap();
+
+        graphrag.apply_element_summaries().await.unwrap();
+
+        let kg = graphrag.knowledge_graph.as_ref().unwrap();
+        let works_with: Vec<&Relationship> = kg
+            .relationships()
+            .filter(|r| r.relation_type == "WORKS_WITH")
+            .collect();
+        assert_eq!(works_with.len(), 2);
+        for r in &works_with {
+            let d = r.description.as_deref().unwrap_or("");
+            assert!(
+                d.contains("indexing pipeline") && d.contains("Q1 design doc"),
+                "expected every duplicate edge to carry the merged \
+                 description, got {:?}",
+                r.description
+            );
+        }
+
+        let reports_to = kg
+            .relationships()
+            .find(|r| r.relation_type == "REPORTS_TO")
+            .expect("REPORTS_TO edge present");
+        assert_eq!(
+            reports_to.description.as_deref(),
+            Some("dotted-line manager"),
+            "singleton edges below min_instances must keep their original \
+             description"
+        );
     }
 }

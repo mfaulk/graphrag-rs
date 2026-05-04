@@ -455,12 +455,24 @@ impl LLMEntityExtractor {
             let target_entity = name_to_entity.get(&rel_item.target.to_lowercase());
 
             if let (Some(source), Some(target)) = (source_entity, target_entity) {
+                // The LLM emits free-text in `RelationshipData::description`;
+                // copy it onto `Relationship::description` so element-summary
+                // collapse has something to merge per (source, target,
+                // relation_type) group. `relation_type` keeps the same value
+                // for backward compatibility with existing graph-traversal
+                // consumers.
+                let description = if rel_item.description.trim().is_empty() {
+                    None
+                } else {
+                    Some(rel_item.description.clone())
+                };
                 let relationship = Relationship {
                     source: source.id.clone(),
                     target: target.id.clone(),
                     relation_type: rel_item.description.clone(),
                     confidence: rel_item.strength as f32,
                     context: vec![], // No context chunks for this relationship
+                    description,
                     embedding: None,
                     temporal_type: None,
                     temporal_range: None,

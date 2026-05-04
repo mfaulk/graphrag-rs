@@ -280,6 +280,13 @@ pub struct Relationship {
     /// Chunk IDs providing context for this relationship
     pub context: Vec<ChunkId>,
 
+    /// Free-text description of the relationship. Populated by LLM-based
+    /// extractors and overwritten by element-summary collapse when the same
+    /// (source, target, relation_type) triple is described in multiple
+    /// chunks (Edge et al. 2024 §2.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
     /// Optional embedding vector for semantic similarity matching
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub embedding: Option<Vec<f32>>,
@@ -305,12 +312,19 @@ impl Relationship {
             relation_type,
             confidence,
             context: Vec::new(),
+            description: None,
             embedding: None,
             // Temporal fields default to None (backward compatible)
             temporal_type: None,
             temporal_range: None,
             causal_strength: None,
         }
+    }
+
+    /// Set the free-text description for this relationship.
+    pub fn with_description(mut self, description: String) -> Self {
+        self.description = Some(description);
+        self
     }
 
     /// Add context chunks to the relationship
@@ -947,6 +961,13 @@ impl KnowledgeGraph {
     /// Get all relationships as an iterator
     pub fn relationships(&self) -> impl Iterator<Item = &Relationship> {
         self.graph.edge_weights()
+    }
+
+    /// Get all relationships as a mutable iterator. Element-summary writeback
+    /// uses this to update every edge in a (source, target, relation_type)
+    /// group rather than relying on a per-id index.
+    pub fn relationships_mut(&mut self) -> impl Iterator<Item = &mut Relationship> {
+        self.graph.edge_weights_mut()
     }
 
     /// Clear all entities and relationships while preserving documents and chunks

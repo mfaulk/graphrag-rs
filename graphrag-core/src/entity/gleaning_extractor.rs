@@ -410,12 +410,21 @@ impl GleaningEntityExtractor {
             let target_entity = name_to_entity.get(&rel_item.target.to_lowercase());
 
             if let (Some(source), Some(target)) = (source_entity, target_entity) {
+                // Mirror llm_extractor: keep the free-text description so
+                // element-summary collapse can merge multi-chunk emissions
+                // (Edge et al. 2024 §2.2).
+                let description = if rel_item.description.trim().is_empty() {
+                    None
+                } else {
+                    Some(rel_item.description.clone())
+                };
                 let relationship = Relationship {
                     source: source.id.clone(),
                     target: target.id.clone(),
                     relation_type: rel_item.description.clone(),
                     confidence: rel_item.strength as f32,
                     context: vec![],
+                    description,
                     embedding: None,
                     temporal_type: None,
                     temporal_range: None,
