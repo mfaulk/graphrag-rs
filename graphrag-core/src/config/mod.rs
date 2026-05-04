@@ -1426,6 +1426,27 @@ fn default_max_gleaning_rounds() -> usize {
     1
 }
 
+/// Parse the `entities.mode` string used by manual TOML/JSON code paths.
+///
+/// Recognises the snake_case names emitted by `EntityExtractionMode`'s serde
+/// representation (`algorithmic`, `llm_single_pass`, `llm_gleaning`).
+fn parse_entity_extraction_mode(value: &str) -> Option<EntityExtractionMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "algorithmic" => Some(EntityExtractionMode::Algorithmic),
+        "llm_single_pass" => Some(EntityExtractionMode::LlmSinglePass),
+        "llm_gleaning" => Some(EntityExtractionMode::LlmGleaning),
+        _ => None,
+    }
+}
+
+fn entity_extraction_mode_to_str(mode: EntityExtractionMode) -> &'static str {
+    match mode {
+        EntityExtractionMode::Algorithmic => "algorithmic",
+        EntityExtractionMode::LlmSinglePass => "llm_single_pass",
+        EntityExtractionMode::LlmGleaning => "llm_gleaning",
+    }
+}
+
 fn default_validation_confidence() -> f32 {
     0.7
 }
@@ -1880,7 +1901,9 @@ impl Config {
                 } else {
                     default_entity_types()
                 },
-                mode: None,
+                mode: parsed["entities"]["mode"]
+                    .as_str()
+                    .and_then(parse_entity_extraction_mode),
                 use_gleaning: parsed["entities"]["use_gleaning"]
                     .as_bool()
                     .unwrap_or(false),
@@ -1899,7 +1922,18 @@ impl Config {
                 max_fact_tokens: parsed["entities"]["max_fact_tokens"]
                     .as_usize()
                     .unwrap_or(default_max_fact_tokens()),
-                element_summary: ElementSummaryConfig::default(),
+                element_summary: ElementSummaryConfig {
+                    enabled: parsed["entities"]["element_summary"]["enabled"]
+                        .as_bool()
+                        .unwrap_or(true),
+                    min_instances: parsed["entities"]["element_summary"]["min_instances"]
+                        .as_usize()
+                        .unwrap_or_else(default_element_summary_min_instances),
+                    max_chars_for_concat: parsed["entities"]["element_summary"]
+                        ["max_chars_for_concat"]
+                        .as_usize()
+                        .unwrap_or_else(default_element_summary_max_chars_concat),
+                },
             },
             retrieval: RetrievalConfig {
                 top_k: parsed["retrieval"]["top_k"]
@@ -2380,8 +2414,19 @@ impl Config {
             .map(|s| json::JsonValue::from(s.as_str()))
             .collect();
         entities["entity_types"] = json::JsonValue::from(entity_types_array);
+        if let Some(mode) = self.entities.mode {
+            entities["mode"] = json::JsonValue::from(entity_extraction_mode_to_str(mode));
+        }
         entities["use_gleaning"] = json::JsonValue::from(self.entities.use_gleaning);
         entities["max_gleaning_rounds"] = json::JsonValue::from(self.entities.max_gleaning_rounds);
+        let mut element_summary = json::JsonValue::new_object();
+        element_summary["enabled"] =
+            json::JsonValue::from(self.entities.element_summary.enabled);
+        element_summary["min_instances"] =
+            json::JsonValue::from(self.entities.element_summary.min_instances);
+        element_summary["max_chars_for_concat"] =
+            json::JsonValue::from(self.entities.element_summary.max_chars_for_concat);
+        entities["element_summary"] = element_summary;
         config_json["entities"] = entities;
 
         // Retrieval
@@ -2603,5 +2648,65 @@ mod entity_mode_tests {
             element_summary: ElementSummaryConfig::default(),
         };
         assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::LlmSinglePass);
+    }
+}
+
+#[cfg(test)]
+mod config_io_round_trip_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// JSON I/O round-trip preserves the explicit `entities.mode` field.
+    #[test]
+    fn config_round_trip_preserves_entity_mode() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut cfg = Config::default();
+        cfg.entities.mode = Some(EntityExtractionMode::LlmSinglePass);
+        cfg.to_file(&path_str).expect("write config");
+
+        let loaded = Config::from_file(&path_str).expect("read config");
+        assert_eq!(loaded.entities.mode, Some(EntityExtractionMode::LlmSinglePass));
+    }
+
+    /// JSON I/O round-trip preserves the `entities.element_summary` block.
+    #[test]
+    fn config_round_trip_preserves_element_summary_settings() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut cfg = Config::default();
+        cfg.entities.element_summary = ElementSummaryConfig {
+            enabled: false,
+            min_instances: 7,
+            max_chars_for_concat: 4321,
+        };
+        cfg.to_file(&path_str).expect("write config");
+
+        let loaded = Config::from_file(&path_str).expect("read config");
+        assert!(!loaded.entities.element_summary.enabled);
+        assert_eq!(loaded.entities.element_summary.min_instances, 7);
+        assert_eq!(loaded.entities.element_summary.max_chars_for_concat, 4321);
+    }
+
+    /// `parse_entity_extraction_mode` accepts the snake_case serde names.
+    #[test]
+    fn parse_entity_extraction_mode_accepts_snake_case_variants() {
+        assert_eq!(
+            parse_entity_extraction_mode("algorithmic"),
+            Some(EntityExtractionMode::Algorithmic)
+        );
+        assert_eq!(
+            parse_entity_extraction_mode("llm_single_pass"),
+            Some(EntityExtractionMode::LlmSinglePass)
+        );
+        assert_eq!(
+            parse_entity_extraction_mode("llm_gleaning"),
+            Some(EntityExtractionMode::LlmGleaning)
+        );
+        assert_eq!(parse_entity_extraction_mode("nonsense"), None);
     }
 }
