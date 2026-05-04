@@ -41,6 +41,16 @@ use crate::vector::store::VectorStore;
 pub struct RetrievalSystem {
     vector_store: std::sync::Arc<dyn VectorStore>,
     embedding_generator: EmbeddingGenerator,
+    /// Configured async embedder (OpenAI, Voyage, Ollama, ...). When `None`,
+    /// the hash-based `embedding_generator` is used. Populated by
+    /// `RetrievalSystem::new` when `config.embeddings.backend != "hash"`,
+    /// or by `with_embedder` when an embedder is injected via the registry.
+    #[cfg(feature = "async")]
+    embedder: Option<crate::core::registry::DynAsyncEmbedder>,
+    /// Whether to silently fall back to the hash generator when the
+    /// configured embedder fails at runtime. Mirrors
+    /// `config.embeddings.fallback_to_hash`.
+    fallback_to_hash: bool,
     config: RetrievalConfig,
     #[cfg(feature = "parallel-processing")]
     parallel_processor: Option<ParallelProcessor>,
@@ -52,8 +62,27 @@ pub struct RetrievalSystem {
 }
 
 impl RetrievalSystem {
-    /// Create a new retrieval system
+    /// Create a new retrieval system using `config.embeddings.backend` to
+    /// pick an embedder. See [`RetrievalSystem::new_with_embedder`] for the
+    /// registry-injected variant.
     pub fn new(config: &Config) -> Result<Self> {
+        Self::new_with_embedder(config, None)
+    }
+
+    /// Create a new retrieval system, optionally bypassing
+    /// `config.embeddings.backend` selection with a pre-built embedder.
+    ///
+    /// Selection precedence (issue #91 / #6):
+    /// 1. `embedder_override` (from `ServiceRegistry` via
+    ///    `GraphRAG::new_with_registry`).
+    /// 2. `config.embeddings.backend` factory dispatch (hash/Ollama/HTTP).
+    /// 3. Hash fallback when `fallback_to_hash = true` and (2) fails to
+    ///    construct.
+    #[cfg(feature = "async")]
+    pub fn new_with_embedder(
+        config: &Config,
+        embedder_override: Option<crate::core::registry::DynAsyncEmbedder>,
+    ) -> Result<Self> {
         let retrieval_config = RetrievalConfig {
             top_k: config.retrieval.top_k,
             similarity_threshold: 0.35,
@@ -73,16 +102,41 @@ impl RetrievalSystem {
             std::sync::Arc::new(crate::vector::memory_store::MemoryVectorStore::new());
 
         // Use the configured embedding dimension for the hash fallback so the
-        // hot retrieval path actually respects `[embeddings]` config. Even
-        // before the configured embedder gets wired through (see #6 / #7),
-        // dimension parity matters: a 768-dim Nomic / 1536-dim OpenAI
-        // configuration would have silently downgraded query-time embeddings
-        // to the previous hardcoded 128 dims.
+        // hot retrieval path actually respects `[embeddings]` config. The
+        // hash generator is also used when the configured backend is "hash"
+        // or when fallback_to_hash kicks in after a runtime API failure.
         let embedding_dim = config.embeddings.dimension.max(1);
+
+        // Resolve the embedder: registry override wins; otherwise dispatch
+        // on `config.embeddings.backend`. A construction failure is fatal
+        // unless `fallback_to_hash = true` (issue #91).
+        let embedder = if let Some(e) = embedder_override {
+            Some(e)
+        } else {
+            match crate::embeddings::factory::build_async_embedder(&config.embeddings) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    if config.embeddings.fallback_to_hash {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "Failed to construct configured embedder \"{}\": {}. \
+                             Falling back to hash embeddings.",
+                            config.embeddings.backend,
+                            e,
+                        );
+                        None
+                    } else {
+                        return Err(e);
+                    }
+                },
+            }
+        };
 
         Ok(Self {
             vector_store,
             embedding_generator: EmbeddingGenerator::new(embedding_dim),
+            embedder,
+            fallback_to_hash: config.embeddings.fallback_to_hash,
             config: retrieval_config,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
@@ -92,6 +146,68 @@ impl RetrievalSystem {
             #[cfg(feature = "lazygraphrag")]
             concept_filtering_enabled: false,
         })
+    }
+
+    /// Sync construction path (no async feature). Always uses hash
+    /// embeddings; the configured backend is only honoured under `async`.
+    #[cfg(not(feature = "async"))]
+    pub fn new_with_embedder(config: &Config, _override: Option<()>) -> Result<Self> {
+        let retrieval_config = RetrievalConfig {
+            top_k: config.retrieval.top_k,
+            similarity_threshold: 0.35,
+            max_expansion_depth: 2,
+            entity_weight: 0.4,
+            chunk_weight: 0.4,
+            graph_weight: 0.2,
+            #[cfg(feature = "lazygraphrag")]
+            use_concept_filtering: false,
+            #[cfg(feature = "lazygraphrag")]
+            concept_top_k: 20,
+        };
+
+        let vector_store =
+            std::sync::Arc::new(crate::vector::memory_store::MemoryVectorStore::new());
+
+        let embedding_dim = config.embeddings.dimension.max(1);
+
+        Ok(Self {
+            vector_store,
+            embedding_generator: EmbeddingGenerator::new(embedding_dim),
+            fallback_to_hash: config.embeddings.fallback_to_hash,
+            config: retrieval_config,
+            #[cfg(feature = "parallel-processing")]
+            parallel_processor: None,
+            #[cfg(feature = "pagerank")]
+            pagerank_retriever: None,
+            enriched_retriever: None,
+            #[cfg(feature = "lazygraphrag")]
+            concept_filtering_enabled: false,
+        })
+    }
+
+    /// Embed `text` using the configured async embedder; on failure (or
+    /// when no embedder is configured) falls back to the in-memory hash
+    /// generator if `fallback_to_hash` is enabled. Logs a warning on the
+    /// first fallback per call so users see the signal without spamming.
+    #[cfg(feature = "async")]
+    async fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
+        if let Some(embedder) = self.embedder.clone() {
+            match embedder.embed(text).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    if self.fallback_to_hash {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "Configured embedder failed ({}); falling back to hash embeddings",
+                            e
+                        );
+                    } else {
+                        return Err(e);
+                    }
+                },
+            }
+        }
+        Ok(self.embedding_generator.generate_embedding(text))
     }
 }
 
@@ -507,6 +623,9 @@ impl RetrievalSystem {
         Ok(Self {
             vector_store,
             embedding_generator,
+            #[cfg(feature = "async")]
+            embedder: None,
+            fallback_to_hash: true,
             config: retrieval_config,
             parallel_processor: Some(parallel_processor),
             #[cfg(feature = "pagerank")]
@@ -674,8 +793,8 @@ impl RetrievalSystem {
         // 1. Analyze query to determine optimal strategy
         let analysis = self.analyze_query(query, graph)?;
 
-        // 2. Generate query embedding
-        let query_embedding = self.embedding_generator.generate_embedding(query);
+        // 2. Generate query embedding (configured embedder if any, hash fallback otherwise)
+        let query_embedding = self.embed_text(query).await?;
 
         // 3. Execute multi-strategy retrieval based on analysis
         let mut results = self
@@ -700,8 +819,8 @@ impl RetrievalSystem {
         query: &str,
         graph: &KnowledgeGraph,
     ) -> Result<Vec<SearchResult>> {
-        // 1. Generate query embedding
-        let query_embedding = self.embedding_generator.generate_embedding(query);
+        // 1. Generate query embedding via the configured embedder
+        let query_embedding = self.embed_text(query).await?;
 
         // 2. Perform comprehensive search
         let results = self.comprehensive_search(&query_embedding, graph).await?;
@@ -758,7 +877,7 @@ impl RetrievalSystem {
 
         // Process chunks
         for (chunk_id, text) in chunk_texts {
-            let embedding = self.embedding_generator.generate_embedding(&text);
+            let embedding = self.embed_text(&text).await?;
             if let Some(chunk) = graph.get_chunk_mut(&chunk_id) {
                 chunk.embedding = Some(embedding);
             }
@@ -766,7 +885,7 @@ impl RetrievalSystem {
 
         // Process entities
         for (entity_id, text) in entity_texts {
-            let embedding = self.embedding_generator.generate_embedding(&text);
+            let embedding = self.embed_text(&text).await?;
             if let Some(entity) = graph.get_entity_mut(&entity_id) {
                 entity.embedding = Some(embedding);
             }
@@ -780,30 +899,36 @@ impl RetrievalSystem {
 
     /// Sequential embedding generation (fallback)
     async fn add_embeddings_sequential(&mut self, graph: &mut KnowledgeGraph) -> Result<()> {
-        // Debug: Check total counts first (uncomment for debugging)
-        let _total_chunks = graph.chunks().count();
-        let _total_entities = graph.entities().count();
-        // println!("DEBUG: Found {} total chunks and {} total entities in graph", _total_chunks, _total_entities);
+        // Two-pass: collect texts (immutable borrow), embed (no graph
+        // borrow), write back (mutable borrow). Required because
+        // `embed_text` takes `&mut self` and we cannot hold a `&mut graph`
+        // iterator at the same time.
+        let chunk_jobs: Vec<(crate::core::ChunkId, String)> = graph
+            .chunks()
+            .filter(|c| c.embedding.is_none())
+            .map(|c| (c.id.clone(), c.content.clone()))
+            .collect();
 
-        // Generate embeddings for all chunks
-        let mut chunk_count = 0;
-        for chunk in graph.chunks_mut() {
-            if chunk.embedding.is_none() {
-                let embedding = self.embedding_generator.generate_embedding(&chunk.content);
+        let entity_jobs: Vec<(crate::core::EntityId, String)> = graph
+            .entities()
+            .filter(|e| e.embedding.is_none())
+            .map(|e| (e.id.clone(), format!("{} {}", e.name, e.entity_type)))
+            .collect();
+
+        let chunk_count = chunk_jobs.len();
+        let entity_count = entity_jobs.len();
+
+        for (chunk_id, text) in chunk_jobs {
+            let embedding = self.embed_text(&text).await?;
+            if let Some(chunk) = graph.get_chunk_mut(&chunk_id) {
                 chunk.embedding = Some(embedding);
-                chunk_count += 1;
             }
         }
 
-        // Generate embeddings for all entities (using their name and context)
-        let mut entity_count = 0;
-        for entity in graph.entities_mut() {
-            if entity.embedding.is_none() {
-                // Create entity text from name and entity type
-                let entity_text = format!("{} {}", entity.name, entity.entity_type);
-                let embedding = self.embedding_generator.generate_embedding(&entity_text);
+        for (entity_id, text) in entity_jobs {
+            let embedding = self.embed_text(&text).await?;
+            if let Some(entity) = graph.get_entity_mut(&entity_id) {
                 entity.embedding = Some(embedding);
-                entity_count += 1;
             }
         }
 
@@ -811,7 +936,6 @@ impl RetrievalSystem {
             "Generated embeddings for {chunk_count} chunks and {entity_count} entities"
         );
 
-        // Re-index the graph with new embeddings
         // Re-index the graph with new embeddings
         self.index_graph(graph).await?;
 
@@ -1736,7 +1860,7 @@ impl RetrievalSystem {
         query: &str,
         max_results: usize,
     ) -> Result<Vec<SearchResult>> {
-        let query_embedding = self.embedding_generator.generate_embedding(query);
+        let query_embedding = self.embed_text(query).await?;
         let similar_vectors = self
             .vector_store
             .search(&query_embedding, max_results)
