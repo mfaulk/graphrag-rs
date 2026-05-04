@@ -236,21 +236,29 @@ impl<'a> LocalSearch<'a> {
         Ok(ctx)
     }
 
-    /// Case-insensitive substring entity match. Mirrors `analyze_query` in
-    /// `retrieval/mod.rs` so seeds line up with the existing classifier.
+    /// Word-level entity match: a seed is selected when the query and the
+    /// entity name share at least one normalized whitespace-separated token.
+    ///
+    /// Normalization strips punctuation (`is_alphanumeric() || is_whitespace()`)
+    /// and lower-cases. Word-level set intersection avoids the false positives
+    /// of substring matching (e.g. `bobblehead` matching entity `Bob`) and the
+    /// false negatives of a length cutoff (e.g. `AI`, `UK`).
     fn find_seed_entities(&self, query: &str) -> Vec<Entity> {
-        let q_lower = query.to_lowercase();
-        let words: Vec<&str> = q_lower.split_whitespace().collect();
+        let query_norm = normalize(query);
+        let query_words: HashSet<&str> = query_norm.split_whitespace().collect();
+        if query_words.is_empty() {
+            return Vec::new();
+        }
 
         let mut seeds: Vec<Entity> = Vec::new();
         let mut seen: HashSet<EntityId> = HashSet::new();
         for entity in self.graph.entities() {
-            let name_lower = entity.name.to_lowercase();
-            // Match if any whole word in the query overlaps the entity name.
-            // Avoid trivial 1- or 2-char overlaps which create noisy seeds.
-            let hit = words
-                .iter()
-                .any(|&w| w.len() >= 3 && (name_lower.contains(w) || w.contains(&name_lower)));
+            let name_norm = normalize(&entity.name);
+            let entity_words: HashSet<&str> = name_norm.split_whitespace().collect();
+            if entity_words.is_empty() {
+                continue;
+            }
+            let hit = !query_words.is_disjoint(&entity_words);
             if hit && !seen.contains(&entity.id) {
                 seen.insert(entity.id.clone());
                 seeds.push(entity.clone());
@@ -315,6 +323,16 @@ impl<'a> LocalSearch<'a> {
         }
         out
     }
+}
+
+/// Lower-case `s` and drop characters that are neither alphanumeric nor
+/// whitespace. Used to canonicalize both queries and entity names so seed
+/// matching can do clean whitespace-token set intersection.
+fn normalize(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
 }
 
 fn format_entity_description(entity: &Entity) -> String {
@@ -520,6 +538,78 @@ mod tests {
         assert_eq!(LocalContextTier::Relationships.label(), "Relationships");
         assert_eq!(LocalContextTier::SourceChunks.label(), "Sources");
         assert_eq!(LocalContextTier::Community.label(), "Communities");
+    }
+
+    /// Word-level matching must select short acronym entities like `AI` that
+    /// the previous `len() >= 3` filter dropped.
+    #[test]
+    fn local_search_finds_short_acronym_entities() {
+        let mut g = KnowledgeGraph::new();
+        g.add_chunk(make_chunk("c1", "doc1", "AI is reshaping research."))
+            .unwrap();
+        g.add_entity(
+            Entity::new(
+                EntityId::new("ai".into()),
+                "AI".into(),
+                "CONCEPT".into(),
+                0.9,
+            )
+            .with_mentions(vec![make_mention("c1")]),
+        )
+        .unwrap();
+
+        let ls = LocalSearch::with_default_config(&g);
+        let ctx = ls.search("What is AI?", 4096).unwrap();
+        assert_eq!(ctx.seed_entities, vec!["AI".to_string()]);
+    }
+
+    /// `bobblehead` must NOT match entity `Bob` — substring matching is wrong.
+    #[test]
+    fn local_search_does_not_match_substring_within_word() {
+        let mut g = KnowledgeGraph::new();
+        g.add_chunk(make_chunk("c1", "doc1", "Bob is here."))
+            .unwrap();
+        g.add_entity(
+            Entity::new(
+                EntityId::new("bob".into()),
+                "Bob".into(),
+                "PERSON".into(),
+                0.9,
+            )
+            .with_mentions(vec![make_mention("c1")]),
+        )
+        .unwrap();
+
+        let ls = LocalSearch::with_default_config(&g);
+        let ctx = ls.search("Tell me about a bobblehead", 4096).unwrap();
+        assert!(
+            ctx.seed_entities.is_empty(),
+            "substring of a longer word must not match: got {:?}",
+            ctx.seed_entities
+        );
+    }
+
+    /// Punctuation in the query (e.g. `Alice?`) must be stripped before
+    /// matching; an entity named `Alice` must still seed.
+    #[test]
+    fn local_search_strips_punctuation_from_query() {
+        let mut g = KnowledgeGraph::new();
+        g.add_chunk(make_chunk("c1", "doc1", "Alice is here."))
+            .unwrap();
+        g.add_entity(
+            Entity::new(
+                EntityId::new("alice".into()),
+                "Alice".into(),
+                "PERSON".into(),
+                0.9,
+            )
+            .with_mentions(vec![make_mention("c1")]),
+        )
+        .unwrap();
+
+        let ls = LocalSearch::with_default_config(&g);
+        let ctx = ls.search("Alice?", 4096).unwrap();
+        assert_eq!(ctx.seed_entities, vec!["Alice".to_string()]);
     }
 
     /// Seeds that are only the *target* of a relationship must still see that
