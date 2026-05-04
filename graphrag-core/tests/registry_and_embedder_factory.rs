@@ -679,6 +679,59 @@ async fn retrieval_handles_provider_success_then_failure_dim_consistent() {
     let _ = v_fallback;
 }
 
+/// A typo in `[embeddings].backend` must surface immediately, even when
+/// `fallback_to_hash = true` (issue #91 review, finding #3). The
+/// `fallback_to_hash` switch governs *runtime* failures (HTTP 5xx, rate
+/// limits) — silently swallowing a configuration error here would mean
+/// the user gets bad retrieval six months later instead of an error at
+/// boot.
+#[test]
+fn factory_errors_on_unknown_backend_typo() {
+    use graphrag_core::embeddings::factory::build_async_embedder;
+
+    let mut config = Config::default();
+    config.embeddings.backend = "opena".to_string(); // typo
+    config.embeddings.fallback_to_hash = true;
+
+    match build_async_embedder(&config.embeddings) {
+        Ok(_) => panic!("typo'd backend must error in the factory"),
+        Err(err) => {
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("opena") || msg.to_lowercase().contains("unknown"),
+                "error must identify the bad backend, got: {msg}"
+            );
+        },
+    }
+}
+
+/// `RetrievalSystem::new_with_embedder` must propagate factory errors
+/// rather than silently swallowing them when `fallback_to_hash = true`.
+/// Construction-time errors are *configuration* errors; runtime
+/// fallback is a separate concern (issue #91 review, finding #3).
+#[test]
+fn retrieval_construction_errors_propagate_through_fallback_to_hash() {
+    use graphrag_core::retrieval::RetrievalSystem;
+
+    let mut config = Config::default();
+    config.embeddings.backend = "definitely-not-a-real-backend".to_string();
+    config.embeddings.fallback_to_hash = true; // must NOT rescue config errors
+
+    match RetrievalSystem::new_with_embedder(&config, None) {
+        Ok(_) => panic!(
+            "unknown backend must produce an error even with \
+             fallback_to_hash=true; the flag is only for runtime errors"
+        ),
+        Err(err) => {
+            let msg = format!("{err}").to_lowercase();
+            assert!(
+                msg.contains("definitely-not-a-real-backend") || msg.contains("unknown"),
+                "error must identify the bad backend, got: {msg}"
+            );
+        },
+    }
+}
+
 /// Direct check that fix #2 wires the embedder's dim into `embed_text`'s
 /// fallback. Distinct from the integration test above so a failure
 /// points at the dim-tracking field, not somewhere deeper.

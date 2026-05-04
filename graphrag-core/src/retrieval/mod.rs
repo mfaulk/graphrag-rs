@@ -94,8 +94,12 @@ impl RetrievalSystem {
     /// 1. `embedder_override` (from `ServiceRegistry` via
     ///    `GraphRAG::new_with_registry`).
     /// 2. `config.embeddings.backend` factory dispatch (hash/Ollama/HTTP).
-    /// 3. Hash fallback when `fallback_to_hash = true` and (2) fails to
-    ///    construct.
+    ///
+    /// Construction-time errors from the factory propagate. The
+    /// `fallback_to_hash` flag only governs runtime failures
+    /// (`AsyncEmbedder::embed` returning `Err`); a misconfigured backend
+    /// is always fatal so users see typos and missing credentials at
+    /// boot rather than after months of silent hash-degraded retrieval.
     #[cfg(feature = "async")]
     pub fn new_with_embedder(
         config: &Config,
@@ -125,28 +129,17 @@ impl RetrievalSystem {
         let configured_dim = config.embeddings.dimension.max(1);
 
         // Resolve the embedder: registry override wins; otherwise dispatch
-        // on `config.embeddings.backend`. A construction failure is fatal
-        // unless `fallback_to_hash = true` (issue #91).
+        // on `config.embeddings.backend`. Construction failures (typos,
+        // missing API keys, missing feature flags) are *always* fatal —
+        // `fallback_to_hash` only governs runtime errors (HTTP failures,
+        // rate limits, transient 5xxs). Silently swallowing config
+        // errors here would mean a user who typoed `backend = "opena"`
+        // gets bad retrieval quality six months later instead of an
+        // immediate error at boot (issue #91 review, finding #3).
         let embedder = if let Some(e) = embedder_override {
             Some(e)
         } else {
-            match crate::embeddings::factory::build_async_embedder(&config.embeddings) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    if config.embeddings.fallback_to_hash {
-                        #[cfg(feature = "tracing")]
-                        tracing::warn!(
-                            "Failed to construct configured embedder \"{}\": {}. \
-                             Falling back to hash embeddings.",
-                            config.embeddings.backend,
-                            e,
-                        );
-                        None
-                    } else {
-                        return Err(e);
-                    }
-                },
-            }
+            crate::embeddings::factory::build_async_embedder(&config.embeddings)?
         };
 
         // Trust the embedder's `dimension()` over the config: providers
