@@ -263,13 +263,16 @@ impl<'a> LocalSearch<'a> {
     }
 
     /// Build relationship descriptions for edges incident to any seed entity.
+    ///
+    /// Uses `get_incident_relationships`, which walks both outgoing *and*
+    /// incoming edges so seeds that are only edge targets still contribute.
     fn collect_relationships(&self, seeds: &[Entity]) -> Vec<String> {
         let seed_ids: HashSet<EntityId> = seeds.iter().map(|e| e.id.clone()).collect();
         let mut emitted: HashSet<(EntityId, EntityId, String)> = HashSet::new();
         let mut out = Vec::new();
 
         for seed in seeds {
-            for (neighbor, rel) in self.graph.get_neighbors(&seed.id) {
+            for (other, rel) in self.graph.get_incident_relationships(&seed.id) {
                 let key = (
                     rel.source.clone(),
                     rel.target.clone(),
@@ -280,11 +283,16 @@ impl<'a> LocalSearch<'a> {
                 }
                 // Prefer relationships among seeds; if `include_neighbors` is
                 // off, skip edges that leave the seed set.
-                if !self.config.include_neighbors && !seed_ids.contains(&neighbor.id) {
+                if !self.config.include_neighbors && !seed_ids.contains(&other.id) {
                     continue;
                 }
                 emitted.insert(key);
-                out.push(format_relationship(seed, neighbor, rel));
+                // Render with the canonical (source -> target) direction
+                // from the relationship itself, regardless of which endpoint
+                // we found it through.
+                let source_entity = self.graph.get_entity(&rel.source).unwrap_or(seed);
+                let target_entity = self.graph.get_entity(&rel.target).unwrap_or(other);
+                out.push(format_relationship(source_entity, target_entity, rel));
             }
         }
         out
@@ -512,5 +520,86 @@ mod tests {
         assert_eq!(LocalContextTier::Relationships.label(), "Relationships");
         assert_eq!(LocalContextTier::SourceChunks.label(), "Sources");
         assert_eq!(LocalContextTier::Community.label(), "Communities");
+    }
+
+    /// Seeds that are only the *target* of a relationship must still see that
+    /// edge surface in tier (b). Regression test for the directed-graph
+    /// `get_neighbors` bug fixed by switching to `get_incident_relationships`.
+    #[test]
+    fn local_search_includes_incoming_relationships_for_seed() {
+        let mut g = KnowledgeGraph::new();
+        g.add_chunk(make_chunk("c1", "doc1", "Bob and Carol talked."))
+            .unwrap();
+
+        let bob = Entity::new(
+            EntityId::new("bob".into()),
+            "Bob".into(),
+            "PERSON".into(),
+            0.95,
+        )
+        .with_mentions(vec![make_mention("c1")]);
+        let carol = Entity::new(
+            EntityId::new("carol".into()),
+            "Carol".into(),
+            "PERSON".into(),
+            0.95,
+        )
+        .with_mentions(vec![make_mention("c1")]);
+        let dave = Entity::new(
+            EntityId::new("dave".into()),
+            "Dave".into(),
+            "PERSON".into(),
+            0.95,
+        )
+        .with_mentions(vec![make_mention("c1")]);
+
+        g.add_entity(bob).unwrap();
+        g.add_entity(carol).unwrap();
+        g.add_entity(dave).unwrap();
+
+        // Carol is the *source* of one edge (outgoing) ...
+        g.add_relationship(Relationship::new(
+            EntityId::new("carol".into()),
+            EntityId::new("dave".into()),
+            "MENTORED".into(),
+            0.85,
+        ))
+        .unwrap();
+        // ... and the *target* of another (incoming).
+        g.add_relationship(Relationship::new(
+            EntityId::new("bob".into()),
+            EntityId::new("carol".into()),
+            "MET".into(),
+            0.9,
+        ))
+        .unwrap();
+
+        // Query mentions only Carol, so Carol is the sole seed.
+        let ls = LocalSearch::new(
+            &g,
+            LocalSearchConfig {
+                budget: 4096,
+                top_k_entities: 1,
+                include_neighbors: true,
+            },
+        );
+        let ctx = ls.search("Tell me about Carol", 4096).unwrap();
+
+        assert_eq!(ctx.seed_entities, vec!["Carol".to_string()]);
+        // Both edges are incident to Carol; both must appear.
+        assert!(
+            ctx.relationship_descriptions
+                .iter()
+                .any(|d| d.contains("Bob") && d.contains("MET") && d.contains("Carol")),
+            "incoming edge Bob-MET->Carol must appear, got: {:?}",
+            ctx.relationship_descriptions
+        );
+        assert!(
+            ctx.relationship_descriptions
+                .iter()
+                .any(|d| d.contains("Carol") && d.contains("MENTORED") && d.contains("Dave")),
+            "outgoing edge Carol-MENTORED->Dave must appear, got: {:?}",
+            ctx.relationship_descriptions
+        );
     }
 }
