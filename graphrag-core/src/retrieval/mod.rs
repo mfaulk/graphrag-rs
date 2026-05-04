@@ -40,7 +40,15 @@ use crate::vector::store::VectorStore;
 /// Retrieval system for querying the knowledge graph
 pub struct RetrievalSystem {
     vector_store: std::sync::Arc<dyn VectorStore>,
-    embedding_generator: EmbeddingGenerator,
+    /// Hash-based embedding generator used when no async embedder is wired
+    /// up (or as the runtime fallback when `fallback_to_hash` is enabled).
+    /// Wrapped in a `Mutex` because `EmbeddingGenerator::generate_embedding`
+    /// mutates its internal word-vector cache; the mutex lets `embed_text`
+    /// take `&self` so multiple concurrent queries can share a
+    /// `RetrievalSystem` (the embedder itself is already
+    /// `Arc<dyn Trait + Send + Sync>`). Hash generation is non-blocking and
+    /// short-lived, so a `std::sync::Mutex` is fine here.
+    embedding_generator: std::sync::Mutex<EmbeddingGenerator>,
     /// Configured async embedder (OpenAI, Voyage, Ollama, ...). When `None`,
     /// the hash-based `embedding_generator` is used. Populated by
     /// `RetrievalSystem::new` when `config.embeddings.backend != "hash"`,
@@ -134,7 +142,7 @@ impl RetrievalSystem {
 
         Ok(Self {
             vector_store,
-            embedding_generator: EmbeddingGenerator::new(embedding_dim),
+            embedding_generator: std::sync::Mutex::new(EmbeddingGenerator::new(embedding_dim)),
             embedder,
             fallback_to_hash: config.embeddings.fallback_to_hash,
             config: retrieval_config,
@@ -172,7 +180,7 @@ impl RetrievalSystem {
 
         Ok(Self {
             vector_store,
-            embedding_generator: EmbeddingGenerator::new(embedding_dim),
+            embedding_generator: std::sync::Mutex::new(EmbeddingGenerator::new(embedding_dim)),
             fallback_to_hash: config.embeddings.fallback_to_hash,
             config: retrieval_config,
             #[cfg(feature = "parallel-processing")]
@@ -187,11 +195,15 @@ impl RetrievalSystem {
 
     /// Embed `text` using the configured async embedder; on failure (or
     /// when no embedder is configured) falls back to the in-memory hash
-    /// generator if `fallback_to_hash` is enabled. Logs a warning on the
-    /// first fallback per call so users see the signal without spamming.
+    /// generator if `fallback_to_hash` is enabled.
+    ///
+    /// Takes `&self` so multiple concurrent queries can share a
+    /// `RetrievalSystem` (issue #91 review). The hash fallback's mutable
+    /// state lives behind a `Mutex`; the configured `Arc<dyn AsyncEmbedder>`
+    /// is already shareable.
     #[cfg(feature = "async")]
-    async fn embed_text(&mut self, text: &str) -> Result<Vec<f32>> {
-        if let Some(embedder) = self.embedder.clone() {
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        if let Some(embedder) = self.embedder.as_ref().cloned() {
             match embedder.embed(text).await {
                 Ok(v) => return Ok(v),
                 Err(e) => {
@@ -207,7 +219,13 @@ impl RetrievalSystem {
                 },
             }
         }
-        Ok(self.embedding_generator.generate_embedding(text))
+        let mut gen =
+            self.embedding_generator
+                .lock()
+                .map_err(|_| crate::core::GraphRAGError::Config {
+                    message: "embedding_generator mutex poisoned".to_string(),
+                })?;
+        Ok(gen.generate_embedding(text))
     }
 }
 
@@ -622,7 +640,7 @@ impl RetrievalSystem {
 
         Ok(Self {
             vector_store,
-            embedding_generator,
+            embedding_generator: std::sync::Mutex::new(embedding_generator),
             #[cfg(feature = "async")]
             embedder: None,
             fallback_to_hash: true,
@@ -900,9 +918,10 @@ impl RetrievalSystem {
     /// Sequential embedding generation (fallback)
     async fn add_embeddings_sequential(&mut self, graph: &mut KnowledgeGraph) -> Result<()> {
         // Two-pass: collect texts (immutable borrow), embed (no graph
-        // borrow), write back (mutable borrow). Required because
-        // `embed_text` takes `&mut self` and we cannot hold a `&mut graph`
-        // iterator at the same time.
+        // borrow), write back (mutable borrow). Keeps the loop body free
+        // of nested `&graph` + `&mut graph` lifetimes across an await
+        // boundary; `embed_text` itself takes `&self` so this is just a
+        // borrow-checker convenience, not a correctness requirement.
         let chunk_jobs: Vec<(crate::core::ChunkId, String)> = graph
             .chunks()
             .filter(|c| c.embedding.is_none())
@@ -1357,9 +1376,16 @@ impl RetrievalSystem {
                     if !visited.contains(&neighbor.id) {
                         visited.insert(neighbor.id.clone());
 
-                        // Calculate relationship relevance
+                        // Calculate relationship relevance. Hash-only path
+                        // here (cheap, deterministic, no network); the
+                        // configured async embedder is reserved for the
+                        // user's actual query text.
                         let rel_embedding = self
                             .embedding_generator
+                            .lock()
+                            .map_err(|_| crate::core::GraphRAGError::Config {
+                                message: "embedding_generator mutex poisoned".to_string(),
+                            })?
                             .generate_embedding(&relationship.relation_type);
                         let rel_similarity =
                             VectorUtils::cosine_similarity(query_embedding, &rel_embedding);
@@ -1992,9 +2018,13 @@ impl RetrievalSystem {
         };
 
         // Add embedding generator info
+        let (eg_dim, eg_cached) = match self.embedding_generator.lock() {
+            Ok(g) => (g.dimension(), g.cached_words()),
+            Err(_) => (0, 0),
+        };
         json_data["embedding_generator"] = json::object! {
-            "dimension" => self.embedding_generator.dimension(),
-            "cached_words" => self.embedding_generator.cached_words()
+            "dimension" => eg_dim,
+            "cached_words" => eg_cached
         };
 
         // Add parallel processing info
@@ -2074,7 +2104,7 @@ mod tests {
         config.embeddings.dimension = 768;
         let retrieval = RetrievalSystem::new(&config).unwrap();
         assert_eq!(
-            retrieval.embedding_generator.dimension(),
+            retrieval.embedding_generator.lock().unwrap().dimension(),
             768,
             "configured dimension should propagate to retrieval embedder"
         );
@@ -2087,7 +2117,7 @@ mod tests {
         let mut config = Config::default();
         config.embeddings.dimension = 0;
         let retrieval = RetrievalSystem::new(&config).unwrap();
-        assert_eq!(retrieval.embedding_generator.dimension(), 1);
+        assert_eq!(retrieval.embedding_generator.lock().unwrap().dimension(), 1);
     }
 
     #[test]
