@@ -131,6 +131,18 @@ min_confidence = 0.7
 use_gleaning = true
 max_gleaning_rounds = 3
 entity_types = ["PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT"]
+
+# Element-summary collapse (Edge et al. 2024 §2.2): synthesise a single
+# coherent description per entity that appears in multiple chunks. Wired
+# into `build_graph` after extraction; below `max_chars_for_concat` total
+# characters the descriptions are joined locally instead of being sent to
+# the chat backend, saving an LLM call.
+[entities.element_summary]
+enabled = true
+min_instances = 2
+max_chars_for_concat = 800
+temperature = 0.0
+max_output_tokens = 256
 ```
 
 Load with:
