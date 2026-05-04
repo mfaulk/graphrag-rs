@@ -531,10 +531,11 @@ impl LeidenCommunityDetector {
         let level0_communities = self.run_leiden_pass(graph)?;
         levels.insert(0, level0_communities.clone());
 
-        if self.config.max_levels <= 1 {
-            return Ok((levels, hierarchy));
-        }
-
+        // When `max_levels <= 1`, skip the contraction loop but still fall through to the
+        // top-level root-recording pass below so callers see `hierarchy[0][id] = None` for
+        // every level-0 community (matching the documented contract on
+        // `HierarchicalCommunities::hierarchy`).
+        //
         // For each subsequent level we operate on a contracted super-graph and project the
         // resulting community ids back onto the original NodeIndex space.
         let mut prev_assignment = level0_communities; // original NodeIndex -> level-(L-1) community id
@@ -594,14 +595,14 @@ impl LeidenCommunityDetector {
             }
         }
 
-        // Top-level communities are roots: record explicit None parents so callers can detect them.
+        // Top-level communities are roots: always record explicit None parents so callers can
+        // detect them, regardless of whether the top is level 0 (single-level case from
+        // `max_levels = 1` or early termination) or a deeper level.
         let top_level = *levels.keys().max().unwrap_or(&0);
-        if top_level > 0 {
-            let unique_top: HashSet<usize> = levels[&top_level].values().copied().collect();
-            let entry = hierarchy.entry(top_level).or_default();
-            for id in unique_top {
-                entry.entry(id).or_insert(None);
-            }
+        let unique_top: HashSet<usize> = levels[&top_level].values().copied().collect();
+        let entry = hierarchy.entry(top_level).or_default();
+        for id in unique_top {
+            entry.entry(id).or_insert(None);
         }
 
         Ok((levels, hierarchy))
@@ -1077,7 +1078,8 @@ mod tests {
         }
     }
 
-    /// max_levels = 1 caps the algorithm at the leaf partition only.
+    /// max_levels = 1 caps the algorithm at the leaf partition only; the top level (level 0)
+    /// must still appear in `hierarchy` with `None` parents marking those communities as roots.
     #[test]
     fn test_hierarchical_max_levels_cap() {
         let graph = create_two_tier_graph();
@@ -1097,7 +1099,7 @@ mod tests {
             1,
             "expected exactly 1 level when max_levels=1"
         );
-        // With only one level, hierarchy should be empty (no parents to record).
+        // With only one level, no community has a parent (no level-1 to chase up to).
         let parented: usize = result
             .hierarchy
             .values()
@@ -1105,6 +1107,28 @@ mod tests {
             .filter(|p| p.is_some())
             .count();
         assert_eq!(parented, 0, "expected no parent links at max_levels=1");
+
+        // Level 0 communities must still be present in `hierarchy[0]` with `None` parents,
+        // marking them as roots — matching the contract documented on `HierarchicalCommunities`.
+        let cap_communities = result.hierarchy.get(&0).expect("level 0 hierarchy");
+        assert!(
+            !cap_communities.is_empty(),
+            "level 0 hierarchy entries should be recorded for roots when max_levels=1"
+        );
+        for parent in cap_communities.values() {
+            assert!(
+                parent.is_none(),
+                "level-0 communities must be roots when max_levels=1"
+            );
+        }
+        // Coverage: every community id present in `levels[0]` should appear in `hierarchy[0]`.
+        let level_0_ids: HashSet<usize> = result.levels[&0].values().copied().collect();
+        for id in &level_0_ids {
+            assert!(
+                cap_communities.contains_key(id),
+                "missing root entry for level-0 community {id}"
+            );
+        }
     }
 
     /// Summaries must not collide when communities at different levels share an id.
