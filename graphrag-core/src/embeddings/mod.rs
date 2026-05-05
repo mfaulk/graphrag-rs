@@ -22,6 +22,10 @@ pub mod ollama;
 /// TOML configuration for embedding providers
 pub mod config;
 
+/// Build an `AsyncEmbedder` from `config.embeddings.backend` (factory dispatch).
+#[cfg(feature = "async")]
+pub mod factory;
+
 /// Trait for embedding providers
 #[async_trait::async_trait]
 pub trait EmbeddingProvider: Send + Sync {

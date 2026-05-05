@@ -507,7 +507,10 @@ See [config_example.toml](config_example.toml) for detailed explanations of all 
 
 ### Embedding Providers Configuration
 
-GraphRAG Core supports **8 embedding providers** for maximum flexibility:
+GraphRAG Core supports **8 embedding providers** for maximum flexibility. The
+`backend` setting is now consumed end-to-end: ingestion and query-time embeddings
+both go through the configured provider, with hash fallback if
+`fallback_to_hash = true`.
 
 ```toml
 [embeddings]
@@ -519,15 +522,39 @@ backend = "huggingface"  # Free, offline (default)
 # backend = "mistral"    # RAG-optimized
 # backend = "together"   # Cheapest ($0.008/1M)
 # backend = "ollama"     # Local GPU
+# backend = "hash"       # In-memory hash fallback (no I/O, deterministic)
 
 model = "sentence-transformers/all-MiniLM-L6-v2"
 dimension = 384
 batch_size = 32
 cache_dir = "~/.cache/huggingface"
 
+# Graceful degradation when the API is unreachable.
+fallback_to_hash = true
+
 # For API providers, set api_key or use environment variables
 # api_key = "your-key"  # Or set OPENAI_API_KEY, VOYAGE_API_KEY, etc.
 ```
+
+For programmatic injection of a custom embedder (e.g., a Candle/ONNX model
+or a test stub), use the registry path instead of (or alongside) the
+backend string:
+
+```rust
+use graphrag_core::core::registry::RegistryBuilder;
+use graphrag_core::{Config, GraphRAG};
+
+let registry = RegistryBuilder::new()
+    .with_async_embedder(my_custom_embedder)
+    .with_chat_backend(my_chat_backend) // optional
+    .build();
+
+let mut graphrag = GraphRAG::new_with_registry(Config::default(), registry)?;
+graphrag.initialize()?;
+```
+
+The registry-injected embedder wins over `config.embeddings.backend` when both
+are set; otherwise the factory dispatches on `backend`.
 
 **Provider Comparison:**
 

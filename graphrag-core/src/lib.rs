@@ -290,16 +290,55 @@ pub struct GraphRAG {
     #[cfg(feature = "parallel-processing")]
     #[allow(dead_code)] // Held for upcoming parallel-pipeline integration; reader pending.
     parallel_processor: Option<parallel::ParallelProcessor>,
-    /// Optional override for chat-completion calls. When set, the built-in
-    /// Ollama client is bypassed for the final answer-generation step in
-    /// `ask` and `ask_explained`. See [`core::backend::ChatBackend`].
+    /// Service registry for dependency injection. The registry's typed slots
+    /// (`embedder`, `chat_backend`) are consulted at construction time:
+    /// - `embedder` overrides `config.embeddings.backend` selection in
+    ///   `RetrievalSystem` (issue #91 / #6).
+    /// - `chat_backend` overrides Ollama for final answer synthesis. The
+    ///   legacy `set_chat_backend` setter routes through this slot.
     #[cfg(feature = "async")]
-    chat_backend: Option<core::backend::DynChatBackend>,
+    registry: core::registry::ServiceRegistry,
 }
 
 impl GraphRAG {
-    /// Create a new GraphRAG instance with the given configuration
+    /// Create a new GraphRAG instance with the given configuration. Equivalent
+    /// to [`GraphRAG::new_with_registry`] called with an empty registry, so
+    /// behavior matches every previous release for callers that don't inject
+    /// custom services.
     pub fn new(config: Config) -> Result<Self> {
+        #[cfg(feature = "async")]
+        {
+            Self::new_with_registry(config, core::registry::ServiceRegistry::default())
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            Ok(Self {
+                config,
+                knowledge_graph: None,
+                retrieval_system: None,
+                query_planner: None,
+                critic: None,
+                #[cfg(feature = "parallel-processing")]
+                parallel_processor: None,
+            })
+        }
+    }
+
+    /// Create a new GraphRAG instance and consult `registry` for custom
+    /// service implementations (issue #6). At construction time the registry
+    /// is used for two slots:
+    /// - `Embedder` (via `RegistryBuilder::with_async_embedder`): wins over
+    ///   `config.embeddings.backend` when set.
+    /// - `ChatBackend` (via `RegistryBuilder::with_chat_backend`): replaces
+    ///   the built-in Ollama client for final answer synthesis.
+    ///
+    /// Other registry slots (`Storage`, `Retriever`) are accepted but not
+    /// yet wired through; see follow-up issues.
+    #[cfg(feature = "async")]
+    pub fn new_with_registry(
+        config: Config,
+        registry: core::registry::ServiceRegistry,
+    ) -> Result<Self> {
         Ok(Self {
             config,
             knowledge_graph: None,
@@ -308,17 +347,29 @@ impl GraphRAG {
             critic: None,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
-            #[cfg(feature = "async")]
-            chat_backend: None,
+            registry,
         })
     }
 
     /// Inject a custom chat backend for answer generation. Once set, the
     /// built-in Ollama client is bypassed for the final LLM call inside
     /// `ask` and `ask_explained`. Pass `None` to revert to the default.
+    ///
+    /// This is now a thin shim over the [`core::registry::ServiceRegistry`]
+    /// (issue #6): setting it stores the backend in the registry's typed
+    /// slot. Pre-existing callers keep working unchanged.
     #[cfg(feature = "async")]
     pub fn set_chat_backend(&mut self, backend: Option<core::backend::DynChatBackend>) {
-        self.chat_backend = backend;
+        if let Some(b) = backend {
+            self.registry.set_chat_backend(b);
+        } else {
+            // Null only the chat-backend slot. The previous implementation
+            // rebuilt the entire `ServiceRegistry` and copied just the
+            // embedder, which silently dropped anything else the user
+            // had registered through `register/get` (Storage, Retriever,
+            // ...). See `ServiceRegistry::clear_chat_backend` (#6 review).
+            self.registry.clear_chat_backend();
+        }
     }
 
     /// Create a Zero-Config local GraphRAG instance
@@ -363,7 +414,20 @@ impl GraphRAG {
             self.knowledge_graph = Some(KnowledgeGraph::new());
         }
 
-        self.retrieval_system = Some(retrieval::RetrievalSystem::new(&self.config)?);
+        // Pass any registry-injected embedder to RetrievalSystem so the
+        // configured backend is consulted on the hot path (issue #6 + #91).
+        #[cfg(feature = "async")]
+        {
+            let injected = self.registry.async_embedder().cloned();
+            self.retrieval_system = Some(retrieval::RetrievalSystem::new_with_embedder(
+                &self.config,
+                injected,
+            )?);
+        }
+        #[cfg(not(feature = "async"))]
+        {
+            self.retrieval_system = Some(retrieval::RetrievalSystem::new(&self.config)?);
+        }
 
         if self.config.ollama.enabled {
             let client = ollama::OllamaClient::new(self.config.ollama.clone());
@@ -1258,7 +1322,7 @@ impl GraphRAG {
             }
         }
 
-        if self.chat_backend.is_some() || self.config.ollama.enabled {
+        if self.registry.chat_backend().is_some() || self.config.ollama.enabled {
             // Initial synthesis (dispatches through `chat_backend` if set,
             // otherwise via the built-in Ollama client).
             let mut current_answer = self
@@ -1333,9 +1397,10 @@ impl GraphRAG {
         let search_results = self.query_internal_with_results(query).await?;
 
         // Synthesize via LLM whenever a chat backend is reachable — either an
-        // injected `ChatBackend` (set via `set_chat_backend`) or the built-in
-        // Ollama client. The synthesis function picks the right one internally.
-        if self.chat_backend.is_some() || self.config.ollama.enabled {
+        // injected `ChatBackend` (registry slot, populated via
+        // `RegistryBuilder::with_chat_backend` or `set_chat_backend`) or the
+        // built-in Ollama client. The synthesis function picks the right one.
+        if self.registry.chat_backend().is_some() || self.config.ollama.enabled {
             return self
                 .generate_semantic_answer_from_results(query, &search_results)
                 .await;
@@ -1406,8 +1471,8 @@ impl GraphRAG {
         let search_results = self.query_internal_with_results(query).await?;
 
         // Generate the answer — dispatch to the LLM whenever any chat
-        // backend is reachable (injected `ChatBackend` OR built-in Ollama).
-        let answer = if self.chat_backend.is_some() || self.config.ollama.enabled {
+        // backend is reachable (registry-injected `ChatBackend` OR Ollama).
+        let answer = if self.registry.chat_backend().is_some() || self.config.ollama.enabled {
             self.generate_semantic_answer_from_results(query, &search_results)
                 .await?
         } else {
@@ -1604,11 +1669,10 @@ impl GraphRAG {
         };
 
         // Dispatch through an injected ChatBackend if one was provided; otherwise
-        // fall back to the built-in Ollama client. This is the single hook
-        // downstream crates (e.g. semanticore) use to plug OpenAI-style providers
-        // into the answer-generation step without forking the rest of the
-        // pipeline.
-        let answer_result = if let Some(backend) = self.chat_backend.clone() {
+        // fall back to the built-in Ollama client. The backend lives in the
+        // registry's typed slot (issue #6) and is populated via
+        // `RegistryBuilder::with_chat_backend` or `GraphRAG::set_chat_backend`.
+        let answer_result = if let Some(backend) = self.registry.chat_backend().cloned() {
             let chat_params = crate::core::backend::ChatParams {
                 max_tokens: params.num_predict,
                 temperature: params.temperature,

@@ -45,7 +45,35 @@ use crate::vector::store::VectorStore;
 /// Retrieval system for querying the knowledge graph
 pub struct RetrievalSystem {
     vector_store: std::sync::Arc<dyn VectorStore>,
-    embedding_generator: EmbeddingGenerator,
+    /// Hash-based embedding generator used when no async embedder is wired
+    /// up (or as the runtime fallback when `fallback_to_hash` is enabled).
+    /// Wrapped in a `Mutex` because `EmbeddingGenerator::generate_embedding`
+    /// mutates its internal word-vector cache; the mutex lets `embed_text`
+    /// take `&self` so multiple concurrent queries can share a
+    /// `RetrievalSystem` (the embedder itself is already
+    /// `Arc<dyn Trait + Send + Sync>`). Hash generation is non-blocking and
+    /// short-lived, so a `std::sync::Mutex` is fine here.
+    embedding_generator: std::sync::Mutex<EmbeddingGenerator>,
+    /// Configured async embedder (OpenAI, Voyage, Ollama, ...). When `None`,
+    /// the hash-based `embedding_generator` is used. Populated by
+    /// `RetrievalSystem::new` when `config.embeddings.backend != "hash"`,
+    /// or by `with_embedder` when an embedder is injected via the registry.
+    #[cfg(feature = "async")]
+    embedder: Option<crate::core::registry::DynAsyncEmbedder>,
+    /// Cached output dimension of the configured async embedder. Used to
+    /// size the hash fallback so an OpenAI-indexed corpus (1536 dim) is
+    /// never queried with a config-sized vector (e.g. 768) — that
+    /// mismatch makes cosine similarity return 0 and the search returns
+    /// nothing. Seeded from `AsyncEmbedder::dimension()` at construction
+    /// and refined in `embed_text` after the first successful embed if
+    /// the provider's reported value disagrees with reality (issue #91
+    /// review).
+    #[cfg(feature = "async")]
+    fallback_dim: std::sync::Mutex<usize>,
+    /// Whether to silently fall back to the hash generator when the
+    /// configured embedder fails at runtime. Mirrors
+    /// `config.embeddings.fallback_to_hash`.
+    fallback_to_hash: bool,
     config: RetrievalConfig,
     #[cfg(feature = "parallel-processing")]
     parallel_processor: Option<ParallelProcessor>,
@@ -57,8 +85,31 @@ pub struct RetrievalSystem {
 }
 
 impl RetrievalSystem {
-    /// Create a new retrieval system
+    /// Create a new retrieval system using `config.embeddings.backend` to
+    /// pick an embedder. See [`RetrievalSystem::new_with_embedder`] for the
+    /// registry-injected variant.
     pub fn new(config: &Config) -> Result<Self> {
+        Self::new_with_embedder(config, None)
+    }
+
+    /// Create a new retrieval system, optionally bypassing
+    /// `config.embeddings.backend` selection with a pre-built embedder.
+    ///
+    /// Selection precedence (issue #91 / #6):
+    /// 1. `embedder_override` (from `ServiceRegistry` via
+    ///    `GraphRAG::new_with_registry`).
+    /// 2. `config.embeddings.backend` factory dispatch (hash/Ollama/HTTP).
+    ///
+    /// Construction-time errors from the factory propagate. The
+    /// `fallback_to_hash` flag only governs runtime failures
+    /// (`AsyncEmbedder::embed` returning `Err`); a misconfigured backend
+    /// is always fatal so users see typos and missing credentials at
+    /// boot rather than after months of silent hash-degraded retrieval.
+    #[cfg(feature = "async")]
+    pub fn new_with_embedder(
+        config: &Config,
+        embedder_override: Option<crate::core::registry::DynAsyncEmbedder>,
+    ) -> Result<Self> {
         let retrieval_config = RetrievalConfig {
             top_k: config.retrieval.top_k,
             similarity_threshold: 0.35,
@@ -77,17 +128,40 @@ impl RetrievalSystem {
         let vector_store =
             std::sync::Arc::new(crate::vector::memory_store::MemoryVectorStore::new());
 
-        // Use the configured embedding dimension for the hash fallback so the
-        // hot retrieval path actually respects `[embeddings]` config. Even
-        // before the configured embedder gets wired through (see #6 / #7),
-        // dimension parity matters: a 768-dim Nomic / 1536-dim OpenAI
-        // configuration would have silently downgraded query-time embeddings
-        // to the previous hardcoded 128 dims.
-        let embedding_dim = config.embeddings.dimension.max(1);
+        // Configured dimension is the *initial* fallback size; once the
+        // embedder produces a real vector, `embed_text` updates the
+        // fallback to match (issue #91 review).
+        let configured_dim = config.embeddings.dimension.max(1);
+
+        // Resolve the embedder: registry override wins; otherwise dispatch
+        // on `config.embeddings.backend`. Construction failures (typos,
+        // missing API keys, missing feature flags) are *always* fatal —
+        // `fallback_to_hash` only governs runtime errors (HTTP failures,
+        // rate limits, transient 5xxs). Silently swallowing config
+        // errors here would mean a user who typoed `backend = "opena"`
+        // gets bad retrieval quality six months later instead of an
+        // immediate error at boot (issue #91 review, finding #3).
+        let embedder = if let Some(e) = embedder_override {
+            Some(e)
+        } else {
+            crate::embeddings::factory::build_async_embedder(&config.embeddings)?
+        };
+
+        // Trust the embedder's `dimension()` over the config: providers
+        // know their model's actual output size, and a typo in
+        // `[embeddings].dimension` would otherwise produce length-mismatched
+        // hash fallbacks that silently zero out cosine similarities.
+        let fallback_dim = embedder
+            .as_ref()
+            .map(|e| e.dimension().max(1))
+            .unwrap_or(configured_dim);
 
         Ok(Self {
             vector_store,
-            embedding_generator: EmbeddingGenerator::new(embedding_dim),
+            embedding_generator: std::sync::Mutex::new(EmbeddingGenerator::new(fallback_dim)),
+            embedder,
+            fallback_dim: std::sync::Mutex::new(fallback_dim),
+            fallback_to_hash: config.embeddings.fallback_to_hash,
             config: retrieval_config,
             #[cfg(feature = "parallel-processing")]
             parallel_processor: None,
@@ -97,6 +171,99 @@ impl RetrievalSystem {
             #[cfg(feature = "lazygraphrag")]
             concept_filtering_enabled: false,
         })
+    }
+
+    /// Sync construction path (no async feature). Always uses hash
+    /// embeddings; the configured backend is only honoured under `async`.
+    #[cfg(not(feature = "async"))]
+    pub fn new_with_embedder(config: &Config, _override: Option<()>) -> Result<Self> {
+        let retrieval_config = RetrievalConfig {
+            top_k: config.retrieval.top_k,
+            similarity_threshold: 0.35,
+            max_expansion_depth: 2,
+            entity_weight: 0.4,
+            chunk_weight: 0.4,
+            graph_weight: 0.2,
+            #[cfg(feature = "lazygraphrag")]
+            use_concept_filtering: false,
+            #[cfg(feature = "lazygraphrag")]
+            concept_top_k: 20,
+        };
+
+        let vector_store =
+            std::sync::Arc::new(crate::vector::memory_store::MemoryVectorStore::new());
+
+        let embedding_dim = config.embeddings.dimension.max(1);
+
+        Ok(Self {
+            vector_store,
+            embedding_generator: std::sync::Mutex::new(EmbeddingGenerator::new(embedding_dim)),
+            fallback_to_hash: config.embeddings.fallback_to_hash,
+            config: retrieval_config,
+            #[cfg(feature = "parallel-processing")]
+            parallel_processor: None,
+            #[cfg(feature = "pagerank")]
+            pagerank_retriever: None,
+            enriched_retriever: None,
+            #[cfg(feature = "lazygraphrag")]
+            concept_filtering_enabled: false,
+        })
+    }
+
+    /// Embed `text` using the configured async embedder; on failure (or
+    /// when no embedder is configured) falls back to the in-memory hash
+    /// generator if `fallback_to_hash` is enabled.
+    ///
+    /// Takes `&self` so multiple concurrent queries can share a
+    /// `RetrievalSystem` (issue #91 review). The hash fallback's mutable
+    /// state lives behind a `Mutex`; the configured `Arc<dyn AsyncEmbedder>`
+    /// is already shareable.
+    #[cfg(feature = "async")]
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
+        if let Some(embedder) = self.embedder.as_ref().cloned() {
+            match embedder.embed(text).await {
+                Ok(v) => {
+                    // Track the actual provider dimension so any later
+                    // hash fallback produces vectors that match the
+                    // already-indexed embeddings. The provider's
+                    // self-reported `dimension()` may not match what it
+                    // actually returns (e.g. a model swap), and the user's
+                    // config may not match either; the wire format is the
+                    // source of truth (issue #91 review).
+                    if !v.is_empty() {
+                        if let Ok(mut dim) = self.fallback_dim.lock() {
+                            if *dim != v.len() {
+                                *dim = v.len();
+                                if let Ok(mut gen) = self.embedding_generator.lock() {
+                                    if gen.dimension() != v.len() {
+                                        *gen = EmbeddingGenerator::new(v.len());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return Ok(v);
+                },
+                Err(e) => {
+                    if self.fallback_to_hash {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "Configured embedder failed ({}); falling back to hash embeddings",
+                            e
+                        );
+                    } else {
+                        return Err(e);
+                    }
+                },
+            }
+        }
+        let mut gen =
+            self.embedding_generator
+                .lock()
+                .map_err(|_| crate::core::GraphRAGError::Config {
+                    message: "embedding_generator mutex poisoned".to_string(),
+                })?;
+        Ok(gen.generate_embedding(text))
     }
 }
 
@@ -552,10 +719,17 @@ impl RetrievalSystem {
         // EmbeddingGenerator operations can be parallelized with rayon
 
         let retrieval_config = RetrievalConfig::default();
+        #[cfg(feature = "async")]
+        let fallback_dim = std::sync::Mutex::new(embedding_generator.dimension().max(1));
 
         Ok(Self {
             vector_store,
-            embedding_generator,
+            embedding_generator: std::sync::Mutex::new(embedding_generator),
+            #[cfg(feature = "async")]
+            embedder: None,
+            #[cfg(feature = "async")]
+            fallback_dim,
+            fallback_to_hash: true,
             config: retrieval_config,
             parallel_processor: Some(parallel_processor),
             #[cfg(feature = "pagerank")]
@@ -749,8 +923,8 @@ impl RetrievalSystem {
         // 1. Analyze query to determine optimal strategy
         let analysis = self.analyze_query(query, graph)?;
 
-        // 2. Generate query embedding
-        let query_embedding = self.embedding_generator.generate_embedding(query);
+        // 2. Generate query embedding (configured embedder if any, hash fallback otherwise)
+        let query_embedding = self.embed_text(query).await?;
 
         // 3. Execute multi-strategy retrieval based on analysis
         let mut results = self
@@ -775,8 +949,8 @@ impl RetrievalSystem {
         query: &str,
         graph: &KnowledgeGraph,
     ) -> Result<Vec<SearchResult>> {
-        // 1. Generate query embedding
-        let query_embedding = self.embedding_generator.generate_embedding(query);
+        // 1. Generate query embedding via the configured embedder
+        let query_embedding = self.embed_text(query).await?;
 
         // 2. Perform comprehensive search
         let results = self.comprehensive_search(&query_embedding, graph).await?;
@@ -833,7 +1007,7 @@ impl RetrievalSystem {
 
         // Process chunks
         for (chunk_id, text) in chunk_texts {
-            let embedding = self.embedding_generator.generate_embedding(&text);
+            let embedding = self.embed_text(&text).await?;
             if let Some(chunk) = graph.get_chunk_mut(&chunk_id) {
                 chunk.embedding = Some(embedding);
             }
@@ -841,7 +1015,7 @@ impl RetrievalSystem {
 
         // Process entities
         for (entity_id, text) in entity_texts {
-            let embedding = self.embedding_generator.generate_embedding(&text);
+            let embedding = self.embed_text(&text).await?;
             if let Some(entity) = graph.get_entity_mut(&entity_id) {
                 entity.embedding = Some(embedding);
             }
@@ -855,30 +1029,37 @@ impl RetrievalSystem {
 
     /// Sequential embedding generation (fallback)
     async fn add_embeddings_sequential(&mut self, graph: &mut KnowledgeGraph) -> Result<()> {
-        // Debug: Check total counts first (uncomment for debugging)
-        let _total_chunks = graph.chunks().count();
-        let _total_entities = graph.entities().count();
-        // println!("DEBUG: Found {} total chunks and {} total entities in graph", _total_chunks, _total_entities);
+        // Two-pass: collect texts (immutable borrow), embed (no graph
+        // borrow), write back (mutable borrow). Keeps the loop body free
+        // of nested `&graph` + `&mut graph` lifetimes across an await
+        // boundary; `embed_text` itself takes `&self` so this is just a
+        // borrow-checker convenience, not a correctness requirement.
+        let chunk_jobs: Vec<(crate::core::ChunkId, String)> = graph
+            .chunks()
+            .filter(|c| c.embedding.is_none())
+            .map(|c| (c.id.clone(), c.content.clone()))
+            .collect();
 
-        // Generate embeddings for all chunks
-        let mut chunk_count = 0;
-        for chunk in graph.chunks_mut() {
-            if chunk.embedding.is_none() {
-                let embedding = self.embedding_generator.generate_embedding(&chunk.content);
+        let entity_jobs: Vec<(crate::core::EntityId, String)> = graph
+            .entities()
+            .filter(|e| e.embedding.is_none())
+            .map(|e| (e.id.clone(), format!("{} {}", e.name, e.entity_type)))
+            .collect();
+
+        let chunk_count = chunk_jobs.len();
+        let entity_count = entity_jobs.len();
+
+        for (chunk_id, text) in chunk_jobs {
+            let embedding = self.embed_text(&text).await?;
+            if let Some(chunk) = graph.get_chunk_mut(&chunk_id) {
                 chunk.embedding = Some(embedding);
-                chunk_count += 1;
             }
         }
 
-        // Generate embeddings for all entities (using their name and context)
-        let mut entity_count = 0;
-        for entity in graph.entities_mut() {
-            if entity.embedding.is_none() {
-                // Create entity text from name and entity type
-                let entity_text = format!("{} {}", entity.name, entity.entity_type);
-                let embedding = self.embedding_generator.generate_embedding(&entity_text);
+        for (entity_id, text) in entity_jobs {
+            let embedding = self.embed_text(&text).await?;
+            if let Some(entity) = graph.get_entity_mut(&entity_id) {
                 entity.embedding = Some(embedding);
-                entity_count += 1;
             }
         }
 
@@ -886,7 +1067,6 @@ impl RetrievalSystem {
             "Generated embeddings for {chunk_count} chunks and {entity_count} entities"
         );
 
-        // Re-index the graph with new embeddings
         // Re-index the graph with new embeddings
         self.index_graph(graph).await?;
 
@@ -1308,9 +1488,16 @@ impl RetrievalSystem {
                     if !visited.contains(&neighbor.id) {
                         visited.insert(neighbor.id.clone());
 
-                        // Calculate relationship relevance
+                        // Calculate relationship relevance. Hash-only path
+                        // here (cheap, deterministic, no network); the
+                        // configured async embedder is reserved for the
+                        // user's actual query text.
                         let rel_embedding = self
                             .embedding_generator
+                            .lock()
+                            .map_err(|_| crate::core::GraphRAGError::Config {
+                                message: "embedding_generator mutex poisoned".to_string(),
+                            })?
                             .generate_embedding(&relationship.relation_type);
                         let rel_similarity =
                             VectorUtils::cosine_similarity(query_embedding, &rel_embedding);
@@ -1811,7 +1998,7 @@ impl RetrievalSystem {
         query: &str,
         max_results: usize,
     ) -> Result<Vec<SearchResult>> {
-        let query_embedding = self.embedding_generator.generate_embedding(query);
+        let query_embedding = self.embed_text(query).await?;
         let similar_vectors = self
             .vector_store
             .search(&query_embedding, max_results)
@@ -1943,9 +2130,13 @@ impl RetrievalSystem {
         };
 
         // Add embedding generator info
+        let (eg_dim, eg_cached) = match self.embedding_generator.lock() {
+            Ok(g) => (g.dimension(), g.cached_words()),
+            Err(_) => (0, 0),
+        };
         json_data["embedding_generator"] = json::object! {
-            "dimension" => self.embedding_generator.dimension(),
-            "cached_words" => self.embedding_generator.cached_words()
+            "dimension" => eg_dim,
+            "cached_words" => eg_cached
         };
 
         // Add parallel processing info
@@ -2025,7 +2216,7 @@ mod tests {
         config.embeddings.dimension = 768;
         let retrieval = RetrievalSystem::new(&config).unwrap();
         assert_eq!(
-            retrieval.embedding_generator.dimension(),
+            retrieval.embedding_generator.lock().unwrap().dimension(),
             768,
             "configured dimension should propagate to retrieval embedder"
         );
@@ -2038,7 +2229,7 @@ mod tests {
         let mut config = Config::default();
         config.embeddings.dimension = 0;
         let retrieval = RetrievalSystem::new(&config).unwrap();
-        assert_eq!(retrieval.embedding_generator.dimension(), 1);
+        assert_eq!(retrieval.embedding_generator.lock().unwrap().dimension(), 1);
     }
 
     #[test]
