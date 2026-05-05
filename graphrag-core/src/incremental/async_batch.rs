@@ -230,6 +230,8 @@ pub struct AsyncBatchUpdater {
     /// Wakes back-pressured submitters when a batch is removed from
     /// `pending_batches`. Replaces a 10ms polling loop in `submit_operation`.
     /// `notify_waiters` is used so all blocked submitters re-check capacity.
+    /// `submit_operation` registers the `notified()` future *before* the
+    /// capacity recheck to avoid lost wakeups across the registration boundary.
     /// A small TOCTOU window between the recheck and `sender.send` may allow
     /// the queue to briefly exceed `max_queue_size`; the channel buffer and
     /// soft-limit semantics make this acceptable here.
@@ -276,10 +278,22 @@ impl AsyncBatchUpdater {
     /// Submit a single update operation (non-blocking)
     pub async fn submit_operation(&self, operation: UpdateOperation) -> Result<()> {
         // Back-pressure: park on `queue_drained_notify` rather than poll every 10ms.
-        // Spurious wakeups are possible, so re-check capacity after each notify.
+        // Register interest with `enable()` BEFORE re-checking the queue length so
+        // any `notify_waiters()` call that fires between the check and the await
+        // is delivered to the already-registered waiter. Without `enable()`, the
+        // `Notified` future does not enter the wait list until its first poll
+        // (i.e. inside `notified.await`), which leaves a TOCTOU window where a
+        // drain notification can be lost and the submitter parks forever.
         if self.config.enable_backpressure {
-            while self.pending_batches.read().len() >= self.config.max_queue_size {
-                self.queue_drained_notify.notified().await;
+            loop {
+                let notified = self.queue_drained_notify.notified();
+                tokio::pin!(notified);
+                // `enable()` adds this future to the Notify wait list now.
+                notified.as_mut().enable();
+                if self.pending_batches.read().len() < self.config.max_queue_size {
+                    break;
+                }
+                notified.as_mut().await;
             }
         }
 
@@ -836,6 +850,62 @@ mod tests {
             .expect("submitter did not wake after notify_waiters");
         join.expect("submit task panicked")
             .expect("submit_operation failed");
+    }
+
+    /// Regression for the lost-wakeup race in the back-pressure loop.
+    ///
+    /// `submit_operation` parks on `queue_drained_notify` when the queue is
+    /// at capacity. The pre-fix loop was:
+    ///   `while pending.read().len() >= cap { notify.notified().await; }`
+    /// `Notify::notified()` captures the current `notify_waiters` counter at
+    /// construction. If a `notify_waiters()` fires *between* the queue read
+    /// and the `Notified` construction, the freshly-constructed future
+    /// captures the post-call counter and the subsequent poll parks on
+    /// that counter — hanging the submitter until some later notify
+    /// arrives. Because the contract is "notify only when a slot opens",
+    /// no later notify is guaranteed.
+    ///
+    /// The fix moves the `Notified` construction to BEFORE the queue
+    /// recheck (and uses `enable()` to register the waiter on the wait
+    /// list before the recheck), so any racing `notify_waiters()` either
+    /// (a) increments the counter past the captured value — making the
+    /// future resolve on its next poll — or (b) wakes the already-
+    /// registered waiter directly.
+    ///
+    /// This test demonstrates the failure mode of the buggy pattern and
+    /// the success of the fixed pattern using a bare `tokio::sync::Notify`.
+    /// Both halves run a tiny scenario: pre-fire `notify_waiters()` (this
+    /// stands in for "drain happened during the buggy gap"), then attempt
+    /// to await with the buggy and fixed patterns. The buggy pattern
+    /// constructs the `Notified` AFTER the pre-fire — capturing the new
+    /// counter — and times out. The fixed pattern constructs the
+    /// `Notified` BEFORE the pre-fire — capturing the original counter —
+    /// so the await resolves on the count mismatch.
+    #[tokio::test]
+    async fn back_pressure_register_before_check_avoids_lost_wakeup() {
+        // Buggy pattern: construct AFTER the racing notify_waiters.
+        let buggy_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        buggy_notify.notify_waiters(); // racing notify
+        let buggy_fut = buggy_notify.notified(); // captures post-call counter
+        let buggy_res =
+            tokio::time::timeout(std::time::Duration::from_millis(50), buggy_fut).await;
+        assert!(
+            buggy_res.is_err(),
+            "buggy pattern unexpectedly succeeded — Notify semantics changed?"
+        );
+
+        // Fixed pattern: construct BEFORE the racing notify_waiters.
+        let fixed_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fixed_fut = fixed_notify.notified(); // captures original counter
+        tokio::pin!(fixed_fut);
+        fixed_fut.as_mut().enable();
+        fixed_notify.notify_waiters(); // racing notify
+        let fixed_res =
+            tokio::time::timeout(std::time::Duration::from_millis(50), fixed_fut.as_mut()).await;
+        assert!(
+            fixed_res.is_ok(),
+            "fixed pattern lost the wakeup — register-before-check broken"
+        );
     }
 
     /// Verifies that workers signal queue_drained_notify when popping a batch,
