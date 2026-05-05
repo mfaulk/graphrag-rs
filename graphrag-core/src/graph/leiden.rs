@@ -37,12 +37,18 @@ pub struct HierarchicalCommunities {
     /// Level 0 = finest granularity, higher = coarser
     pub levels: HashMap<usize, HashMap<NodeIndex, usize>>,
 
-    /// Parent-child relationships between levels
-    /// Maps community ID at level N to parent community ID at level N+1
-    pub hierarchy: HashMap<usize, Option<usize>>,
+    /// Parent-child community relationships across hierarchy levels.
+    /// `hierarchy[level][community_id]` = `Some((parent_level, parent_community_id))` for non-root
+    /// communities, or `None` for roots at the top level. Walk leaf -> root by chasing parents.
+    pub hierarchy: HashMap<usize, HashMap<usize, Option<(usize, usize)>>>,
 
-    /// LLM-generated summaries for each community (optional)
-    pub summaries: HashMap<usize, String>,
+    /// LLM- or extractor-generated summaries for each community, keyed by hierarchy level.
+    ///
+    /// `summaries[level][community_id]` holds the summary for that community. Keying by
+    /// `(level, community_id)` is required because community ids can collide across levels:
+    /// a level-0 community and a level-1 community can both carry id `7`, so a flat
+    /// `HashMap<usize, String>` would let one overwrite the other.
+    pub summaries: HashMap<usize, HashMap<usize, String>>,
 
     /// Mapping from entity names to metadata (enriched from KnowledgeGraph)
     pub entity_mapping: Option<HashMap<String, EntityMetadata>>,
@@ -209,9 +215,19 @@ impl HierarchicalCommunities {
             for community_id in community_ids {
                 let summary =
                     self.generate_community_summary(level, community_id, graph, max_length);
-                self.summaries.insert(community_id, summary);
+                self.summaries
+                    .entry(level)
+                    .or_default()
+                    .insert(community_id, summary);
             }
         }
+    }
+
+    /// Look up the summary for a specific `(level, community_id)`.
+    pub fn get_summary(&self, level: usize, community_id: usize) -> Option<&String> {
+        self.summaries
+            .get(&level)
+            .and_then(|m| m.get(&community_id))
     }
 
     /// Generate summaries for all levels bottom-up
@@ -372,10 +388,12 @@ impl HierarchicalCommunities {
                     .any(|entity| entity.to_lowercase().contains(&query_lower));
 
                 if is_relevant {
-                    // Get or generate summary
+                    // Get or generate summary, keyed by (level, community_id) to avoid
+                    // cross-level id collisions.
                     let summary = self
                         .summaries
-                        .get(&community_id)
+                        .get(&level)
+                        .and_then(|m| m.get(&community_id))
                         .cloned()
                         .unwrap_or_else(|| {
                             // Fallback: create entity list
@@ -496,33 +514,114 @@ impl LeidenCommunityDetector {
         })
     }
 
-    /// Hierarchical Leiden algorithm implementation
+    /// Hierarchical Leiden: run leaf-level local moving + refine, then iteratively contract
+    /// the result into a super-graph (one node per community, multi-edges for inter-community
+    /// edges) and re-cluster until communities stop collapsing or `max_levels` is reached.
     fn hierarchical_leiden(
         &self,
         graph: &Graph<String, f32, Undirected>,
     ) -> Result<(
         HashMap<usize, HashMap<NodeIndex, usize>>,
-        HashMap<usize, Option<usize>>,
+        HashMap<usize, HashMap<usize, Option<(usize, usize)>>>,
     )> {
-        let mut levels = HashMap::new();
-        let hierarchy = HashMap::new();
+        let mut levels: HashMap<usize, HashMap<NodeIndex, usize>> = HashMap::new();
+        let mut hierarchy: HashMap<usize, HashMap<usize, Option<(usize, usize)>>> = HashMap::new();
 
-        let current_graph = graph.clone();
-        let level = 0;
+        // Run level 0 directly on the input graph.
+        let level0_communities = self.run_leiden_pass(graph)?;
+        levels.insert(0, level0_communities.clone());
 
-        // Phase 1: Initialize each node in its own community
-        let mut communities = self.initialize_communities(&current_graph);
+        // When `max_levels <= 1`, skip the contraction loop but still fall through to the
+        // top-level root-recording pass below so callers see `hierarchy[0][id] = None` for
+        // every level-0 community (matching the documented contract on
+        // `HierarchicalCommunities::hierarchy`).
+        //
+        // For each subsequent level we operate on a contracted super-graph and project the
+        // resulting community ids back onto the original NodeIndex space.
+        let mut prev_assignment = level0_communities; // original NodeIndex -> level-(L-1) community id
+        let mut prev_level = 0usize;
 
-        // Phase 2: Local moving (greedy modularity optimization)
+        for level in 1..self.config.max_levels {
+            let unique_prev: HashSet<usize> = prev_assignment.values().copied().collect();
+            // Stop if previous level already collapsed below 2 communities — nothing left to group.
+            if unique_prev.len() < 2 {
+                break;
+            }
+
+            // Build super-graph: one node per prev-level community, multi-edges between
+            // communities preserve inter-community edge counts (used by the unweighted modularity
+            // calc to recover correct super-node degrees). Intra-community edges are dropped.
+            let (super_graph, super_to_prev_id) = build_super_graph(graph, &prev_assignment);
+
+            // Run a Leiden pass on the super-graph.
+            let super_communities = self.run_leiden_pass(&super_graph)?;
+            let unique_super: HashSet<usize> = super_communities.values().copied().collect();
+
+            // No further grouping happened (each super-node is still its own community) — stop.
+            if unique_super.len() == unique_prev.len() {
+                break;
+            }
+
+            // Project the super-graph partition back onto the original nodes:
+            //   prev_community_id -> super_community_id
+            let mut prev_to_super: HashMap<usize, usize> = HashMap::new();
+            for (super_node, &super_comm) in &super_communities {
+                if let Some(&prev_id) = super_to_prev_id.get(super_node) {
+                    prev_to_super.insert(prev_id, super_comm);
+                }
+            }
+
+            let mut level_assignment: HashMap<NodeIndex, usize> =
+                HashMap::with_capacity(prev_assignment.len());
+            for (&node, prev_id) in &prev_assignment {
+                if let Some(&new_id) = prev_to_super.get(prev_id) {
+                    level_assignment.insert(node, new_id);
+                }
+            }
+
+            // Record parent links for every prev-level community.
+            let parent_entry = hierarchy.entry(prev_level).or_default();
+            for (&prev_id, &new_id) in &prev_to_super {
+                parent_entry.insert(prev_id, Some((level, new_id)));
+            }
+
+            levels.insert(level, level_assignment.clone());
+            prev_assignment = level_assignment;
+            prev_level = level;
+
+            // If this level collapsed to a single community, it is the root — stop.
+            if unique_super.len() < 2 {
+                break;
+            }
+        }
+
+        // Top-level communities are roots: always record explicit None parents so callers can
+        // detect them, regardless of whether the top is level 0 (single-level case from
+        // `max_levels = 1` or early termination) or a deeper level.
+        let top_level = *levels.keys().max().unwrap_or(&0);
+        let unique_top: HashSet<usize> = levels[&top_level].values().copied().collect();
+        let entry = hierarchy.entry(top_level).or_default();
+        for id in unique_top {
+            entry.entry(id).or_insert(None);
+        }
+
+        Ok((levels, hierarchy))
+    }
+
+    /// One Leiden pass (local moving + refinement) on the given graph.
+    fn run_leiden_pass(
+        &self,
+        graph: &Graph<String, f32, Undirected>,
+    ) -> Result<HashMap<NodeIndex, usize>> {
+        let mut communities = self.initialize_communities(graph);
+
         let mut improved = true;
         let mut iteration = 0;
         const MAX_ITERATIONS: usize = 100;
-
         while improved && iteration < MAX_ITERATIONS {
             improved = false;
-            for node in current_graph.node_indices() {
-                let best_community = self.find_best_community(&current_graph, node, &communities);
-
+            for node in graph.node_indices() {
+                let best_community = self.find_best_community(graph, node, &communities);
                 if best_community != communities[&node] {
                     communities.insert(node, best_community);
                     improved = true;
@@ -531,13 +630,8 @@ impl LeidenCommunityDetector {
             iteration += 1;
         }
 
-        // Phase 3: Refinement (KEY difference from Louvain)
-        communities = self.refine_partition(&current_graph, communities)?;
-
-        // Store this level
-        levels.insert(level, communities);
-
-        Ok((levels, hierarchy))
+        communities = self.refine_partition(graph, communities)?;
+        Ok(communities)
     }
 
     /// Initialize each node in its own community
@@ -733,7 +827,12 @@ impl LeidenCommunityDetector {
         delta
     }
 
-    /// Count edges from node to a specific community
+    /// Count edges from `node` to *other* nodes in `community`.
+    ///
+    /// Self-loops are excluded: when a super-graph node carries self-loops representing
+    /// internal edges of an aggregated community, those edges always travel with the node
+    /// across moves, so they do not contribute to "edges to community members" in either
+    /// the source or destination side of a modularity-delta calculation.
     fn edges_to_community(
         &self,
         graph: &Graph<String, f32, Undirected>,
@@ -743,7 +842,7 @@ impl LeidenCommunityDetector {
     ) -> usize {
         graph
             .neighbors(node)
-            .filter(|&neighbor| communities.get(&neighbor) == Some(&community))
+            .filter(|&neighbor| neighbor != node && communities.get(&neighbor) == Some(&community))
             .count()
     }
 
@@ -778,6 +877,65 @@ impl LeidenCommunityDetector {
         // Full implementation would extract actual largest component
         graph.clone()
     }
+}
+
+/// Contract a graph by collapsing each community to a single super-node.
+///
+/// Recipe (standard Leiden / Louvain aggregation): one super-node per community in the
+/// `assignment`. For every original edge (u, v):
+///   - If `assignment[u] != assignment[v]` add an inter-community edge between the
+///     corresponding super-nodes.
+///   - If `assignment[u] == assignment[v]` add **two parallel self-loops** on the super-node.
+///     Petgraph counts each self-loop once in `edges(n).count()`, so two parallel self-loops
+///     contribute 2 to the super-node's edge count — exactly matching the contribution of the
+///     original intra-community edge to `sum_n edges(n).count()` (1 to each endpoint). This
+///     preserves total weighted/unweighted degree across contractions, which is required for
+///     the modularity calculation to remain consistent across hierarchy levels.
+///
+/// Multi-edges and self-loops are preserved so the unweighted degree of each super-node equals
+/// the sum of original edge endpoints attached to its underlying community.
+///
+/// Returns the super-graph and a `super_node -> source_community_id` mapping the caller uses
+/// to project the next-level partition back onto the original nodes.
+fn build_super_graph(
+    graph: &Graph<String, f32, Undirected>,
+    assignment: &HashMap<NodeIndex, usize>,
+) -> (Graph<String, f32, Undirected>, HashMap<NodeIndex, usize>) {
+    let mut super_graph = Graph::new_undirected();
+    let mut comm_to_super: HashMap<usize, NodeIndex> = HashMap::new();
+    let mut super_to_comm: HashMap<NodeIndex, usize> = HashMap::new();
+
+    // Stable iteration over communities by sorted id keeps super-node ordering deterministic.
+    let mut comm_ids: Vec<usize> = assignment.values().copied().collect();
+    comm_ids.sort_unstable();
+    comm_ids.dedup();
+    for cid in comm_ids {
+        let super_node = super_graph.add_node(format!("c{cid}"));
+        comm_to_super.insert(cid, super_node);
+        super_to_comm.insert(super_node, cid);
+    }
+
+    for edge in graph.edge_references() {
+        use petgraph::visit::EdgeRef;
+        let a = edge.source();
+        let b = edge.target();
+        let (Some(&ca), Some(&cb)) = (assignment.get(&a), assignment.get(&b)) else {
+            continue;
+        };
+        if ca == cb {
+            // Intra-community edge: add two parallel self-loops to preserve total degree
+            // under petgraph's edges(n).count() semantics (each self-loop counted once).
+            let s = comm_to_super[&ca];
+            super_graph.add_edge(s, s, *edge.weight());
+            super_graph.add_edge(s, s, *edge.weight());
+        } else {
+            let sa = comm_to_super[&ca];
+            let sb = comm_to_super[&cb];
+            super_graph.add_edge(sa, sb, *edge.weight());
+        }
+    }
+
+    (super_graph, super_to_comm)
 }
 
 #[cfg(test)]
@@ -837,5 +995,229 @@ mod tests {
         assert_eq!(config.resolution, 1.0);
         assert_eq!(config.max_levels, 5);
         assert!(config.use_lcc);
+    }
+
+    /// Builds a synthetic two-tier graph: 2 outer cliques, each containing 2 inner sub-cliques
+    /// of 3 nodes. Strong intra-sub-clique edges dominate at level 0 so the leaf partition
+    /// recovers the four sub-cliques; sparse intra-outer bridges (2 per outer-pair) plus a
+    /// single weak inter-outer edge make level-1 contraction merge same-outer sub-cliques
+    /// without merging across outers.
+    fn create_two_tier_graph() -> Graph<String, f32, Undirected> {
+        let mut graph = Graph::new_undirected();
+        let mut nodes = Vec::with_capacity(12);
+        for i in 0..12 {
+            nodes.push(graph.add_node(format!("N{i}")));
+        }
+        // Four sub-cliques of 3 nodes each: [0,1,2], [3,4,5], [6,7,8], [9,10,11]
+        let sub_cliques = [[0, 1, 2], [3, 4, 5], [6, 7, 8], [9, 10, 11]];
+        for sc in &sub_cliques {
+            for i in 0..sc.len() {
+                for j in (i + 1)..sc.len() {
+                    graph.add_edge(nodes[sc[i]], nodes[sc[j]], 10.0);
+                }
+            }
+        }
+        // Outer-clique bridges: sub-clique 0<->1 inside outer A; sub-clique 2<->3 inside outer B
+        graph.add_edge(nodes[2], nodes[3], 3.0);
+        graph.add_edge(nodes[1], nodes[4], 3.0);
+        graph.add_edge(nodes[8], nodes[9], 3.0);
+        graph.add_edge(nodes[7], nodes[10], 3.0);
+        // Single weak inter-outer-clique edge
+        graph.add_edge(nodes[5], nodes[6], 1.0);
+        graph
+    }
+
+    /// Two-tier graph: level 0 must recover the four sub-cliques and level 1 must merge them
+    /// into exactly two outer cliques (each containing two sub-cliques).
+    #[test]
+    fn test_hierarchical_two_tier_graph() {
+        let graph = create_two_tier_graph();
+        let config = LeidenConfig {
+            seed: Some(42),
+            max_levels: 5,
+            ..Default::default()
+        };
+        let detector = LeidenCommunityDetector::new(config);
+
+        let result = detector
+            .detect_communities(&graph)
+            .expect("detection succeeds");
+
+        assert!(
+            result.levels.len() >= 2,
+            "expected >=2 levels, got {}: {:?}",
+            result.levels.len(),
+            result.levels.keys().collect::<Vec<_>>()
+        );
+
+        // Level 0: must produce >=2 distinct communities (the algorithm partitions the graph).
+        let level0_ids: HashSet<usize> = result.levels[&0].values().copied().collect();
+        assert!(
+            level0_ids.len() >= 2,
+            "expected level 0 to have >=2 communities, got {}",
+            level0_ids.len()
+        );
+
+        // Level 1: with two well-separated outer cliques, expect at least 2 outer
+        // communities at the next level — a buggy implementation that over-collapses to a
+        // single root in one step would otherwise pass.
+        let level_1 = result.levels.get(&1).expect("level 1 present");
+        let level1_ids: HashSet<usize> = level_1.values().copied().collect();
+        assert!(
+            level1_ids.len() >= 2,
+            "expected >=2 outer communities at level 1, got {}",
+            level1_ids.len()
+        );
+
+        // Group level-0 sub-cliques by their level-1 parent. The two outer cliques each
+        // contain two sub-cliques, so we expect exactly 2 parent groups, each holding >=2
+        // children.
+        let mut parent_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (&l0_id, parent) in result.hierarchy.get(&0).expect("level 0 hierarchy") {
+            if let Some((_, l1_id)) = parent {
+                parent_groups.entry(*l1_id).or_default().push(l0_id);
+            }
+        }
+        assert_eq!(
+            parent_groups.len(),
+            2,
+            "expected exactly 2 outer groups at level 1, got {} ({parent_groups:?})",
+            parent_groups.len()
+        );
+        for (parent_id, children) in &parent_groups {
+            assert!(
+                children.len() >= 2,
+                "outer community {parent_id} should contain >=2 sub-cliques, got {}",
+                children.len()
+            );
+        }
+
+        // Top level must have all entries with `None` parents (roots).
+        let top_level = *result.levels.keys().max().unwrap();
+        let top_map = result
+            .hierarchy
+            .get(&top_level)
+            .expect("top level hierarchy present");
+        assert!(
+            top_map.values().all(|p| p.is_none()),
+            "top level entries should have no parent"
+        );
+    }
+
+    /// max_levels = 1 caps the algorithm at the leaf partition only; the top level (level 0)
+    /// must still appear in `hierarchy` with `None` parents marking those communities as roots.
+    #[test]
+    fn test_hierarchical_max_levels_cap() {
+        let graph = create_two_tier_graph();
+        let config = LeidenConfig {
+            seed: Some(42),
+            max_levels: 1,
+            ..Default::default()
+        };
+        let detector = LeidenCommunityDetector::new(config);
+
+        let result = detector
+            .detect_communities(&graph)
+            .expect("detection succeeds");
+
+        assert_eq!(
+            result.levels.len(),
+            1,
+            "expected exactly 1 level when max_levels=1"
+        );
+        // With only one level, no community has a parent (no level-1 to chase up to).
+        let parented: usize = result
+            .hierarchy
+            .values()
+            .flat_map(|m| m.values())
+            .filter(|p| p.is_some())
+            .count();
+        assert_eq!(parented, 0, "expected no parent links at max_levels=1");
+
+        // Level 0 communities must still be present in `hierarchy[0]` with `None` parents,
+        // marking them as roots — matching the contract documented on `HierarchicalCommunities`.
+        let cap_communities = result.hierarchy.get(&0).expect("level 0 hierarchy");
+        assert!(
+            !cap_communities.is_empty(),
+            "level 0 hierarchy entries should be recorded for roots when max_levels=1"
+        );
+        for parent in cap_communities.values() {
+            assert!(
+                parent.is_none(),
+                "level-0 communities must be roots when max_levels=1"
+            );
+        }
+        // Coverage: every community id present in `levels[0]` should appear in `hierarchy[0]`.
+        let level_0_ids: HashSet<usize> = result.levels[&0].values().copied().collect();
+        for id in &level_0_ids {
+            assert!(
+                cap_communities.contains_key(id),
+                "missing root entry for level-0 community {id}"
+            );
+        }
+    }
+
+    /// Summaries must not collide when communities at different levels share an id.
+    #[test]
+    fn test_summaries_distinct_across_levels() {
+        // Manually construct a HierarchicalCommunities with overlapping ids across levels.
+        let mut communities = HierarchicalCommunities {
+            levels: HashMap::new(),
+            hierarchy: HashMap::new(),
+            summaries: HashMap::new(),
+            entity_mapping: None,
+        };
+
+        // Level 0: a single community with id 0.
+        let mut l0 = HashMap::new();
+        l0.insert(NodeIndex::new(0), 0usize);
+        communities.levels.insert(0, l0);
+        // Level 1: a community also with id 0 (different community semantically).
+        let mut l1 = HashMap::new();
+        l1.insert(NodeIndex::new(0), 0usize);
+        communities.levels.insert(1, l1);
+
+        // Insert distinct summaries for the colliding ids.
+        communities
+            .summaries
+            .entry(0)
+            .or_default()
+            .insert(0, "level-0 summary".to_string());
+        communities
+            .summaries
+            .entry(1)
+            .or_default()
+            .insert(0, "level-1 summary".to_string());
+
+        let s0 = communities.get_summary(0, 0).expect("level 0 summary");
+        let s1 = communities.get_summary(1, 0).expect("level 1 summary");
+        assert_ne!(
+            s0, s1,
+            "summaries collided across levels: l0={s0:?}, l1={s1:?}"
+        );
+        assert_eq!(s0, "level-0 summary");
+        assert_eq!(s1, "level-1 summary");
+    }
+
+    /// Total weighted degree must be preserved across super-graph contractions; intra-community
+    /// edges become self-loops on super-nodes rather than being dropped.
+    #[test]
+    fn test_super_graph_preserves_total_degree() {
+        let g = create_two_tier_graph();
+        let degree_g: usize = g.node_indices().map(|n| g.edges(n).count()).sum();
+
+        // Partition: assign each node deterministically to a community matching its sub-clique.
+        let mut partition: HashMap<NodeIndex, usize> = HashMap::new();
+        for (idx, node) in g.node_indices().enumerate() {
+            partition.insert(node, idx / 3); // 4 sub-cliques of 3 nodes
+        }
+
+        let (sg, _) = build_super_graph(&g, &partition);
+        let degree_sg: usize = sg.node_indices().map(|n| sg.edges(n).count()).sum();
+
+        assert_eq!(
+            degree_g, degree_sg,
+            "super-graph dropped edges: g={degree_g}, sg={degree_sg}"
+        );
     }
 }

@@ -313,9 +313,16 @@ let mut communities = graph.detect_hierarchical_communities(config)?;
 let leiden_graph = graph.to_leiden_graph();
 communities.generate_hierarchical_summaries(&leiden_graph, 5);
 
-// Access summaries by community ID
-for (community_id, summary) in &communities.summaries {
-    println!("Community {}: {}", community_id, summary);
+// Access summaries: keyed by (level, community_id) — see "Summaries Keying" below.
+for (level, level_summaries) in &communities.summaries {
+    for (community_id, summary) in level_summaries {
+        println!("Level {} community {}: {}", level, community_id, summary);
+    }
+}
+
+// Direct lookup helper:
+if let Some(summary) = communities.get_summary(0, 3) {
+    println!("Level 0 community 3: {}", summary);
 }
 ```
 
@@ -381,8 +388,8 @@ fn retrieve_relevant_communities(
 
             // Check if any entity matches the query
             if entities.iter().any(|e| e.to_lowercase().contains(&query.to_lowercase())) {
-                // Get summary for this community
-                if let Some(summary) = communities.summaries.get(&community_id) {
+                // Get summary for this community (summaries are keyed by (level, id))
+                if let Some(summary) = communities.get_summary(level, community_id) {
                     results.push(summary.clone());
                 }
             }
@@ -567,6 +574,53 @@ Total Score: (0.0 × 0.5) + (0.5 × 0.3) + (0.3 × 0.2) = 0.21
 
 ```
 
+## Hierarchy Construction
+
+Issue #94 added real multi-level community detection. Prior to that fix, the algorithm
+produced only level 0 (`HierarchicalCommunities.hierarchy` was empty) despite the
+`hierarchical_leiden` name and the `max_levels` config knob.
+
+Current behavior:
+
+1. Run a Leiden pass (local moving + refinement) on the input graph -> level 0 partition.
+2. Build a super-graph: one super-node per community; for every original edge whose endpoints
+   live in different communities add a super-edge between the corresponding super-nodes
+   (multi-edges preserved so unweighted super-node degree = original inter-community edge
+   count). Intra-community edges are dropped.
+3. Run a Leiden pass on the super-graph -> level 1 partition; project the result back onto the
+   original `NodeIndex` space and record parent links.
+4. Repeat until either `max_levels` is reached, the partition stops collapsing
+   (`#communities(level L) == #communities(level L-1)`), or the graph collapses to a single
+   community.
+
+`HierarchicalCommunities.hierarchy` is keyed as
+`HashMap<level, HashMap<community_id, Option<(parent_level, parent_community_id)>>>`.
+Walk leaf -> root by chasing the parent at each level. Top-level (root) communities have
+explicit `None` parents at *whichever level happens to be the top* — including level 0
+when the algorithm stops at one level (e.g. `max_levels = 1` or no further merging is
+profitable).
+
+## Summaries Keying
+
+`HierarchicalCommunities.summaries` is keyed as
+`HashMap<level, HashMap<community_id, String>>` — nested by hierarchy level so a level-0
+and a level-1 community can both carry id `0` without colliding. Use the
+`get_summary(level, community_id)` helper for direct lookups.
+
+## Breaking Changes (#94 review)
+
+These types changed shape during the Group H-94 review pass. Callers built against pre-fix
+shapes must migrate:
+
+- `HierarchicalCommunities.hierarchy` is now
+  `HashMap<usize, HashMap<usize, Option<(usize, usize)>>>` (level -> id -> parent).
+  Previously a flat `HashMap<usize, Option<usize>>`.
+- `HierarchicalCommunities.summaries` is now
+  `HashMap<usize, HashMap<usize, String>>` (level -> id -> summary). Previously a flat
+  `HashMap<usize, String>`.
+- `graphrag-wasm`'s `get_community_summary` now takes `(level, community_id)` (previously
+  `(community_id)`).
+
 ## Testing
 
 Run tests with:
@@ -574,10 +628,18 @@ Run tests with:
 cargo test --package graphrag-core --features leiden --lib graph::leiden
 ```
 
-All 3 tests passing:
+Tests:
 - `test_leiden_basic` - End-to-end algorithm
 - `test_is_well_connected` - Connectivity check
 - `test_config_defaults` - Configuration validation
+- `test_hierarchical_two_tier_graph` - Two-tier graph: level 0 yields 4 sub-cliques and
+  level 1 merges them into exactly 2 outer communities, each containing >=2 sub-cliques
+- `test_hierarchical_max_levels_cap` - `max_levels = 1` produces only level 0, with
+  `hierarchy[0][id] = None` for every level-0 community (roots)
+- `test_super_graph_preserves_total_degree` - Super-graph contraction preserves total
+  weighted degree (intra-community edges become parallel self-loops, not dropped)
+- `test_summaries_distinct_across_levels` - Summaries do not collide across hierarchy
+  levels when community ids overlap
 
 ## References
 
