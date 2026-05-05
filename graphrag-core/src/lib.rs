@@ -2162,4 +2162,103 @@ mod tests {
         assert!(graphrag.is_ok());
     }
 
+    #[cfg(feature = "async")]
+    mod concurrent_extraction {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Barrier;
+
+        fn make_chunks(n: usize) -> Vec<TextChunk> {
+            let doc_id = DocumentId::new("doc-0".to_string());
+            (0..n)
+                .map(|i| {
+                    TextChunk::new(
+                        ChunkId::new(format!("chunk-{i}")),
+                        doc_id.clone(),
+                        format!("content-{i}"),
+                        0,
+                        16,
+                    )
+                })
+                .collect()
+        }
+
+        /// Concurrent extraction: an N-party barrier deadlocks under sequential
+        /// extraction and clears under bounded concurrency at or above N.
+        #[tokio::test]
+        async fn extract_entities_concurrent_runs_chunks_in_parallel() {
+            const N_CHUNKS: usize = 8;
+            let chunks = make_chunks(N_CHUNKS);
+            let barrier = Arc::new(Barrier::new(N_CHUNKS));
+
+            let extract = |chunk: &TextChunk| {
+                let barrier = Arc::clone(&barrier);
+                let id = chunk.id.clone();
+                async move {
+                    barrier.wait().await;
+                    Ok::<(Vec<Entity>, Vec<Relationship>), GraphRAGError>((
+                        vec![Entity::new(
+                            EntityId::new(format!("e-{}", id.0)),
+                            id.0.clone(),
+                            "PERSON".to_string(),
+                            0.9,
+                        )],
+                        vec![],
+                    ))
+                }
+            };
+
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                extract_entities_concurrent(&chunks, extract),
+            )
+            .await;
+
+            assert!(
+                result.is_ok(),
+                "extract_entities_concurrent deadlocked or timed out — extractions ran sequentially"
+            );
+            let extractions = result.unwrap().expect("extraction should succeed");
+            assert_eq!(extractions.len(), N_CHUNKS);
+        }
+
+        /// Fail-fast: once one chunk errors, pending extractions beyond the
+        /// concurrency window must not start (bounded by FAIL_AFTER + CONCURRENCY).
+        #[tokio::test]
+        async fn extract_entities_concurrent_fail_fast_on_error() {
+            const N_CHUNKS: usize = 64;
+            const FAIL_AFTER: usize = 4;
+            const CONCURRENCY: usize = 8;
+            let chunks = make_chunks(N_CHUNKS);
+            let started = Arc::new(AtomicUsize::new(0));
+
+            let extract = |_chunk: &TextChunk| {
+                let started = Arc::clone(&started);
+                async move {
+                    let n = started.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n > FAIL_AFTER {
+                        return Err(GraphRAGError::EntityExtraction {
+                            message: format!("test-injected failure at extraction #{n}"),
+                        });
+                    }
+                    Ok::<(Vec<Entity>, Vec<Relationship>), GraphRAGError>((vec![], vec![]))
+                }
+            };
+
+            let result = extract_entities_concurrent(&chunks, extract).await;
+            assert!(result.is_err(), "expected fail-fast error to propagate");
+
+            let total_started = started.load(Ordering::SeqCst);
+            let upper_bound = FAIL_AFTER + CONCURRENCY + 4;
+            assert!(
+                total_started <= upper_bound,
+                "expected fail-fast (started <= {upper_bound}); got {total_started} of {N_CHUNKS}",
+            );
+            assert!(
+                total_started < N_CHUNKS,
+                "all {N_CHUNKS} extractions ran — fail-fast cancellation regressed",
+            );
+        }
+    }
 }
