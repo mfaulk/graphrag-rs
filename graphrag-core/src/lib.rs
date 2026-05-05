@@ -257,14 +257,25 @@ pub use crate::retrieval::hipporag_ppr::{Fact, HippoRAGConfig, HippoRAGRetriever
 /// so the caller still observes the original chunk order (entity-id collisions
 /// resolve deterministically). `try_collect` short-circuits on the first error
 /// and never starts pending futures, keeping graph mutations all-or-nothing.
+///
+/// The closure returns a `Pin<Box<dyn Future + Send + 'static>>` so the helper
+/// composes with pyo3's `future_into_py`, which requires the outer future to
+/// be `Send + 'static`. Callers therefore clone (or `Arc`-clone) any per-chunk
+/// state they need into the returned future rather than borrowing from the
+/// surrounding stack frame; this also matches how `AsyncGraphRAG` already
+/// handles concurrent extraction. The chunk reference is consumed (cloned)
+/// before the future starts to keep the future `'static`.
 #[cfg(feature = "async")]
-async fn extract_entities_concurrent<'a, F, Fut>(
-    chunks: &'a [TextChunk],
+async fn extract_entities_concurrent<F>(
+    chunks: &[TextChunk],
     extract: F,
 ) -> Result<Vec<(ChunkId, Vec<Entity>, Vec<Relationship>)>>
 where
-    F: Fn(&'a TextChunk) -> Fut,
-    Fut: std::future::Future<Output = Result<(Vec<Entity>, Vec<Relationship>)>> + 'a,
+    F: Fn(
+        TextChunk,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(Vec<Entity>, Vec<Relationship>)>> + Send>,
+    >,
 {
     use futures::stream::{self, StreamExt, TryStreamExt};
 
@@ -272,19 +283,24 @@ where
     // Mirrors AsyncGraphRAG; TODO: surface as a Config field.
     const ENTITY_EXTRACTION_CONCURRENCY: usize = 8;
 
-    let mut results: Vec<(usize, ChunkId, Vec<Entity>, Vec<Relationship>)> =
-        stream::iter(chunks.iter().enumerate())
-            .map(|(idx, chunk)| {
-                let chunk_id = chunk.id.clone();
-                let fut = extract(chunk);
-                async move {
-                    let (entities, relationships) = fut.await?;
-                    Ok::<_, GraphRAGError>((idx, chunk_id, entities, relationships))
-                }
-            })
-            .buffer_unordered(ENTITY_EXTRACTION_CONCURRENCY)
-            .try_collect()
-            .await?;
+    // Eagerly clone the chunks into an owned, indexed Vec so the per-chunk
+    // futures don't borrow from the original slice across the `.await` —
+    // that borrow forces a single concrete lifetime which collides with
+    // the `for<'b>` outer-future requirement imposed by pyo3's
+    // `future_into_py`.
+    let owned: Vec<(usize, TextChunk)> = chunks.iter().cloned().enumerate().collect();
+    let mut results: Vec<(usize, ChunkId, Vec<Entity>, Vec<Relationship>)> = stream::iter(owned)
+        .map(|(idx, chunk)| {
+            let chunk_id = chunk.id.clone();
+            let fut = extract(chunk);
+            async move {
+                let (entities, relationships) = fut.await?;
+                Ok::<_, GraphRAGError>((idx, chunk_id, entities, relationships))
+            }
+        })
+        .buffer_unordered(ENTITY_EXTRACTION_CONCURRENCY)
+        .try_collect()
+        .await?;
 
     // Restore input order so downstream graph mutations are deterministic.
     results.sort_by_key(|(idx, _, _, _)| *idx);
@@ -1017,10 +1033,13 @@ impl GraphRAG {
                     self.config.entities.entity_types.clone()
                 };
 
-                let extractor = LLMEntityExtractor::new(client, entity_types)
-                    .with_temperature(self.config.ollama.temperature.unwrap_or(0.1))
-                    .with_max_tokens(self.config.ollama.max_tokens.unwrap_or(1500) as usize)
-                    .with_keep_alive(self.config.ollama.keep_alive.clone());
+                use std::sync::Arc;
+                let extractor = Arc::new(
+                    LLMEntityExtractor::new(client, entity_types)
+                        .with_temperature(self.config.ollama.temperature.unwrap_or(0.1))
+                        .with_max_tokens(self.config.ollama.max_tokens.unwrap_or(1500) as usize)
+                        .with_keep_alive(self.config.ollama.keep_alive.clone()),
+                );
 
                 let pb = make_pb(total_chunks as u64,
                     ProgressStyle::default_bar()
@@ -1029,19 +1048,29 @@ impl GraphRAG {
                         .progress_chars("=>-"),
                 );
                 pb.set_message("Extracting entities with LLM (single-pass)");
+                let pb = Arc::new(pb);
 
                 // Run extractions with bounded concurrency. Per-chunk errors are
                 // converted to empty results via `log_and_skip_extraction_error`
                 // so one chunk's failure doesn't abort the whole build —
                 // preserving the prior skip-on-error behavior of the sequential
                 // loop.
-                let extractor_ref = &extractor;
-                let pb_ref = &pb;
-                let extractions = extract_entities_concurrent(&chunks, |chunk| async move {
-                    let chunk_id = chunk.id.clone();
-                    let result = extractor_ref.extract_from_chunk(chunk).await;
-                    pb_ref.inc(1);
-                    log_and_skip_extraction_error("llm-single-pass", &chunk_id, result)
+                //
+                // The closure returns a `Pin<Box<dyn Future + Send>>` so the
+                // outer build_graph future stays `Send + 'static` — required
+                // for pyo3's `future_into_py` to wrap it. We therefore hold
+                // the extractor and progress bar in `Arc`s and clone them
+                // (along with the chunk) into each invocation rather than
+                // borrowing from the surrounding stack frame.
+                let extractions = extract_entities_concurrent(&chunks, |chunk| {
+                    let extractor = Arc::clone(&extractor);
+                    let pb = Arc::clone(&pb);
+                    Box::pin(async move {
+                        let chunk_id = chunk.id.clone();
+                        let result = extractor.extract_from_chunk(&chunk).await;
+                        pb.inc(1);
+                        log_and_skip_extraction_error("llm-single-pass", &chunk_id, result)
+                    })
                 })
                 .await?;
 
@@ -2223,10 +2252,10 @@ mod tests {
             let chunks = make_chunks(N_CHUNKS);
             let barrier = Arc::new(Barrier::new(N_CHUNKS));
 
-            let extract = |chunk: &TextChunk| {
+            let extract = |chunk: TextChunk| {
                 let barrier = Arc::clone(&barrier);
                 let id = chunk.id.clone();
-                async move {
+                Box::pin(async move {
                     barrier.wait().await;
                     Ok::<(Vec<Entity>, Vec<Relationship>), GraphRAGError>((
                         vec![Entity::new(
@@ -2237,7 +2266,14 @@ mod tests {
                         )],
                         vec![],
                     ))
-                }
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<(Vec<Entity>, Vec<Relationship>)>,
+                                > + Send,
+                        >,
+                    >
             };
 
             let result = tokio::time::timeout(
@@ -2264,9 +2300,9 @@ mod tests {
             let chunks = make_chunks(N_CHUNKS);
             let started = Arc::new(AtomicUsize::new(0));
 
-            let extract = |_chunk: &TextChunk| {
+            let extract = |_chunk: TextChunk| {
                 let started = Arc::clone(&started);
-                async move {
+                Box::pin(async move {
                     let n = started.fetch_add(1, Ordering::SeqCst) + 1;
                     if n > FAIL_AFTER {
                         return Err(GraphRAGError::EntityExtraction {
@@ -2274,7 +2310,14 @@ mod tests {
                         });
                     }
                     Ok::<(Vec<Entity>, Vec<Relationship>), GraphRAGError>((vec![], vec![]))
-                }
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<(Vec<Entity>, Vec<Relationship>)>,
+                                > + Send,
+                        >,
+                    >
             };
 
             let result = extract_entities_concurrent(&chunks, extract).await;
@@ -2304,14 +2347,14 @@ mod tests {
             // chunk-0 sleeps the longest; remaining chunks finish first.
             // If results were returned in completion order, chunk-0 would be
             // last; the post-sort guarantees input order regardless.
-            let extract = |chunk: &TextChunk| {
+            let extract = |chunk: TextChunk| {
                 let id = chunk.id.clone();
                 // Parse trailing index off "chunk-N" to set sleep duration.
                 let idx: u64 =
                     id.0.strip_prefix("chunk-")
                         .and_then(|s| s.parse().ok())
                         .unwrap();
-                async move {
+                Box::pin(async move {
                     let delay_ms = if idx == 0 { 100 } else { 5 };
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                     Ok::<(Vec<Entity>, Vec<Relationship>), GraphRAGError>((
@@ -2323,7 +2366,14 @@ mod tests {
                         )],
                         vec![],
                     ))
-                }
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<(Vec<Entity>, Vec<Relationship>)>,
+                                > + Send,
+                        >,
+                    >
             };
 
             let extractions = extract_entities_concurrent(&chunks, extract)
@@ -2397,14 +2447,14 @@ mod tests {
             const FAILING_CHUNK_IDX: u64 = 2;
             let chunks = make_chunks(N_CHUNKS);
 
-            let extract = |chunk: &TextChunk| {
+            let extract = |chunk: TextChunk| {
                 let chunk_id = chunk.id.clone();
                 let idx: u64 = chunk_id
                     .0
                     .strip_prefix("chunk-")
                     .and_then(|s| s.parse().ok())
                     .unwrap();
-                async move {
+                Box::pin(async move {
                     let extractor_result: Result<(Vec<Entity>, Vec<Relationship>)> =
                         if idx == FAILING_CHUNK_IDX {
                             Err(GraphRAGError::EntityExtraction {
@@ -2422,7 +2472,14 @@ mod tests {
                             ))
                         };
                     log_and_skip_extraction_error("llm-single-pass", &chunk_id, extractor_result)
-                }
+                })
+                    as std::pin::Pin<
+                        Box<
+                            dyn std::future::Future<
+                                    Output = Result<(Vec<Entity>, Vec<Relationship>)>,
+                                > + Send,
+                        >,
+                    >
             };
 
             // Whole batch must succeed despite chunk-2 failing.
