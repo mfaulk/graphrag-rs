@@ -2,6 +2,9 @@
 
 This document details the 7-phase architecture of the GraphRAG pipeline, covering both Indexing (Graph Construction) and Query (Retrieval & Generation).
 
+> [!IMPORTANT]
+> **Status vs. the GraphRAG paper (arxiv 2404.16130).** This pipeline is *inspired by* Microsoft GraphRAG but does not yet implement every stage of the paper. See the [Status vs. paper](#status-vs-paper) table at the bottom of this document, or the matching section in the [root README](../README.md), before benchmarking against the paper's results.
+
 ## Phase 1: Chunking (Indexing)
 **Goal:** Split documents into manageable segments for processing.
 > [!NOTE]
@@ -10,8 +13,11 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 ### Configuration
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `chunk_size` | Maximum number of tokens per chunk | 300 |
-| `chunk_overlap` | Number of overlapping tokens between chunks | 30 |
+| `chunk_size` | Maximum chunk size (characters today; token-based via tiktoken-rs is in flight on PR #126) | 1000 |
+| `chunk_overlap` | Overlap between adjacent chunks | 200 |
+
+> [!NOTE]
+> **Known default inconsistency.** The `Config` struct (`graphrag-core/src/config/mod.rs`) defaults `chunk_size = 1000` / `chunk_overlap = 200`, while `SetConfig` (`graphrag-core/src/config/setconfig.rs`, used by file-loaded configs) defaults `chunk_size = 512` / `chunk_overlap = 64`. The two paths disagree on defaults; effective values therefore depend on whether a `Config` is built programmatically or loaded from a TOML file. Tracked as a follow-up.
 
 ### Guidelines
 - **Small Chunks (100-300 tokens):** Best for granular retrieval and precise fact extraction.
@@ -41,7 +47,7 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 |-----------|-------------|---------|
 | `extract_relationships` | Enable/disable relationship extraction | `true` |
 | `use_gleaning` | Enable multi-pass extraction for missed relationships | `true` |
-| `max_gleanings` | Maximum number of gleaning passes | `1` |
+| `max_gleaning_rounds` | Maximum number of gleaning passes (config default; the paper uses `max_gleanings = 1` and that is what PR #131 wires up for paper-aligned runs) | `3` |
 
 ### Methods
 1.  **Co-occurrence:** rapid identification based on proximity in text.
@@ -91,17 +97,21 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 ### Configuration
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `strategy` | Retrieval strategy (`vector`, `graph`, `hybrid`, `local`, `global`) | `hybrid` |
+| `strategy` | Retrieval strategy (today: `vector`, `graph`, `hybrid`; planned: `local` via PR #130, `global` not yet implemented per #93) | `hybrid` |
 | `top_k` | Number of results to return | `10` |
 | `retrieval.score_threshold` | Minimum similarity score | `0.7` |
 
 ### Strategies
+
+**Available on `main` today:**
 1.  **Vector:** Standard semantic search using embeddings.
 2.  **Graph:** Traverses the knowledge graph to find related entities.
-3.  **Hybrid:** Combines Vector and Graph search for best coverage.
-4.  **Local:** Focuses on immediate neighborhood of query entities.
-5.  **Global:** Scans entire graph/communities for broad queries.
-6.  **Text:** Keyword-based search (BM25 or similar).
+3.  **Hybrid:** Combines Vector and Graph search for best coverage. (Default.)
+4.  **Text:** Keyword-based search (BM25 or similar).
+
+**Planned / in progress (not yet on `main`):**
+5.  **Local:** Focuses on immediate neighborhood of query entities. Paper-aligned Local Search lands in PR #130.
+6.  **Global:** Scans entire graph/communities for broad queries. Paper-aligned Global Search is not yet implemented (tracked in issue #93).
 
 ## Phase 7: Answer Generation (Query)
 **Goal:** Synthesize a final answer from retrieved context.
@@ -125,8 +135,8 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 
 | Section | Parameter | Type | Default | Description |
 |---------|-----------|------|---------|-------------|
-| **Chunking** | `chunk_size` | int | 300 | Max tokens per chunk |
-| | `chunk_overlap` | int | 30 | Overlap tokens |
+| **Chunking** | `chunk_size` | int | 1000 | Max chunk size (chars today; tokens once PR #126 lands) |
+| | `chunk_overlap` | int | 200 | Overlap |
 | **Extraction** | `entity_extraction.approach` | enum | hybrid | Extraction method |
 | | `entity_extraction.entity_types` | list | [...] | Target entities |
 | | `entity_extraction.use_gleaning` | bool | true | Multi-pass extraction |
@@ -148,7 +158,9 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 |---------------|-----------------------------|---------------|---------------|
 | **Light** (Algo Extract, Vector Only) | ~30s | ~500ms | Low |
 | **Balanced** (Hybrid Extract, Hybrid Search) | ~2m | ~1.5s | Medium |
-| **Deep** (All Semantic, Global Search) | ~10m | ~5s+ | High |
+| **Deep** (All Semantic, hybrid + Local Search) | ~10m | ~5s+ | High |
+
+> Paper-style **Global Search** (map-reduce over community reports) is not yet implemented - see [Status vs. paper](#status-vs-paper).
 
 ---
 
@@ -173,3 +185,23 @@ GraphRAG-rs implements techniques from several cutting-edge research papers. Her
 - **Graph Construction:** ~10-30s
 - **Embedding:** ~10-30s
 - **Total Indexing:** ~3-6 mins (highly dependent on LLM speed)
+
+---
+
+## Status vs. paper
+
+The table below tracks how each stage of the GraphRAG paper (arxiv 2404.16130) maps to what is on `main` today. Use it to gauge what to expect when comparing this implementation to the paper's results.
+
+| Pipeline stage | Status | Notes |
+|---|---|---|
+| Document chunking | In progress: token-based via `tiktoken-rs` (cl100k_base) | PR #126 - `main` today uses char-based chunking via `TextProcessor::chunk_text` (a `chunk_text_hierarchical` helper exists in `graphrag-core/src/text/mod.rs` but is not on the active ingestion path) |
+| LLM entity extraction with gleaning | In progress: paper-aligned prompts and `max_gleanings = 1` default | PR #131 (also adds logit-bias / `LOOP` continuation) |
+| Hierarchical Leiden (super-graph contraction) | In progress: real multi-level | PR #128 - single-level Leiden on `main` today |
+| Element summaries (LLM collapse of duplicate descriptions) | Preview only: API exists; needs `Entity::description` wiring | PR #131 + Wave 3 A wiring |
+| Community reports (LLM-generated structured summaries) | Not yet implemented | Tracked in issue #95 (blocked on #94 / #97) |
+| Local Search (entity-anchored, token-budgeted context window) | In progress: `--mode local` retrieval flag (not yet on `main`) | PR #130 |
+| Global Search (map-reduce over community reports + helpfulness scoring) | Not yet implemented | Tracked in issue #93 |
+
+**On query modes today:** `main` does *not* expose a `--mode {local,global,hybrid}` retrieval flag. The TUI's `/mode ask|explain|reason` selects answer style (plain / explained / reasoning), not retrieval strategy; retrieval defaults to this project's hybrid blend (LightRAG dual-level + PageRank/PPR + cross-encoder reranking). After PR #130 merges, `graphrag query --mode local` will become available and will provide the paper-aligned Local Search. Paper-aligned Global Search remains future work (#93).
+
+**For benchmarking:** today (on `main`) the only available retrieval is the project's hybrid blend, so any comparison to the GraphRAG paper's reported numbers should be interpreted with that caveat in mind. After PR #130 merges, Local Search becomes the appropriate paper-aligned retrieval mode to benchmark against. Comparisons should also account for the still-absent Global Search stage and (until the other PRs above merge) the absent token-based chunking, hierarchical Leiden, paper-aligned gleaning defaults, and element-summary collapse.

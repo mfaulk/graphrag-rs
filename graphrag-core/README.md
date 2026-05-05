@@ -2,14 +2,16 @@
 
 The core library for GraphRAG-rs, providing portable functionality for both native and WASM deployments.
 
+> **Status vs. the GraphRAG paper.** This crate is *inspired by* Microsoft GraphRAG (arxiv 2404.16130) but does not yet implement every stage of the paper - notably Global Search and LLM-generated community reports. See the [Status vs. paper](../README.md#status-vs-paper) section in the root README for stage-by-stage status before benchmarking.
+
 ## Overview
 
 `graphrag-core` is the foundational library that powers GraphRAG-rs. It provides:
 
 - **Embedding Generation**: 8 provider backends (HuggingFace, OpenAI, Voyage AI, Cohere, Jina, Mistral, Together AI, Ollama)
-- **Entity Extraction**: TRUE LLM-based gleaning extraction with multi-round refinement (Microsoft GraphRAG-style)
-- **Graph Construction**: Incremental updates, PageRank, community detection
-- **Retrieval Strategies**: Vector, BM25, PageRank, hybrid, adaptive
+- **Entity Extraction**: LLM-based gleaning extraction with multi-round refinement (Microsoft GraphRAG-style prompts; paper-aligned `max_gleanings = 1` default arrives with PR #131)
+- **Graph Construction**: Incremental updates, PageRank, single-level Leiden community detection (multi-level hierarchical Leiden is in flight on PR #128)
+- **Retrieval Strategies**: Vector, BM25, PageRank, hybrid, adaptive (paper-aligned Local Search arrives with PR #130; Global Search is not yet implemented - issue #93)
 - **Configuration System**: Hierarchical TOML-based configuration with environment variable overrides
 - **Cross-Platform**: Works on native (Linux, macOS, Windows) and WASM
 
