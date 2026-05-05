@@ -227,6 +227,16 @@ pub struct AsyncBatchUpdater {
     /// Notify signal for batch ready
     batch_ready_notify: Arc<Notify>,
 
+    /// Wakes back-pressured submitters when a batch is removed from
+    /// `pending_batches`. Replaces a 10ms polling loop in `submit_operation`.
+    /// `notify_waiters` is used so all blocked submitters re-check capacity.
+    /// `submit_operation` registers the `notified()` future *before* the
+    /// capacity recheck to avoid lost wakeups across the registration boundary.
+    /// A small TOCTOU window between the recheck and `sender.send` may allow
+    /// the queue to briefly exceed `max_queue_size`; the channel buffer and
+    /// soft-limit semantics make this acceptable here.
+    queue_drained_notify: Arc<Notify>,
+
     /// Shutdown signal
     shutdown: Arc<RwLock<bool>>,
 }
@@ -255,6 +265,7 @@ impl AsyncBatchUpdater {
                 last_batch_at: None,
             })),
             batch_ready_notify: Arc::new(Notify::new()),
+            queue_drained_notify: Arc::new(Notify::new()),
             shutdown: Arc::new(RwLock::new(false)),
         }
     }
@@ -266,14 +277,34 @@ impl AsyncBatchUpdater {
 
     /// Submit a single update operation (non-blocking)
     pub async fn submit_operation(&self, operation: UpdateOperation) -> Result<()> {
-        // Check back-pressure
+        // Back-pressure: park on `queue_drained_notify` rather than poll every 10ms.
+        // Register interest with `enable()` BEFORE re-checking the queue length so
+        // any `notify_waiters()` call that fires between the check and the await
+        // is delivered to the already-registered waiter. Without `enable()`, the
+        // `Notified` future does not enter the wait list until its first poll
+        // (i.e. inside `notified.await`), which leaves a TOCTOU window where a
+        // drain notification can be lost and the submitter parks forever.
+        //
+        // The shutdown flag is checked inside the loop so submitters parked on
+        // back-pressure are released with an error when `shutdown()` fires its
+        // `notify_waiters()` — otherwise they would re-check, see the queue
+        // still full, re-park, and hang because no further drain notify
+        // arrives after shutdown.
         if self.config.enable_backpressure {
-            let queue_size = self.pending_batches.read().len();
-            if queue_size >= self.config.max_queue_size {
-                // Apply back-pressure: wait until queue size reduces
-                while self.pending_batches.read().len() >= self.config.max_queue_size {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+            loop {
+                let notified = self.queue_drained_notify.notified();
+                tokio::pin!(notified);
+                // `enable()` adds this future to the Notify wait list now.
+                notified.as_mut().enable();
+                if *self.shutdown.read() {
+                    return Err(crate::GraphRAGError::IncrementalUpdate {
+                        message: "AsyncBatchUpdater is shutting down".to_string(),
+                    });
                 }
+                if self.pending_batches.read().len() < self.config.max_queue_size {
+                    break;
+                }
+                notified.as_mut().await;
             }
         }
 
@@ -375,6 +406,7 @@ impl AsyncBatchUpdater {
                 let completed_batches = Arc::clone(&self.completed_batches);
                 let stats = Arc::clone(&self.stats);
                 let batch_ready_notify = Arc::clone(&self.batch_ready_notify);
+                let queue_drained_notify = Arc::clone(&self.queue_drained_notify);
                 let shutdown = Arc::clone(&self.shutdown);
 
                 tokio::spawn(async move {
@@ -393,6 +425,9 @@ impl AsyncBatchUpdater {
                         };
 
                         if let Some(mut batch) = batch {
+                            // A slot opened in `pending_batches`; wake any submitters
+                            // parked on back-pressure so they can re-check capacity.
+                            queue_drained_notify.notify_waiters();
                             // Mark as processing
                             batch.status = BatchStatus::Processing;
                             batch.started_at = Some(Utc::now());
@@ -440,6 +475,9 @@ impl AsyncBatchUpdater {
     pub async fn shutdown(&self) {
         *self.shutdown.write() = true;
         self.batch_ready_notify.notify_waiters();
+        // Release any submitters parked on back-pressure so they can re-check
+        // and proceed (or be cancelled by the caller).
+        self.queue_drained_notify.notify_waiters();
     }
 
     /// Get current statistics
@@ -741,5 +779,245 @@ mod tests {
         for handle in handles {
             assert!(handle.await.is_ok());
         }
+    }
+
+    fn make_dummy_batch() -> UpdateBatch {
+        UpdateBatch {
+            batch_id: uuid::Uuid::new_v4().to_string(),
+            operations: Vec::new(),
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            status: BatchStatus::Pending,
+        }
+    }
+
+    fn make_dummy_op(i: usize) -> UpdateOperation {
+        UpdateOperation {
+            operation_id: format!("op_{}", i),
+            operation_type: OperationType::AddNode,
+            data: UpdateData::Node {
+                node_id: format!("node_{}", i),
+                properties: HashMap::new(),
+                embeddings: None,
+            },
+            priority: 0,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// Verifies a back-pressured submitter parks on Notify rather than polling:
+    /// under paused mocked time, advancing without notify must NOT unblock the
+    /// submitter (proving no 10ms polling loop), and notify_waiters wakes it
+    /// without any virtual time advance.
+    #[tokio::test(start_paused = true)]
+    async fn submit_operation_does_not_busy_wait_under_back_pressure() {
+        let config = AsyncBatchConfig {
+            max_batch_size: 100,
+            max_queue_size: 4,
+            enable_backpressure: true,
+            channel_buffer_size: 16,
+            ..Default::default()
+        };
+
+        let updater = Arc::new(AsyncBatchUpdater::new(config));
+
+        // Pre-fill pending_batches at max_queue_size to engage back-pressure.
+        {
+            let mut q = updater.pending_batches.write();
+            for _ in 0..4 {
+                q.push_back(make_dummy_batch());
+            }
+        }
+
+        // Spawn submitter — it should park on back-pressure.
+        let submitter = {
+            let updater = Arc::clone(&updater);
+            tokio::spawn(async move { updater.submit_operation(make_dummy_op(0)).await })
+        };
+
+        // Yield so the spawned task actually starts and reaches `notified().await`.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Drain a slot but DO NOT notify, then advance virtual time well beyond
+        // the legacy 10ms polling interval. With the polling loop, the submitter
+        // would wake during this advance; with Notify, it stays parked.
+        {
+            let mut q = updater.pending_batches.write();
+            q.pop_front();
+        }
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !submitter.is_finished(),
+            "submitter unblocked without notify — implies polling, not Notify wakeup"
+        );
+
+        // Now signal — the submitter must wake without any time advancement.
+        updater.queue_drained_notify.notify_waiters();
+        let join = tokio::time::timeout(std::time::Duration::from_millis(10), submitter)
+            .await
+            .expect("submitter did not wake after notify_waiters");
+        join.expect("submit task panicked")
+            .expect("submit_operation failed");
+    }
+
+    /// Regression for the lost-wakeup race in the back-pressure loop.
+    ///
+    /// `submit_operation` parks on `queue_drained_notify` when the queue is
+    /// at capacity. The pre-fix loop was:
+    ///   `while pending.read().len() >= cap { notify.notified().await; }`
+    /// `Notify::notified()` captures the current `notify_waiters` counter at
+    /// construction. If a `notify_waiters()` fires *between* the queue read
+    /// and the `Notified` construction, the freshly-constructed future
+    /// captures the post-call counter and the subsequent poll parks on
+    /// that counter — hanging the submitter until some later notify
+    /// arrives. Because the contract is "notify only when a slot opens",
+    /// no later notify is guaranteed.
+    ///
+    /// The fix moves the `Notified` construction to BEFORE the queue
+    /// recheck (and uses `enable()` to register the waiter on the wait
+    /// list before the recheck), so any racing `notify_waiters()` either
+    /// (a) increments the counter past the captured value — making the
+    /// future resolve on its next poll — or (b) wakes the already-
+    /// registered waiter directly.
+    ///
+    /// This test demonstrates the failure mode of the buggy pattern and
+    /// the success of the fixed pattern using a bare `tokio::sync::Notify`.
+    /// Both halves run a tiny scenario: pre-fire `notify_waiters()` (this
+    /// stands in for "drain happened during the buggy gap"), then attempt
+    /// to await with the buggy and fixed patterns. The buggy pattern
+    /// constructs the `Notified` AFTER the pre-fire — capturing the new
+    /// counter — and times out. The fixed pattern constructs the
+    /// `Notified` BEFORE the pre-fire — capturing the original counter —
+    /// so the await resolves on the count mismatch.
+    #[tokio::test]
+    async fn back_pressure_register_before_check_avoids_lost_wakeup() {
+        // Buggy pattern: construct AFTER the racing notify_waiters.
+        let buggy_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        buggy_notify.notify_waiters(); // racing notify
+        let buggy_fut = buggy_notify.notified(); // captures post-call counter
+        let buggy_res = tokio::time::timeout(std::time::Duration::from_millis(50), buggy_fut).await;
+        assert!(
+            buggy_res.is_err(),
+            "buggy pattern unexpectedly succeeded — Notify semantics changed?"
+        );
+
+        // Fixed pattern: construct BEFORE the racing notify_waiters.
+        let fixed_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        let fixed_fut = fixed_notify.notified(); // captures original counter
+        tokio::pin!(fixed_fut);
+        fixed_fut.as_mut().enable();
+        fixed_notify.notify_waiters(); // racing notify
+        let fixed_res =
+            tokio::time::timeout(std::time::Duration::from_millis(50), fixed_fut.as_mut()).await;
+        assert!(
+            fixed_res.is_ok(),
+            "fixed pattern lost the wakeup — register-before-check broken"
+        );
+    }
+
+    /// Verifies that workers signal queue_drained_notify when popping a batch,
+    /// so submitters waiting on back-pressure are woken without polling.
+    #[tokio::test]
+    async fn worker_pop_signals_queue_drained_notify() {
+        let config = AsyncBatchConfig {
+            max_batch_size: 1,
+            max_batch_delay_ms: 50,
+            max_queue_size: 1,
+            enable_backpressure: true,
+            num_workers: 1,
+            channel_buffer_size: 8,
+            ..Default::default()
+        };
+
+        let updater = Arc::new(AsyncBatchUpdater::new(config));
+        updater.start().await;
+
+        // Wait on the drained-notify; if the worker pops a batch, this resolves.
+        let drained_notify = Arc::clone(&updater.queue_drained_notify);
+        let waiter = tokio::spawn(async move {
+            drained_notify.notified().await;
+        });
+
+        // Allow the waiter to register before notify is fired.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // Submit one op; collector forms a batch (max_batch_size=1), worker pops it,
+        // which must trigger queue_drained_notify.
+        updater
+            .submit_operation(make_dummy_op(0))
+            .await
+            .expect("submit failed");
+
+        let res = tokio::time::timeout(std::time::Duration::from_millis(500), waiter).await;
+        assert!(
+            res.is_ok(),
+            "queue_drained_notify was not signaled when worker popped a batch"
+        );
+
+        updater.shutdown().await;
+    }
+
+    /// Verifies that a back-pressured submitter does NOT hang when
+    /// `shutdown()` is called: the loop must observe the shutdown flag and
+    /// return an error rather than re-park on a notify that will never
+    /// come. Before the fix, `shutdown()` fired `notify_waiters()` to wake
+    /// submitters but the loop only re-checked the queue length, found it
+    /// still full, and parked again — hanging permanently because no
+    /// further drain notifies arrive after shutdown.
+    #[tokio::test]
+    async fn submit_operation_returns_error_on_shutdown_while_back_pressured() {
+        let config = AsyncBatchConfig {
+            max_batch_size: 100,
+            max_queue_size: 2,
+            enable_backpressure: true,
+            channel_buffer_size: 16,
+            ..Default::default()
+        };
+
+        let updater = Arc::new(AsyncBatchUpdater::new(config));
+
+        // Pre-fill at capacity to force the submitter to park.
+        {
+            let mut q = updater.pending_batches.write();
+            for _ in 0..2 {
+                q.push_back(make_dummy_batch());
+            }
+        }
+
+        // Spawn submitter; it should park inside the back-pressure loop.
+        let submitter = {
+            let updater = Arc::clone(&updater);
+            tokio::spawn(async move { updater.submit_operation(make_dummy_op(0)).await })
+        };
+
+        // Allow the submitter to reach `.await` and park.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !submitter.is_finished(),
+            "submitter should be parked on back-pressure"
+        );
+
+        // Shutdown should release the parked submitter with an Err — not
+        // wake it to a no-progress recheck loop.
+        updater.shutdown().await;
+
+        let join = tokio::time::timeout(std::time::Duration::from_millis(500), submitter)
+            .await
+            .expect("submitter hung after shutdown");
+        let result = join.expect("submit task panicked");
+        assert!(
+            result.is_err(),
+            "submitter should return Err on shutdown, got Ok"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shutting down") || msg.contains("shutdown"),
+            "unexpected error message on shutdown: {msg}"
+        );
     }
 }
