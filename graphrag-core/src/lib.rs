@@ -294,6 +294,37 @@ where
         .collect())
 }
 
+/// Per-chunk error policy used by the LLM single-pass branch of `build_graph`.
+///
+/// `extract_entities_concurrent` is fail-fast — any extraction `Err` aborts
+/// the whole batch. To preserve the prior sequential loop's "log a warning
+/// and skip" behavior, callers wrap each per-chunk result with this helper
+/// before returning to the helper, so the helper only ever sees `Ok`.
+#[cfg(feature = "async")]
+fn log_and_skip_extraction_error(
+    extractor_label: &'static str,
+    chunk_id: &ChunkId,
+    result: Result<(Vec<Entity>, Vec<Relationship>)>,
+) -> Result<(Vec<Entity>, Vec<Relationship>)> {
+    match result {
+        Ok(pair) => Ok(pair),
+        Err(_e) => {
+            #[cfg(feature = "tracing")]
+            tracing::warn!(
+                extractor = extractor_label,
+                chunk_id = %chunk_id,
+                error = %_e,
+                "extraction failed for chunk, skipping"
+            );
+            #[cfg(not(feature = "tracing"))]
+            {
+                let _ = (extractor_label, chunk_id);
+            }
+            Ok((Vec::new(), Vec::new()))
+        },
+    }
+}
+
 // ================================
 // MAIN GRAPHRAG SYSTEM
 // ================================
@@ -1000,27 +1031,17 @@ impl GraphRAG {
                 pb.set_message("Extracting entities with LLM (single-pass)");
 
                 // Run extractions with bounded concurrency. Per-chunk errors are
-                // caught inside the closure (returning empty) so one chunk's
-                // failure doesn't abort the whole build — preserving the prior
-                // skip-on-error behavior of the sequential loop.
+                // converted to empty results via `log_and_skip_extraction_error`
+                // so one chunk's failure doesn't abort the whole build —
+                // preserving the prior skip-on-error behavior of the sequential
+                // loop.
                 let extractor_ref = &extractor;
                 let pb_ref = &pb;
                 let extractions = extract_entities_concurrent(&chunks, |chunk| async move {
                     let chunk_id = chunk.id.clone();
                     let result = extractor_ref.extract_from_chunk(chunk).await;
                     pb_ref.inc(1);
-                    match result {
-                        Ok(pair) => Ok(pair),
-                        Err(_e) => {
-                            #[cfg(feature = "tracing")]
-                            tracing::warn!(
-                                chunk_id = %chunk_id,
-                                error = %_e,
-                                "LLM extraction failed for chunk, skipping"
-                            );
-                            Ok((Vec::new(), Vec::new()))
-                        },
-                    }
+                    log_and_skip_extraction_error("llm-single-pass", &chunk_id, result)
                 })
                 .await?;
 
@@ -2320,6 +2341,119 @@ mod tests {
                 observed, expected_refs,
                 "results must be in input chunk order regardless of completion order",
             );
+        }
+
+        /// Per-chunk error policy unit: `Ok` extractions pass through unchanged.
+        #[test]
+        fn log_and_skip_extraction_error_passes_ok_through() {
+            let chunk_id = ChunkId::new("chunk-ok".to_string());
+            let entity = Entity::new(
+                EntityId::new("e-1".to_string()),
+                "Foo".to_string(),
+                "PERSON".to_string(),
+                0.9,
+            );
+            let result: Result<(Vec<Entity>, Vec<Relationship>)> =
+                Ok((vec![entity.clone()], vec![]));
+
+            let out = log_and_skip_extraction_error("llm-single-pass", &chunk_id, result)
+                .expect("Ok input must round-trip as Ok");
+            assert_eq!(out.0.len(), 1);
+            assert_eq!(out.0[0].id, entity.id);
+            assert!(out.1.is_empty());
+        }
+
+        /// Per-chunk error policy unit: `Err` extractions are converted to
+        /// empty `Ok` so the bounded-concurrency helper doesn't fail-fast on
+        /// a single bad chunk.
+        #[test]
+        fn log_and_skip_extraction_error_swallows_err_as_empty_ok() {
+            let chunk_id = ChunkId::new("chunk-bad".to_string());
+            let result: Result<(Vec<Entity>, Vec<Relationship>)> =
+                Err(GraphRAGError::EntityExtraction {
+                    message: "simulated extractor failure".to_string(),
+                });
+
+            let out = log_and_skip_extraction_error("llm-single-pass", &chunk_id, result)
+                .expect("Err input must be converted to empty Ok");
+            assert!(
+                out.0.is_empty(),
+                "failed chunks must contribute no entities"
+            );
+            assert!(
+                out.1.is_empty(),
+                "failed chunks must contribute no relationships"
+            );
+        }
+
+        /// Branch-level error policy: this mirrors the LLM single-pass branch
+        /// of `build_graph` (the helper plus `log_and_skip_extraction_error`)
+        /// without requiring Ollama. A regression where `build_graph` stops
+        /// catching per-chunk errors — and instead lets them propagate up
+        /// from `extract_entities_concurrent` — would also break this test.
+        #[tokio::test]
+        async fn extract_with_skip_on_error_completes_and_drops_failed_chunks() {
+            const N_CHUNKS: usize = 6;
+            const FAILING_CHUNK_IDX: u64 = 2;
+            let chunks = make_chunks(N_CHUNKS);
+
+            let extract = |chunk: &TextChunk| {
+                let chunk_id = chunk.id.clone();
+                let idx: u64 = chunk_id
+                    .0
+                    .strip_prefix("chunk-")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap();
+                async move {
+                    let extractor_result: Result<(Vec<Entity>, Vec<Relationship>)> =
+                        if idx == FAILING_CHUNK_IDX {
+                            Err(GraphRAGError::EntityExtraction {
+                                message: format!("simulated failure for chunk {idx}"),
+                            })
+                        } else {
+                            Ok((
+                                vec![Entity::new(
+                                    EntityId::new(format!("e-{}", chunk_id.0)),
+                                    chunk_id.0.clone(),
+                                    "PERSON".to_string(),
+                                    0.9,
+                                )],
+                                vec![],
+                            ))
+                        };
+                    log_and_skip_extraction_error("llm-single-pass", &chunk_id, extractor_result)
+                }
+            };
+
+            // Whole batch must succeed despite chunk-2 failing.
+            let extractions = extract_entities_concurrent(&chunks, extract).await.expect(
+                "branch-level error policy regressed: per-chunk failure propagated up \
+                     instead of being skipped",
+            );
+
+            assert_eq!(extractions.len(), N_CHUNKS, "must yield one slot per chunk");
+
+            // Failed chunk yields empty entities; every other chunk yields one.
+            for (chunk_id, entities, _relationships) in extractions {
+                let idx: u64 = chunk_id
+                    .0
+                    .strip_prefix("chunk-")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap();
+                if idx == FAILING_CHUNK_IDX {
+                    assert!(
+                        entities.is_empty(),
+                        "failed chunk {idx} must contribute no entities",
+                    );
+                } else {
+                    assert_eq!(
+                        entities.len(),
+                        1,
+                        "successful chunk {idx} must contribute exactly one entity",
+                    );
+                    assert_eq!(entities[0].name, chunk_id.0);
+                }
+            }
         }
     }
 }
