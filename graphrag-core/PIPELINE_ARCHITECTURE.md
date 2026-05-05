@@ -13,16 +13,29 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 ### Configuration
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `chunk_size` | Maximum chunk size (characters today; token-based via tiktoken-rs is in flight on PR #126) | 1000 |
-| `chunk_overlap` | Overlap between adjacent chunks | 200 |
+| `chunk_size` | Maximum number of tokens (or bytes, in `Chars` mode) per chunk | 600 |
+| `chunk_overlap` | Number of overlapping tokens between chunks | 60 |
+| `min_chunk_size` | Minimum tokens before a chunk is emitted | 50 |
+| `chunking_mode` | `Tokens` (cl100k_base BPE) or `Chars` (legacy byte-based) | see note |
+
+Token counts use the `cl100k_base` BPE (matches `gpt-4o` / `gpt-4o-mini`) via
+`tiktoken-rs`. Char mode is preserved for backwards compatibility with callers
+that pass byte-length sizes into legacy code paths.
 
 > [!NOTE]
-> **Known default inconsistency.** The `Config` struct (`graphrag-core/src/config/mod.rs`) defaults `chunk_size = 1000` / `chunk_overlap = 200`, while `SetConfig` (`graphrag-core/src/config/setconfig.rs`, used by file-loaded configs) defaults `chunk_size = 512` / `chunk_overlap = 64`. The two paths disagree on defaults; effective values therefore depend on whether a `Config` is built programmatically or loaded from a TOML file. Tracked as a follow-up.
+> The runtime `chunking_mode` default depends on how the chunker is
+> constructed. `HierarchicalChunker::new()` returns `Chars` mode for
+> backwards compatibility with existing `TextProcessor` pipelines. To use
+> the paper-aligned token-based chunker (600 tokens, 60-token overlap),
+> opt in via `HierarchicalChunker::new().with_mode(ChunkingMode::Tokens)`.
+> The `ChunkingMode::default()` enum impl returns `Tokens` and is used by
+> any caller that goes through `Default::default()` rather than `new()`.
 
 ### Guidelines
-- **Small Chunks (100-300 tokens):** Best for granular retrieval and precise fact extraction.
-- **Large Chunks (500-1000 tokens):** Better for capturing broader context and thematic relationships.
-- **Overlap:** Ensure critical information isn't split across boundaries. 10-20% overlap is recommended.
+- **Small Chunks (300-600 tokens):** Better for granular retrieval and precise fact extraction.
+- **Medium Chunks (600-1200 tokens):** Edge et al. 2024 GraphRAG default; balances context and recall.
+- **Large Chunks (1200-2400 tokens):** Captures broader context and thematic relationships at the cost of recall (Edge et al. ablation).
+- **Overlap:** 10% of `chunk_size` is the default; ensures critical information isn't split across boundaries.
 
 ## Phase 2: Entity Extraction (Indexing)
 **Goal:** Identify key entities (People, Places, Organizations, Concepts) from text chunks.
@@ -135,8 +148,9 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 
 | Section | Parameter | Type | Default | Description |
 |---------|-----------|------|---------|-------------|
-| **Chunking** | `chunk_size` | int | 1000 | Max chunk size (chars today; tokens once PR #126 lands) |
-| | `chunk_overlap` | int | 200 | Overlap |
+| **Chunking** | `chunk_size` | int | 600 | Max tokens per chunk in `Tokens` mode (cl100k_base BPE); bytes in `Chars` mode |
+| | `chunk_overlap` | int | 60 | Overlap tokens |
+| | `chunking_mode` | enum | see note | `Tokens` or `Chars`. `HierarchicalChunker::new()` defaults to `Chars` for backwards compat; opt into token mode via `.with_mode(ChunkingMode::Tokens)` |
 | **Extraction** | `entity_extraction.approach` | enum | hybrid | Extraction method |
 | | `entity_extraction.entity_types` | list | [...] | Target entities |
 | | `entities.mode` | enum | n/a | `algorithmic` \| `llm_single_pass` \| `llm_gleaning` (overrides `use_gleaning`) |

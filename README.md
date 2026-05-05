@@ -372,7 +372,7 @@ QUERY (ask())
 
 | Phase | Goal | Key Parameters |
 |-------|------|----------------|
-| **1. Chunking** | Split text | `chunk_size` (1000), `chunk_overlap` (200) |
+| **1. Chunking** | Split text | `chunk_size` (600 tokens), `chunk_overlap` (60 tokens), `chunking_mode` (`Chars` from `HierarchicalChunker::new()`; opt into `Tokens` via `.with_mode`) |
 | **2. Extraction** | Identify entities | `approach` (hybrid), `entity_types` |
 | **3. Relationships** | Connect entities | `extract_relationships` (true) |
 | **4. Graph** | Build network | `max_connections` (50), `enable_pagerank` |
