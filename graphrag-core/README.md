@@ -278,6 +278,74 @@ async fn main() -> Result<()> {
 }
 ```
 
+## LLM Chat Providers
+
+In addition to the default Ollama backend, `graphrag-core` ships native
+HTTP `ChatBackend` implementations for the two main cloud providers
+(issue #90). All three implement the same `ChatBackend` trait and can be
+injected via `GraphRAG::set_chat_backend`.
+
+| Provider     | Endpoint                                | Default model                | Auth                                      | Feature flags        |
+|--------------|-----------------------------------------|------------------------------|-------------------------------------------|----------------------|
+| **Ollama**   | `http://localhost:11434/api/generate`   | `llama3.2:3b`                | none (local)                              | `ollama` + `async`   |
+| **OpenAI**   | `https://api.openai.com/v1/chat/completions` | `gpt-4o-mini`           | `Authorization: Bearer $OPENAI_API_KEY`   | `async` + `ureq`     |
+| **Anthropic**| `https://api.anthropic.com/v1/messages` | `claude-haiku-4-5-20251001`  | `x-api-key: $ANTHROPIC_API_KEY`           | `async` + `ureq`     |
+
+Documented Anthropic model options: `claude-haiku-4-5-20251001` (default,
+cheap), `claude-sonnet-4-6`, `claude-opus-4-7`.
+
+**Construction:**
+
+```rust
+use graphrag_core::core::api_chat::{OpenAiChat, AnthropicChat};
+
+// Read API key from env (recommended)
+let openai     = OpenAiChat::from_env_default()?;          // gpt-4o-mini
+let anthropic  = AnthropicChat::from_env_default()?;       // claude-haiku-4-5-20251001
+
+// Or pass an explicit key + model
+let custom = AnthropicChat::new(my_key, "claude-sonnet-4-6")
+    .with_default_max_tokens(8192);
+```
+
+**Config-driven (TOML):**
+
+```toml
+# OpenAI — reads OPENAI_API_KEY from env when api_key is omitted
+[chat]
+provider = "openai"
+model    = "gpt-4o-mini"
+```
+
+```toml
+# Anthropic — reads ANTHROPIC_API_KEY from env
+[chat]
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+```
+
+```toml
+# Ollama — local, no API key needed
+[chat]
+provider = "ollama"
+model    = "llama3.2:3b"   # constructed via core::ollama_adapters
+```
+
+```rust
+use graphrag_core::core::api_chat::ChatProviderConfig;
+
+let cfg: ChatProviderConfig = toml::from_str(include_str!("chat.toml"))?;
+let backend = cfg.build()?;   // returns DynChatBackend (OpenAI/Anthropic only)
+```
+
+Sample TOML snippets live under `tests/e2e/configs/chat_openai.toml`
+and `tests/e2e/configs/chat_anthropic.toml`.
+
+**Out of scope** for the native HTTP backends (per issue #90):
+streaming, tool / function calling, Azure OpenAI / Bedrock / Vertex
+routing, and a CLI flag.
+
 ## Embedding Providers
 
 GraphRAG Core supports 8 embedding backends:

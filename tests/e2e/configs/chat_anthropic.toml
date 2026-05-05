@@ -1,0 +1,19 @@
+# Sample chat-provider config for the native Anthropic ChatBackend (issue #90).
+#
+# Maps onto graphrag_core::core::api_chat::ChatProviderConfig. Drop this
+# under a top-level [chat] table in any TOML config the application loads.
+#
+# Auth:
+#   - `api_key` is intentionally unset; the loader will read
+#     ANTHROPIC_API_KEY from the environment. Do NOT commit a real key.
+#
+# Documented model options:
+#   - claude-haiku-4-5-20251001  (default; cheap)
+#   - claude-sonnet-4-6
+#   - claude-opus-4-7
+
+provider   = "anthropic"
+model      = "claude-haiku-4-5-20251001"
+max_tokens = 4096
+
+# api_key = "sk-ant-..."   # uncomment to override the env var
