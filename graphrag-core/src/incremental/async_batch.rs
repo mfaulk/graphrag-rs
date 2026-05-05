@@ -284,12 +284,23 @@ impl AsyncBatchUpdater {
         // `Notified` future does not enter the wait list until its first poll
         // (i.e. inside `notified.await`), which leaves a TOCTOU window where a
         // drain notification can be lost and the submitter parks forever.
+        //
+        // The shutdown flag is checked inside the loop so submitters parked on
+        // back-pressure are released with an error when `shutdown()` fires its
+        // `notify_waiters()` — otherwise they would re-check, see the queue
+        // still full, re-park, and hang because no further drain notify
+        // arrives after shutdown.
         if self.config.enable_backpressure {
             loop {
                 let notified = self.queue_drained_notify.notified();
                 tokio::pin!(notified);
                 // `enable()` adds this future to the Notify wait list now.
                 notified.as_mut().enable();
+                if *self.shutdown.read() {
+                    return Err(crate::GraphRAGError::IncrementalUpdate {
+                        message: "AsyncBatchUpdater is shutting down".to_string(),
+                    });
+                }
                 if self.pending_batches.read().len() < self.config.max_queue_size {
                     break;
                 }
@@ -887,8 +898,7 @@ mod tests {
         let buggy_notify = std::sync::Arc::new(tokio::sync::Notify::new());
         buggy_notify.notify_waiters(); // racing notify
         let buggy_fut = buggy_notify.notified(); // captures post-call counter
-        let buggy_res =
-            tokio::time::timeout(std::time::Duration::from_millis(50), buggy_fut).await;
+        let buggy_res = tokio::time::timeout(std::time::Duration::from_millis(50), buggy_fut).await;
         assert!(
             buggy_res.is_err(),
             "buggy pattern unexpectedly succeeded — Notify semantics changed?"
@@ -948,5 +958,66 @@ mod tests {
         );
 
         updater.shutdown().await;
+    }
+
+    /// Verifies that a back-pressured submitter does NOT hang when
+    /// `shutdown()` is called: the loop must observe the shutdown flag and
+    /// return an error rather than re-park on a notify that will never
+    /// come. Before the fix, `shutdown()` fired `notify_waiters()` to wake
+    /// submitters but the loop only re-checked the queue length, found it
+    /// still full, and parked again — hanging permanently because no
+    /// further drain notifies arrive after shutdown.
+    #[tokio::test]
+    async fn submit_operation_returns_error_on_shutdown_while_back_pressured() {
+        let config = AsyncBatchConfig {
+            max_batch_size: 100,
+            max_queue_size: 2,
+            enable_backpressure: true,
+            channel_buffer_size: 16,
+            ..Default::default()
+        };
+
+        let updater = Arc::new(AsyncBatchUpdater::new(config));
+
+        // Pre-fill at capacity to force the submitter to park.
+        {
+            let mut q = updater.pending_batches.write();
+            for _ in 0..2 {
+                q.push_back(make_dummy_batch());
+            }
+        }
+
+        // Spawn submitter; it should park inside the back-pressure loop.
+        let submitter = {
+            let updater = Arc::clone(&updater);
+            tokio::spawn(async move { updater.submit_operation(make_dummy_op(0)).await })
+        };
+
+        // Allow the submitter to reach `.await` and park.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        assert!(
+            !submitter.is_finished(),
+            "submitter should be parked on back-pressure"
+        );
+
+        // Shutdown should release the parked submitter with an Err — not
+        // wake it to a no-progress recheck loop.
+        updater.shutdown().await;
+
+        let join = tokio::time::timeout(std::time::Duration::from_millis(500), submitter)
+            .await
+            .expect("submitter hung after shutdown");
+        let result = join.expect("submit task panicked");
+        assert!(
+            result.is_err(),
+            "submitter should return Err on shutdown, got Ok"
+        );
+        let err = result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shutting down") || msg.contains("shutdown"),
+            "unexpected error message on shutdown: {msg}"
+        );
     }
 }
