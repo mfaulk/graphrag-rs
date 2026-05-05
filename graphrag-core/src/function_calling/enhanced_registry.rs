@@ -159,9 +159,19 @@ impl EnhancedToolRegistry {
         }
     }
 
-    /// Get a mutable reference to the function caller
-    pub fn get_function_caller(&self) -> Arc<Mutex<FunctionCaller>> {
-        Arc::clone(&self.function_caller)
+    /// Run `f` with exclusive access to the underlying `FunctionCaller`.
+    ///
+    /// The mutex is intentionally hidden: callers must hold the lock only for
+    /// the duration of `f`, which keeps lock scope a single block and prevents
+    /// holding a `std::sync::Mutex` guard across an `.await` point.
+    pub fn with_function_caller<R>(&self, f: impl FnOnce(&mut FunctionCaller) -> R) -> R {
+        // Recover from prior panics rather than propagating; FunctionCaller has
+        // no poison-sensitive invariants (worst case: a stale registry entry).
+        let mut caller = self
+            .function_caller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        f(&mut caller)
     }
 }
 
@@ -574,5 +584,60 @@ mod tests {
             registry.get_usage_statistics().get("test_function"),
             Some(&1)
         );
+    }
+
+    // Verifies `with_function_caller` exposes &mut FunctionCaller so a mutation
+    // performed inside the closure is observable on a subsequent invocation.
+    #[test]
+    fn test_with_function_caller_allows_mutation() {
+        let registry = EnhancedToolRegistry::new();
+
+        registry.with_function_caller(|caller| {
+            caller.register_function(Box::new(ContextAnalysisFunction));
+        });
+
+        let names: Vec<String> = registry.with_function_caller(|caller| {
+            caller
+                .get_function_definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        });
+        assert!(names.iter().any(|n| n == "context_analysis"));
+    }
+
+    // Verifies registry-level register_function_in_category is reflected in the
+    // FunctionCaller observed via with_function_caller (no Arc<Mutex<_>> leak).
+    #[test]
+    fn test_with_function_caller_sees_registry_registered_functions() {
+        let mut registry = EnhancedToolRegistry::new();
+        registry
+            .register_function_in_category(Box::new(ContextAnalysisFunction), "test".to_string())
+            .unwrap();
+
+        let names: Vec<String> = registry.with_function_caller(|caller| {
+            caller
+                .get_function_definitions()
+                .into_iter()
+                .map(|d| d.name)
+                .collect()
+        });
+        assert!(names.iter().any(|n| n == "context_analysis"));
+    }
+
+    // A poisoned FunctionCaller mutex from a prior panic does not block subsequent calls.
+    #[test]
+    fn test_with_function_caller_recovers_from_poison() {
+        let registry = EnhancedToolRegistry::new();
+
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.with_function_caller(|_| {
+                panic!("intentional");
+            })
+        }));
+
+        // Subsequent call must not panic despite the mutex being poisoned.
+        let count = registry.with_function_caller(|c| c.get_function_definitions().len());
+        let _ = count;
     }
 }
