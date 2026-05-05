@@ -130,10 +130,34 @@ chat_model = "llama3.2:3b"
 
 [entities]
 min_confidence = 0.7
+# Extraction strategy. When set, takes precedence over `use_gleaning` below.
+#   "algorithmic"     - regex/capitalization only, never calls the LLM
+#   "llm_single_pass" - one LLM call per chunk, no iterative refinement
+#   "llm_gleaning"    - iterative LLM gleaning (Edge et al. 2024 §2.1)
+mode = "llm_gleaning"
+# Legacy back-compat flag. Ignored when `mode` is set.
 use_gleaning = true
-max_gleaning_rounds = 3
+# Paper default is 1 (Edge et al. 2024 §2.1). Higher values trade index time
+# for marginal recall.
+max_gleaning_rounds = 1
 entity_types = ["PERSON", "ORGANIZATION", "LOCATION", "DATE", "EVENT"]
+
+# Element-summary collapse (Edge et al. 2024 §2.2): preview API only.
+# These keys are accepted by all config loaders and round-trip through
+# serialisation, but they are NOT yet invoked during `build_graph` —
+# `core::Entity` does not yet carry a description field for the collapsed
+# text. The collapse functions in `entity::element_summary` are public and
+# usable directly. See issue #97 review for the wiring follow-up.
+[entities.element_summary]
+enabled = true
+min_instances = 2
+max_chars_for_concat = 800
 ```
+
+> **Note:** `mode = "algorithmic"` (or `ollama.enabled = false`) is the only
+> way to fully skip per-chunk LLM entity-extraction calls at index time. The
+> legacy `use_gleaning = false` setting alone still runs an LLM single-pass
+> per chunk when Ollama is enabled.
 
 Load with:
 ```rust
@@ -456,8 +480,8 @@ GraphRAG uses a configurable pipeline with different methods for each phase:
 | Phase | Key Parameters | Config |
 |-------|----------------|--------|
 | **1. Chunking** | `chunk_size`, `chunk_overlap` | `chunk_size = 1000` |
-| **2. Entity Extraction** | `approach`, `entity_types`, `use_gleaning` | `approach = "hybrid"` |
-| **3. Relationship Extraction** | `extract_relationships`, `use_gleaning` | `[graph] extract_relationships = true` |
+| **2. Entity Extraction** | `approach`, `entity_types`, `mode`, `max_gleaning_rounds` | `mode = "llm_gleaning"` |
+| **3. Relationship Extraction** | `extract_relationships`, `mode` | `[graph] extract_relationships = true` |
 | **4. Graph Construction** | `enable_pagerank`, `max_connections` | `[graph] enable_pagerank = true` |
 | **5. Embedding** | `backend`, `dimension`, `model` | `[embeddings] backend = "ollama"` |
 | **6. Retrieval** | `strategy`, `top_k` | `[retrieval] strategy = "hybrid"` |
@@ -467,8 +491,8 @@ GraphRAG uses a configurable pipeline with different methods for each phase:
 
 | Phase | Methods Available | Config Setting |
 |-------|-------------------|----------------|
-| **Entity Extraction** | Algorithmic / Semantic / Hybrid | `approach = "algorithmic\|semantic\|hybrid"` |
-| **Relationship Extraction** | Co-occurrence / LLM-based / Gleaning | `entities.use_gleaning = true\|false` |
+| **Entity Extraction** | Algorithmic / LLM single-pass / LLM gleaning | `entities.mode = "algorithmic\|llm_single_pass\|llm_gleaning"` |
+| **Relationship Extraction** | Co-occurrence / LLM-based / Gleaning | `entities.mode = "llm_gleaning"` |
 | **Embedding** | Ollama / Hash / OpenAI / HuggingFace / 8 providers | `embeddings.backend = "ollama"` |
 | **Retrieval** | Vector / BM25 / PageRank / Hybrid / Adaptive / LightRAG | `retrieval.strategy = "hybrid"` |
 

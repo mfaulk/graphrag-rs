@@ -160,9 +160,16 @@ impl LLMEntityExtractor {
         Ok((entities, relationships))
     }
 
-    /// Check if extraction is complete using LLM judgment
+    /// Check if extraction is complete using LLM judgment.
     ///
-    /// Uses the LLM to determine if all significant entities have been extracted.
+    /// Returns `Ok(true)` when the LLM judges the extraction COMPLETE (no more
+    /// entities to add). Follows Edge et al. 2024 §2.1 semantics:
+    ///   YES = entities were missed, continue gleaning  → returns `false`
+    ///   NO  = extraction is complete                    → returns `true`
+    ///
+    /// Backends that support `logit_bias` (e.g. OpenAI) should constrain the
+    /// reply to a single YES/NO token; backends that do not (Anthropic, Ollama)
+    /// fall back to string parsing of the first non-whitespace token.
     #[cfg(feature = "async")]
     pub async fn check_completion(
         &self,
@@ -172,20 +179,15 @@ impl LLMEntityExtractor {
     ) -> Result<bool> {
         tracing::debug!("LLM completion check for chunk: {}", chunk.id);
 
-        // Build completion check prompt
         let prompt =
             self.prompt_builder
                 .build_completion_prompt(&chunk.content, entities, relationships);
 
-        // Call LLM with logit bias for YES/NO response
         let llm_response = self.call_llm_completion_check(&prompt).await?;
-
-        // Parse YES/NO response
-        let response_trimmed = llm_response.trim().to_uppercase();
-        let is_complete = response_trimmed.starts_with("YES") || response_trimmed.contains("YES");
+        let is_complete = parse_completion_response(&llm_response);
 
         tracing::debug!(
-            "LLM completion check result: {} (response: {})",
+            "LLM completion check: {} (raw: {:?})",
             if is_complete {
                 "COMPLETE"
             } else {
@@ -486,6 +488,38 @@ impl LLMEntityExtractor {
     }
 }
 
+/// Parse the YES/NO response from a gleaning completion-check call.
+///
+/// Returns `true` when the LLM signals that extraction is COMPLETE (no more
+/// entities to add). The prompt asks the model to answer YES if entities were
+/// missed; we therefore invert: the first standalone token decides the answer
+/// and unrecognized output is treated as INCOMPLETE so gleaning continues.
+fn parse_completion_response(response: &str) -> bool {
+    let trimmed = response.trim();
+    let first_token: String = trimmed
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+
+    match first_token.as_str() {
+        "NO" => true,   // Extraction is COMPLETE
+        "YES" => false, // More entities were missed
+        _ => {
+            // Fall back to word-boundary matching so verbose responses
+            // containing words like "KNOW", "NOTHING", "NONE", or
+            // "ENOUGH" are not mistaken for an isolated "NO" token.
+            // Default to INCOMPLETE if neither word appears.
+            let upper = trimmed.to_uppercase();
+            let words: std::collections::HashSet<&str> = upper
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|w| !w.is_empty())
+                .collect();
+            words.contains("NO") && !words.contains("YES")
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +559,55 @@ Here's the extraction:
         let json = LLMEntityExtractor::find_json_in_text(text);
         assert!(json.is_some());
         assert_eq!(json.unwrap(), "{ \"entities\": [] }");
+    }
+
+    /// Plain "NO" response means extraction is complete.
+    #[test]
+    fn test_parse_completion_response_no_means_complete() {
+        assert!(parse_completion_response("NO"));
+        assert!(parse_completion_response("no\n"));
+        assert!(parse_completion_response("  No.  "));
+    }
+
+    /// Plain "YES" response means more entities should be extracted.
+    #[test]
+    fn test_parse_completion_response_yes_means_incomplete() {
+        assert!(!parse_completion_response("YES"));
+        assert!(!parse_completion_response("yes\n"));
+        assert!(!parse_completion_response("Yes, more entities exist."));
+    }
+
+    /// Unrecognized output defaults to INCOMPLETE so gleaning continues.
+    #[test]
+    fn test_parse_completion_response_unknown_defaults_incomplete() {
+        assert!(!parse_completion_response(""));
+        assert!(!parse_completion_response("maybe"));
+    }
+
+    /// Substring "NO" inside other words must not classify as complete.
+    #[test]
+    fn parse_completion_response_does_not_match_no_in_word() {
+        assert!(!parse_completion_response(
+            "NOTHING WAS MISSED. KNOW WHAT I MEAN?"
+        ));
+        assert!(!parse_completion_response("ENOUGH context, KNOW more?"));
+        assert!(!parse_completion_response("NONE of the above"));
+    }
+
+    /// An isolated "NO" word (in any form) must classify as complete.
+    #[test]
+    fn parse_completion_response_recognizes_isolated_no() {
+        assert!(parse_completion_response("NO"));
+        assert!(parse_completion_response("No, the extraction is complete."));
+        assert!(parse_completion_response("no - all entities found"));
+    }
+
+    /// Ambiguous "not sure" must not classify as complete (no isolated NO/YES).
+    #[test]
+    fn parse_completion_response_handles_not_sure() {
+        assert!(!parse_completion_response(
+            "Not sure if there are more entities."
+        ));
     }
 
     #[test]

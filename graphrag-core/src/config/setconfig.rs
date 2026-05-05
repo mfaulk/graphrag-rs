@@ -1100,6 +1100,13 @@ pub struct EntityExtractionTopLevelConfig {
     #[serde(default = "default_confidence_threshold")]
     pub min_confidence: f32,
 
+    /// Explicit extraction mode. When set, takes precedence over the legacy
+    /// `use_gleaning` flag. Accepted values are the snake_case variants of
+    /// [`crate::config::EntityExtractionMode`]: `algorithmic`,
+    /// `llm_single_pass`, `llm_gleaning`.
+    #[serde(default)]
+    pub mode: Option<String>,
+
     /// Use LLM-based gleaning
     #[serde(default)]
     pub use_gleaning: bool,
@@ -1134,6 +1141,7 @@ impl Default for EntityExtractionTopLevelConfig {
         Self {
             enabled: true,
             min_confidence: default_confidence_threshold(),
+            mode: None,
             use_gleaning: false,
             max_gleaning_rounds: default_gleaning_rounds(),
             gleaning_improvement_threshold: default_gleaning_improvement(),
@@ -1142,6 +1150,21 @@ impl Default for EntityExtractionTopLevelConfig {
             automatic_linking: false,
             linking_confidence_threshold: default_confidence_threshold(),
         }
+    }
+}
+
+/// Parse the `entities.mode` string emitted by SetConfig TOML files.
+///
+/// Mirrors the snake_case shape used by
+/// [`crate::config::EntityExtractionMode`]'s serde representation. Returns
+/// `None` for unrecognised values so the default precedence rules in
+/// `EntityConfig::resolved_mode` continue to apply.
+fn parse_entity_extraction_mode_str(value: &str) -> Option<crate::config::EntityExtractionMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "algorithmic" => Some(crate::config::EntityExtractionMode::Algorithmic),
+        "llm_single_pass" => Some(crate::config::EntityExtractionMode::LlmSinglePass),
+        "llm_gleaning" => Some(crate::config::EntityExtractionMode::LlmGleaning),
+        _ => None,
     }
 }
 
@@ -1269,7 +1292,8 @@ fn default_max_retries() -> u32 {
     3
 }
 fn default_gleaning_rounds() -> usize {
-    3
+    // Edge et al. 2024 §2.1 default: a single gleaning round.
+    1
 }
 fn default_gleaning_improvement() -> f32 {
     0.1
@@ -1304,7 +1328,8 @@ fn default_semantic_entity_method() -> String {
     "llm".to_string()
 }
 fn default_max_gleaning_rounds() -> usize {
-    3
+    // Edge et al. 2024 §2.1 default: a single gleaning round.
+    1
 }
 fn default_semantic_temperature() -> f32 {
     0.1
@@ -1866,6 +1891,12 @@ impl SetConfig {
             },
         }
 
+        // Map the explicit `entities.mode` field. When set, it takes
+        // precedence over `use_gleaning` per `EntityConfig::resolved_mode`.
+        if let Some(ref raw) = self.entity_extraction.mode {
+            config.entities.mode = parse_entity_extraction_mode_str(raw);
+        }
+
         // Map graph building
         config.graph.similarity_threshold = self.pipeline.graph_building.min_relation_score;
         config.graph.max_connections = self.pipeline.graph_building.max_connections_per_node;
@@ -1924,5 +1955,47 @@ impl SetConfig {
         };
 
         config
+    }
+}
+
+#[cfg(test)]
+mod entity_mode_plumbing_tests {
+    use super::*;
+    use crate::config::EntityExtractionMode;
+
+    /// `to_graphrag_config` propagates `entity_extraction.mode = "llm_single_pass"`.
+    #[test]
+    fn to_graphrag_config_maps_entities_mode_llm_single_pass() {
+        let mut set_cfg = SetConfig::default();
+        set_cfg.entity_extraction.mode = Some("llm_single_pass".to_string());
+        let cfg = set_cfg.to_graphrag_config();
+        assert_eq!(cfg.entities.mode, Some(EntityExtractionMode::LlmSinglePass));
+    }
+
+    /// `to_graphrag_config` propagates `entity_extraction.mode = "algorithmic"`.
+    #[test]
+    fn to_graphrag_config_maps_entities_mode_algorithmic() {
+        let mut set_cfg = SetConfig::default();
+        set_cfg.entity_extraction.mode = Some("algorithmic".to_string());
+        let cfg = set_cfg.to_graphrag_config();
+        assert_eq!(cfg.entities.mode, Some(EntityExtractionMode::Algorithmic));
+    }
+
+    /// `to_graphrag_config` propagates `entity_extraction.mode = "llm_gleaning"`.
+    #[test]
+    fn to_graphrag_config_maps_entities_mode_llm_gleaning() {
+        let mut set_cfg = SetConfig::default();
+        set_cfg.entity_extraction.mode = Some("llm_gleaning".to_string());
+        let cfg = set_cfg.to_graphrag_config();
+        assert_eq!(cfg.entities.mode, Some(EntityExtractionMode::LlmGleaning));
+    }
+
+    /// Unrecognised mode strings round-trip as `None` so default precedence applies.
+    #[test]
+    fn to_graphrag_config_ignores_unknown_mode_string() {
+        let mut set_cfg = SetConfig::default();
+        set_cfg.entity_extraction.mode = Some("not_a_real_mode".to_string());
+        let cfg = set_cfg.to_graphrag_config();
+        assert_eq!(cfg.entities.mode, None);
     }
 }

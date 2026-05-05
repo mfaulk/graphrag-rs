@@ -39,7 +39,10 @@ pub struct GleaningConfig {
 impl Default for GleaningConfig {
     fn default() -> Self {
         Self {
-            max_gleaning_rounds: 4, // Microsoft GraphRAG uses 4 rounds
+            // Edge et al. 2024 §2.1 default: a single gleaning round.
+            // Higher values trade index time for marginal recall and can be
+            // overridden via `entities.max_gleaning_rounds` in config.
+            max_gleaning_rounds: 1,
             completion_threshold: 0.85,
             entity_confidence_threshold: 0.7,
             use_llm_completion_check: true, // Always use LLM for real gleaning
@@ -522,7 +525,8 @@ mod tests {
         let extractor = GleaningEntityExtractor::new(ollama_client, config);
 
         let stats = extractor.get_statistics();
-        assert_eq!(stats.config.max_gleaning_rounds, 4);
+        // Paper default is 1 (Edge et al. 2024 §2.1)
+        assert_eq!(stats.config.max_gleaning_rounds, 1);
         assert!(stats.llm_available);
     }
 

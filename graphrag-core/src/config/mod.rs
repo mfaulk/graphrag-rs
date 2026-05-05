@@ -1056,6 +1056,23 @@ pub struct TextConfig {
     pub languages: Vec<String>,
 }
 
+/// Entity extraction strategy.
+///
+/// Resolution order at index time (see [`EntityConfig::resolved_mode`]):
+/// 1. Explicit `mode` field, when set.
+/// 2. Back-compat mapping from the legacy `use_gleaning` boolean.
+/// 3. `Algorithmic` if Ollama is disabled in the active config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntityExtractionMode {
+    /// Pattern/regex/capitalization-only extraction. Never invokes the LLM.
+    Algorithmic,
+    /// One LLM call per chunk (no iterative refinement).
+    LlmSinglePass,
+    /// Iterative LLM gleaning per Edge et al. 2024 §2.1.
+    LlmGleaning,
+}
+
 /// Configuration for entity extraction
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EntityConfig {
@@ -1064,6 +1081,11 @@ pub struct EntityConfig {
 
     /// Types of entities to extract
     pub entity_types: Vec<String>,
+
+    /// Explicit extraction mode. When set, takes precedence over the legacy
+    /// `use_gleaning` flag below.
+    #[serde(default)]
+    pub mode: Option<EntityExtractionMode>,
 
     /// Whether to use LLM-based gleaning for entity extraction
     #[serde(default)]
@@ -1092,6 +1114,73 @@ pub struct EntityConfig {
     /// Facts longer than this will be rejected
     #[serde(default = "default_max_fact_tokens")]
     pub max_fact_tokens: usize,
+
+    /// Element-summary collapse settings (Edge et al. 2024 §2.2).
+    #[serde(default)]
+    pub element_summary: ElementSummaryConfig,
+}
+
+impl EntityConfig {
+    /// Resolve the active extraction mode, applying the precedence rules
+    /// described on [`EntityExtractionMode`].
+    ///
+    /// `ollama_enabled` should be the value of `config.ollama.enabled` in the
+    /// surrounding `Config`; when false, this method always returns
+    /// `Algorithmic` regardless of the configured mode (the LLM paths
+    /// require a chat backend).
+    pub fn resolved_mode(&self, ollama_enabled: bool) -> EntityExtractionMode {
+        if !ollama_enabled {
+            return EntityExtractionMode::Algorithmic;
+        }
+        if let Some(m) = self.mode {
+            return m;
+        }
+        if self.use_gleaning {
+            EntityExtractionMode::LlmGleaning
+        } else {
+            EntityExtractionMode::LlmSinglePass
+        }
+    }
+}
+
+/// Configuration for element-summary collapse (paper §2.2).
+///
+/// When the same entity or relationship appears in multiple chunks, this
+/// step synthesizes a single coherent description from the per-instance
+/// descriptions, calling the chat backend only when the total instance
+/// length exceeds the cost-guard threshold.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElementSummaryConfig {
+    /// Master switch.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Minimum instances of an element required to trigger summarization.
+    #[serde(default = "default_element_summary_min_instances")]
+    pub min_instances: usize,
+
+    /// Total character budget below which descriptions are concatenated
+    /// locally instead of being sent to the LLM.
+    #[serde(default = "default_element_summary_max_chars_concat")]
+    pub max_chars_for_concat: usize,
+}
+
+impl Default for ElementSummaryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_instances: default_element_summary_min_instances(),
+            max_chars_for_concat: default_element_summary_max_chars_concat(),
+        }
+    }
+}
+
+fn default_element_summary_min_instances() -> usize {
+    2
+}
+
+fn default_element_summary_max_chars_concat() -> usize {
+    800
 }
 
 /// Configuration for advanced GraphRAG features (Phases 2-3)
@@ -1333,7 +1422,29 @@ fn default_relationship_confidence() -> f32 {
     0.5
 }
 fn default_max_gleaning_rounds() -> usize {
-    3
+    // Edge et al. 2024 §2.1 default: a single gleaning round.
+    1
+}
+
+/// Parse the `entities.mode` string used by manual TOML/JSON code paths.
+///
+/// Recognises the snake_case names emitted by `EntityExtractionMode`'s serde
+/// representation (`algorithmic`, `llm_single_pass`, `llm_gleaning`).
+fn parse_entity_extraction_mode(value: &str) -> Option<EntityExtractionMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "algorithmic" => Some(EntityExtractionMode::Algorithmic),
+        "llm_single_pass" => Some(EntityExtractionMode::LlmSinglePass),
+        "llm_gleaning" => Some(EntityExtractionMode::LlmGleaning),
+        _ => None,
+    }
+}
+
+fn entity_extraction_mode_to_str(mode: EntityExtractionMode) -> &'static str {
+    match mode {
+        EntityExtractionMode::Algorithmic => "algorithmic",
+        EntityExtractionMode::LlmSinglePass => "llm_single_pass",
+        EntityExtractionMode::LlmGleaning => "llm_gleaning",
+    }
 }
 
 fn default_validation_confidence() -> f32 {
@@ -1468,12 +1579,14 @@ impl Default for Config {
             entities: EntityConfig {
                 min_confidence: default_min_confidence(),
                 entity_types: default_entity_types(),
+                mode: None,
                 use_gleaning: false,
                 max_gleaning_rounds: default_max_gleaning_rounds(),
                 enable_triple_reflection: false,
                 validation_min_confidence: default_validation_confidence(),
                 use_atomic_facts: false,
                 max_fact_tokens: default_max_fact_tokens(),
+                element_summary: ElementSummaryConfig::default(),
             },
             retrieval: RetrievalConfig {
                 top_k: default_top_k(),
@@ -1788,6 +1901,9 @@ impl Config {
                 } else {
                     default_entity_types()
                 },
+                mode: parsed["entities"]["mode"]
+                    .as_str()
+                    .and_then(parse_entity_extraction_mode),
                 use_gleaning: parsed["entities"]["use_gleaning"]
                     .as_bool()
                     .unwrap_or(false),
@@ -1806,6 +1922,18 @@ impl Config {
                 max_fact_tokens: parsed["entities"]["max_fact_tokens"]
                     .as_usize()
                     .unwrap_or(default_max_fact_tokens()),
+                element_summary: ElementSummaryConfig {
+                    enabled: parsed["entities"]["element_summary"]["enabled"]
+                        .as_bool()
+                        .unwrap_or(true),
+                    min_instances: parsed["entities"]["element_summary"]["min_instances"]
+                        .as_usize()
+                        .unwrap_or_else(default_element_summary_min_instances),
+                    max_chars_for_concat: parsed["entities"]["element_summary"]
+                        ["max_chars_for_concat"]
+                        .as_usize()
+                        .unwrap_or_else(default_element_summary_max_chars_concat),
+                },
             },
             retrieval: RetrievalConfig {
                 top_k: parsed["retrieval"]["top_k"]
@@ -2286,8 +2414,18 @@ impl Config {
             .map(|s| json::JsonValue::from(s.as_str()))
             .collect();
         entities["entity_types"] = json::JsonValue::from(entity_types_array);
+        if let Some(mode) = self.entities.mode {
+            entities["mode"] = json::JsonValue::from(entity_extraction_mode_to_str(mode));
+        }
         entities["use_gleaning"] = json::JsonValue::from(self.entities.use_gleaning);
         entities["max_gleaning_rounds"] = json::JsonValue::from(self.entities.max_gleaning_rounds);
+        let mut element_summary = json::JsonValue::new_object();
+        element_summary["enabled"] = json::JsonValue::from(self.entities.element_summary.enabled);
+        element_summary["min_instances"] =
+            json::JsonValue::from(self.entities.element_summary.min_instances);
+        element_summary["max_chars_for_concat"] =
+            json::JsonValue::from(self.entities.element_summary.max_chars_for_concat);
+        entities["element_summary"] = element_summary;
         config_json["entities"] = entities;
 
         // Retrieval
@@ -2430,5 +2568,147 @@ impl Config {
         let content = json::stringify_pretty(config_json, 2);
         fs::write(path, content)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod entity_mode_tests {
+    use super::*;
+
+    /// Algorithmic mode is forced when Ollama is disabled, even if mode says LLM.
+    #[test]
+    fn resolved_mode_ollama_disabled_forces_algorithmic() {
+        let mut cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: Some(EntityExtractionMode::LlmGleaning),
+            use_gleaning: true,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(false), EntityExtractionMode::Algorithmic);
+        cfg.mode = None;
+        assert_eq!(cfg.resolved_mode(false), EntityExtractionMode::Algorithmic);
+    }
+
+    /// Explicit mode wins over the legacy use_gleaning flag.
+    #[test]
+    fn resolved_mode_explicit_mode_wins_over_use_gleaning() {
+        let cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: Some(EntityExtractionMode::Algorithmic),
+            use_gleaning: true,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::Algorithmic);
+    }
+
+    /// Back-compat: use_gleaning=true maps to LlmGleaning when no mode is set.
+    #[test]
+    fn resolved_mode_use_gleaning_true_maps_to_gleaning() {
+        let cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: None,
+            use_gleaning: true,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::LlmGleaning);
+    }
+
+    /// Back-compat: use_gleaning=false maps to LlmSinglePass when no mode is set.
+    #[test]
+    fn resolved_mode_use_gleaning_false_maps_to_single_pass() {
+        let cfg = EntityConfig {
+            min_confidence: 0.5,
+            entity_types: vec![],
+            mode: None,
+            use_gleaning: false,
+            max_gleaning_rounds: 1,
+            enable_triple_reflection: false,
+            validation_min_confidence: 0.7,
+            use_atomic_facts: false,
+            max_fact_tokens: 400,
+            element_summary: ElementSummaryConfig::default(),
+        };
+        assert_eq!(cfg.resolved_mode(true), EntityExtractionMode::LlmSinglePass);
+    }
+}
+
+#[cfg(test)]
+mod config_io_round_trip_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// JSON I/O round-trip preserves the explicit `entities.mode` field.
+    #[test]
+    fn config_round_trip_preserves_entity_mode() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut cfg = Config::default();
+        cfg.entities.mode = Some(EntityExtractionMode::LlmSinglePass);
+        cfg.to_file(&path_str).expect("write config");
+
+        let loaded = Config::from_file(&path_str).expect("read config");
+        assert_eq!(
+            loaded.entities.mode,
+            Some(EntityExtractionMode::LlmSinglePass)
+        );
+    }
+
+    /// JSON I/O round-trip preserves the `entities.element_summary` block.
+    #[test]
+    fn config_round_trip_preserves_element_summary_settings() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let path_str = path.to_string_lossy().to_string();
+
+        let mut cfg = Config::default();
+        cfg.entities.element_summary = ElementSummaryConfig {
+            enabled: false,
+            min_instances: 7,
+            max_chars_for_concat: 4321,
+        };
+        cfg.to_file(&path_str).expect("write config");
+
+        let loaded = Config::from_file(&path_str).expect("read config");
+        assert!(!loaded.entities.element_summary.enabled);
+        assert_eq!(loaded.entities.element_summary.min_instances, 7);
+        assert_eq!(loaded.entities.element_summary.max_chars_for_concat, 4321);
+    }
+
+    /// `parse_entity_extraction_mode` accepts the snake_case serde names.
+    #[test]
+    fn parse_entity_extraction_mode_accepts_snake_case_variants() {
+        assert_eq!(
+            parse_entity_extraction_mode("algorithmic"),
+            Some(EntityExtractionMode::Algorithmic)
+        );
+        assert_eq!(
+            parse_entity_extraction_mode("llm_single_pass"),
+            Some(EntityExtractionMode::LlmSinglePass)
+        );
+        assert_eq!(
+            parse_entity_extraction_mode("llm_gleaning"),
+            Some(EntityExtractionMode::LlmGleaning)
+        );
+        assert_eq!(parse_entity_extraction_mode("nonsense"), None);
     }
 }

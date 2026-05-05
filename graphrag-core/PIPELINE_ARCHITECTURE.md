@@ -139,7 +139,12 @@ This document details the 7-phase architecture of the GraphRAG pipeline, coverin
 | | `chunk_overlap` | int | 200 | Overlap |
 | **Extraction** | `entity_extraction.approach` | enum | hybrid | Extraction method |
 | | `entity_extraction.entity_types` | list | [...] | Target entities |
-| | `entity_extraction.use_gleaning` | bool | true | Multi-pass extraction |
+| | `entities.mode` | enum | n/a | `algorithmic` \| `llm_single_pass` \| `llm_gleaning` (overrides `use_gleaning`) |
+| | `entity_extraction.use_gleaning` | bool | true | Legacy back-compat flag |
+| | `entities.max_gleaning_rounds` | int | 1 | Paper default per Edge et al. 2024 §2.1 |
+| | `entities.element_summary.enabled` | bool | true | (Preview, not yet wired into indexing) LLM collapse of multi-chunk descriptions (§2.2) |
+| | `entities.element_summary.min_instances` | int | 2 | (Preview) Min descriptions before collapsing |
+| | `entities.element_summary.max_chars_for_concat` | int | 800 | (Preview) Below budget concatenate locally |
 | | `relationship_extraction.enabled` | bool | true | Extract relationships |
 | **Graph** | `graph.enable_pagerank` | bool | true | Calculate PageRank |
 | | `graph.max_connections` | int | 50 | Max node degree |

@@ -617,21 +617,29 @@ impl GraphRAG {
         let total_chunks = chunks.len();
 
         // PHASE 1: Extract and add all entities
-        // Pipeline selection based on config.approach (semantic/algorithmic/hybrid)
-        // - Semantic: config.entities.use_gleaning = true (LLM-based with iterative refinement)
-        // - Algorithmic: config.entities.use_gleaning = false (pattern-based extraction)
-        // - Hybrid: config.entities.use_gleaning = true (uses LLM + pattern fusion)
+        //
+        // Mode selection follows `EntityConfig::resolved_mode`:
+        //   - explicit `entities.mode` wins
+        //   - else `use_gleaning` toggles between LlmGleaning and LlmSinglePass
+        //   - if Ollama is disabled, the mode is forced to Algorithmic
+        //
+        // Algorithmic mode never invokes the LLM and is the only way to fully
+        // skip per-chunk LLM calls at index time (see issue #8).
+        let resolved_mode = self
+            .config
+            .entities
+            .resolved_mode(self.config.ollama.enabled);
 
-        // DEBUG: Log current configuration state
         #[cfg(feature = "tracing")]
         tracing::info!(
-            "build_graph() - Config state: approach='{}', use_gleaning={}, ollama.enabled={}",
+            "build_graph() - approach='{}', mode={:?}, use_gleaning={}, ollama.enabled={}",
             self.config.approach,
+            resolved_mode,
             self.config.entities.use_gleaning,
             self.config.ollama.enabled
         );
 
-        if self.config.entities.use_gleaning && self.config.ollama.enabled {
+        if resolved_mode == crate::config::EntityExtractionMode::LlmGleaning {
             // LLM-based extraction with gleaning
             #[cfg(feature = "async")]
             {
@@ -906,8 +914,8 @@ impl GraphRAG {
                     );
                 }
             }
-        } else if self.config.ollama.enabled {
-            // LLM single-pass extraction (Ollama enabled, gleaning disabled)
+        } else if resolved_mode == crate::config::EntityExtractionMode::LlmSinglePass {
+            // LLM single-pass extraction (mode = LlmSinglePass; Ollama enabled).
             //
             // Uses LLMEntityExtractor directly for one extraction round per chunk.
             // num_ctx is calculated dynamically from the built prompt + 20% margin,
