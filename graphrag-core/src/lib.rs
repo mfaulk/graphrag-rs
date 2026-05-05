@@ -250,6 +250,40 @@ pub use crate::retrieval::pagerank_retrieval::{PageRankRetrievalSystem, ScoredRe
 #[cfg(feature = "pagerank")]
 pub use crate::retrieval::hipporag_ppr::{Fact, HippoRAGConfig, HippoRAGRetriever};
 
+/// Bounded-concurrency entity extraction helper.
+///
+/// `buffered` (vs `buffer_unordered`) preserves chunk order so colliding entity
+/// ids resolve deterministically; `try_collect` short-circuits on the first
+/// error and never starts pending futures, keeping graph mutations all-or-nothing.
+#[cfg(feature = "async")]
+async fn extract_entities_concurrent<'a, F, Fut>(
+    chunks: &'a [TextChunk],
+    extract: F,
+) -> Result<Vec<(ChunkId, Vec<Entity>, Vec<Relationship>)>>
+where
+    F: Fn(&'a TextChunk) -> Fut,
+    Fut: std::future::Future<Output = Result<(Vec<Entity>, Vec<Relationship>)>> + 'a,
+{
+    use futures::stream::{self, StreamExt, TryStreamExt};
+
+    // Default 8 balances OpenAI-class remote LLMs and local Ollama (typically 4-8).
+    // Mirrors AsyncGraphRAG; TODO: surface as a Config field.
+    const ENTITY_EXTRACTION_CONCURRENCY: usize = 8;
+
+    stream::iter(chunks.iter())
+        .map(|chunk| {
+            let chunk_id = chunk.id.clone();
+            let fut = extract(chunk);
+            async move {
+                let (entities, relationships) = fut.await?;
+                Ok::<_, GraphRAGError>((chunk_id, entities, relationships))
+            }
+        })
+        .buffered(ENTITY_EXTRACTION_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
 // ================================
 // MAIN GRAPHRAG SYSTEM
 // ================================
@@ -955,46 +989,44 @@ impl GraphRAG {
                 );
                 pb.set_message("Extracting entities with LLM (single-pass)");
 
-                for (idx, chunk) in chunks.iter().enumerate() {
-                    pb.set_message(format!(
-                        "Chunk {}/{} (LLM single-pass)",
-                        idx + 1,
-                        total_chunks
-                    ));
-
-                    #[cfg(feature = "tracing")]
-                    tracing::info!(
-                        "Processing chunk {}/{} (LLM single-pass)",
-                        idx + 1,
-                        total_chunks
-                    );
-
-                    match extractor.extract_from_chunk(chunk).await {
-                        Ok((entities, relationships)) => {
-                            for entity in entities {
-                                if let Err(e) = graph.add_entity(entity) {
-                                    #[cfg(feature = "tracing")]
-                                    tracing::debug!("Failed to add entity: {}", e);
-                                }
-                            }
-                            for relationship in relationships {
-                                if let Err(e) = graph.add_relationship(relationship) {
-                                    #[cfg(feature = "tracing")]
-                                    tracing::debug!("Failed to add relationship: {}", e);
-                                }
-                            }
-                        },
-                        Err(e) => {
+                // Run extractions with bounded concurrency. Per-chunk errors are
+                // caught inside the closure (returning empty) so one chunk's
+                // failure doesn't abort the whole build — preserving the prior
+                // skip-on-error behavior of the sequential loop.
+                let extractor_ref = &extractor;
+                let pb_ref = &pb;
+                let extractions = extract_entities_concurrent(&chunks, |chunk| async move {
+                    let chunk_id = chunk.id.clone();
+                    let result = extractor_ref.extract_from_chunk(chunk).await;
+                    pb_ref.inc(1);
+                    match result {
+                        Ok(pair) => Ok(pair),
+                        Err(_e) => {
                             #[cfg(feature = "tracing")]
                             tracing::warn!(
-                                chunk_id = %chunk.id,
-                                error = %e,
+                                chunk_id = %chunk_id,
+                                error = %_e,
                                 "LLM extraction failed for chunk, skipping"
                             );
+                            Ok((Vec::new(), Vec::new()))
                         },
                     }
+                })
+                .await?;
 
-                    pb.inc(1);
+                for (_chunk_id, entities, relationships) in extractions {
+                    for entity in entities {
+                        if let Err(e) = graph.add_entity(entity) {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Failed to add entity: {}", e);
+                        }
+                    }
+                    for relationship in relationships {
+                        if let Err(e) = graph.add_relationship(relationship) {
+                            #[cfg(feature = "tracing")]
+                            tracing::debug!("Failed to add relationship: {}", e);
+                        }
+                    }
                 }
 
                 pb.finish_with_message("LLM single-pass extraction complete");
@@ -2129,4 +2161,5 @@ mod tests {
             .build();
         assert!(graphrag.is_ok());
     }
+
 }
