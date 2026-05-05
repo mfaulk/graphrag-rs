@@ -258,8 +258,8 @@ where
 {
     l1: L1Cache<K, V>,
     #[cfg(feature = "redis_storage")]
-    #[allow(dead_code)]
     l2: Option<L2Cache>,
+    // Placeholder so the struct layout matches across features; not read when redis_storage is off.
     #[cfg(not(feature = "redis_storage"))]
     #[allow(dead_code)]
     l2: Option<()>,

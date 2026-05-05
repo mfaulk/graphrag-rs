@@ -363,7 +363,7 @@ pub struct GraphStatistics {
 
 impl GraphStatistics {
     /// Print graph statistics
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public diagnostic helper; called by downstream binaries and examples.
     pub fn print(&self) {
         tracing::info!("Graph Statistics:");
         tracing::info!("  Documents: {}", self.document_count);

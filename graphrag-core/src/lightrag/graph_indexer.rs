@@ -51,7 +51,7 @@ pub struct GraphIndexer {
     /// List of entity types to recognize during extraction
     entity_types: Vec<String>,
     /// Maximum depth for relationship traversal (reserved for future implementation)
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Reserved for future relationship-traversal depth limiting.
     max_depth: usize,
 }
 

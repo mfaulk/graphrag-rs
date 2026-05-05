@@ -62,7 +62,7 @@ impl LLMClient for AsyncLanguageModelAdapter {
 
 /// Async version of the main GraphRAG system
 pub struct AsyncGraphRAG {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Retained for builder round-trip; pipeline wiring still in progress.
     config: Config,
     knowledge_graph: Arc<RwLock<Option<KnowledgeGraph>>>,
     document_trees: Arc<RwLock<HashMap<DocumentId, DocumentTree>>>,

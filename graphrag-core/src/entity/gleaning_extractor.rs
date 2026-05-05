@@ -473,7 +473,7 @@ pub struct GleaningStatistics {
 
 impl GleaningStatistics {
     /// Print statistics to stdout
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public diagnostic helper; called by downstream binaries and examples.
     pub fn print(&self) {
         tracing::info!("🔍 REAL LLM Gleaning Extraction Statistics");
         tracing::info!("  Max rounds: {}", self.config.max_gleaning_rounds);

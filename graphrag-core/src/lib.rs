@@ -288,7 +288,7 @@ pub struct GraphRAG {
     query_planner: Option<query::planner::QueryPlanner>,
     critic: Option<critic::Critic>,
     #[cfg(feature = "parallel-processing")]
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Held for upcoming parallel-pipeline integration; reader pending.
     parallel_processor: Option<parallel::ParallelProcessor>,
     /// Optional override for chat-completion calls. When set, the built-in
     /// Ollama client is bypassed for the final answer-generation step in

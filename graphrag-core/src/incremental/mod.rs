@@ -433,7 +433,7 @@ struct ChangeDetector {
     /// Document hashes for change detection
     document_hashes: HashMap<String, String>,
     /// Entity version tracking
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Reserved for entity-level version tracking; reader pending.
     entity_versions: HashMap<String, u32>,
 }
 
@@ -665,26 +665,6 @@ impl IncrementalGraphManager {
     /// Get statistics about lazy propagation
     pub fn get_propagation_stats(&self) -> PropagationStats {
         self.lazy_propagation.propagation_stats()
-    }
-
-    /// Queue a node update for lazy propagation
-    ///
-    /// The update will be deferred until threshold is reached or force propagate is called.
-    #[allow(dead_code)]
-    fn queue_lazy_update(
-        &self,
-        node_id: String,
-        affected_relationships: Vec<String>,
-    ) -> Result<String> {
-        if !self.config.enable_lazy_propagation {
-            return Ok(String::new()); // Skip if disabled
-        }
-
-        self.lazy_propagation
-            .queue_node_update(node_id, affected_relationships)
-            .map_err(|e| GraphRAGError::IncrementalUpdate {
-                message: format!("Failed to queue lazy update: {}", e),
-            })
     }
 
     /// Create a snapshot of the current graph state
@@ -1146,12 +1126,14 @@ pub struct GraphStats {
 struct ExtractionResult {
     entities: Vec<ExtractedEntity>,
     relationships: Vec<ExtractedRelationship>,
+    // Concept extraction not yet wired through `apply_incremental_update`.
     #[allow(dead_code)]
     concepts: Vec<ExtractedConcept>,
 }
 
 struct ExtractedEntity {
     name: String,
+    // Reserved for typed-entity routing; current update path uses `name` only.
     #[allow(dead_code)]
     entity_type: String,
     attributes: HashMap<String, String>,
@@ -1160,12 +1142,13 @@ struct ExtractedEntity {
 struct ExtractedRelationship {
     source: String,
     target: String,
+    // Reserved for relationship-typed graph edges; reader pending.
     #[allow(dead_code)]
     relationship_type: String,
     confidence: f32,
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // Stub type for upcoming concept extraction; fields shape the schema.
 struct ExtractedConcept {
     name: String,
     description: String,

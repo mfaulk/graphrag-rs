@@ -106,8 +106,11 @@ fn load_yaml_config(_content: &str) -> Result<Config> {
 }
 
 /// Raw configuration structure that matches the TOML file
+// Many sub-structs map config keys we accept on disk but do not yet propagate
+// into `Config` via `convert_raw_config`. Keeping them keeps the schema honest
+// (unknown-field warnings stay accurate) while the wiring is filled in. (#27)
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(#27): wire remaining sections through convert_raw_config.
 struct RawConfig {
     #[serde(default)]
     system: SystemConfig,
@@ -150,7 +153,7 @@ struct RawConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(#27): map into Config; preserved so deserialization stays lenient.
 struct SystemConfig {
     log_level: Option<String>,
     max_memory_mb: Option<u64>,
@@ -159,7 +162,7 @@ struct SystemConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(#27): map into Config; preserved so deserialization stays lenient.
 struct FeaturesConfig {
     text_processing: Option<bool>,
     entity_extraction: Option<bool>,
@@ -171,7 +174,7 @@ struct FeaturesConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(#27): map into Config; preserved so deserialization stays lenient.
 struct RawTextProcessingConfig {
     enabled: Option<bool>,
     chunk_size: Option<usize>,
@@ -187,7 +190,7 @@ struct RawTextProcessingConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(#27): map into Config; preserved so deserialization stays lenient.
 struct RawEnrichmentConfig {
     enabled: Option<bool>,
     auto_detect_format: Option<bool>,
@@ -210,7 +213,7 @@ struct RawEnrichmentConfig {
 }
 
 #[derive(Debug, serde::Deserialize, Default)]
-#[allow(dead_code)]
+#[allow(dead_code)] // TODO(#27): map into Config; preserved so deserialization stays lenient.
 struct RawEntityExtractionConfig {
     enabled: Option<bool>,
     min_confidence: Option<f32>,

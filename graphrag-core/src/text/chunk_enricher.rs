@@ -191,7 +191,7 @@ pub struct EnrichmentStatistics {
 
 impl EnrichmentStatistics {
     /// Print statistics summary
-    #[allow(dead_code)]
+    #[allow(dead_code)] // Public diagnostic helper; called by downstream binaries and examples.
     pub fn print_summary(&self) {
         tracing::info!("\nChunk Enrichment Statistics:");
         tracing::info!("  Total chunks: {}", self.total_chunks);
