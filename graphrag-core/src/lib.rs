@@ -252,9 +252,11 @@ pub use crate::retrieval::hipporag_ppr::{Fact, HippoRAGConfig, HippoRAGRetriever
 
 /// Bounded-concurrency entity extraction helper.
 ///
-/// `buffered` (vs `buffer_unordered`) preserves chunk order so colliding entity
-/// ids resolve deterministically; `try_collect` short-circuits on the first
-/// error and never starts pending futures, keeping graph mutations all-or-nothing.
+/// Uses `buffer_unordered` so a slow chunk doesn't head-of-line-block faster
+/// chunks behind it, then re-sorts the collected results by input chunk index
+/// so the caller still observes the original chunk order (entity-id collisions
+/// resolve deterministically). `try_collect` short-circuits on the first error
+/// and never starts pending futures, keeping graph mutations all-or-nothing.
 #[cfg(feature = "async")]
 async fn extract_entities_concurrent<'a, F, Fut>(
     chunks: &'a [TextChunk],
@@ -270,18 +272,26 @@ where
     // Mirrors AsyncGraphRAG; TODO: surface as a Config field.
     const ENTITY_EXTRACTION_CONCURRENCY: usize = 8;
 
-    stream::iter(chunks.iter())
-        .map(|chunk| {
-            let chunk_id = chunk.id.clone();
-            let fut = extract(chunk);
-            async move {
-                let (entities, relationships) = fut.await?;
-                Ok::<_, GraphRAGError>((chunk_id, entities, relationships))
-            }
-        })
-        .buffered(ENTITY_EXTRACTION_CONCURRENCY)
-        .try_collect()
-        .await
+    let mut results: Vec<(usize, ChunkId, Vec<Entity>, Vec<Relationship>)> =
+        stream::iter(chunks.iter().enumerate())
+            .map(|(idx, chunk)| {
+                let chunk_id = chunk.id.clone();
+                let fut = extract(chunk);
+                async move {
+                    let (entities, relationships) = fut.await?;
+                    Ok::<_, GraphRAGError>((idx, chunk_id, entities, relationships))
+                }
+            })
+            .buffer_unordered(ENTITY_EXTRACTION_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+    // Restore input order so downstream graph mutations are deterministic.
+    results.sort_by_key(|(idx, _, _, _)| *idx);
+    Ok(results
+        .into_iter()
+        .map(|(_, chunk_id, entities, relationships)| (chunk_id, entities, relationships))
+        .collect())
 }
 
 // ================================
@@ -2258,6 +2268,57 @@ mod tests {
             assert!(
                 total_started < N_CHUNKS,
                 "all {N_CHUNKS} extractions ran — fail-fast cancellation regressed",
+            );
+        }
+
+        /// Chunk order: with `buffer_unordered` underneath, a slow early chunk
+        /// must not delay later chunks (no head-of-line blocking), but the
+        /// returned Vec must still be in input chunk order so downstream
+        /// graph mutations stay deterministic.
+        #[tokio::test]
+        async fn extract_entities_concurrent_returns_results_in_chunk_order() {
+            const N_CHUNKS: usize = 4;
+            let chunks = make_chunks(N_CHUNKS);
+
+            // chunk-0 sleeps the longest; remaining chunks finish first.
+            // If results were returned in completion order, chunk-0 would be
+            // last; the post-sort guarantees input order regardless.
+            let extract = |chunk: &TextChunk| {
+                let id = chunk.id.clone();
+                // Parse trailing index off "chunk-N" to set sleep duration.
+                let idx: u64 =
+                    id.0.strip_prefix("chunk-")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap();
+                async move {
+                    let delay_ms = if idx == 0 { 100 } else { 5 };
+                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    Ok::<(Vec<Entity>, Vec<Relationship>), GraphRAGError>((
+                        vec![Entity::new(
+                            EntityId::new(format!("e-{}", id.0)),
+                            id.0.clone(),
+                            "PERSON".to_string(),
+                            0.9,
+                        )],
+                        vec![],
+                    ))
+                }
+            };
+
+            let extractions = extract_entities_concurrent(&chunks, extract)
+                .await
+                .expect("extraction should succeed");
+
+            assert_eq!(extractions.len(), N_CHUNKS);
+            let observed: Vec<&str> = extractions
+                .iter()
+                .map(|(chunk_id, _, _)| chunk_id.0.as_str())
+                .collect();
+            let expected: Vec<String> = (0..N_CHUNKS).map(|i| format!("chunk-{i}")).collect();
+            let expected_refs: Vec<&str> = expected.iter().map(|s| s.as_str()).collect();
+            assert_eq!(
+                observed, expected_refs,
+                "results must be in input chunk order regardless of completion order",
             );
         }
     }
