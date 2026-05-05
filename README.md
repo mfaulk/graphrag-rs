@@ -439,6 +439,32 @@ cargo build --release
 ./target/release/graphrag-rs config.toml query "Your question"
 ```
 
+### Query Modes
+
+`graphrag query` supports an explicit retrieval mode flag (#102):
+
+```bash
+# Default: multi-strategy hybrid retrieval (vector + graph + hierarchical).
+graphrag query "How does Bob mentor Carol?" --mode hybrid
+
+# Local Search (Edge et al. 2024): entity-anchored, token-budgeted context.
+# Returns a single prompt-ready bundle of (a) entity descriptions,
+# (b) relationship descriptions, (c) source-chunk text, (d) community
+# context, packed in priority order against `--budget` tokens.
+graphrag query "Tell me about Alice" --mode local --budget 2048
+```
+
+`--mode` is case-insensitive and routes through a single core entrypoint
+(`RetrievalSystem::search_with_mode`) shared by the CLI, FFI, and
+library API. Local mode is best for narrow, entity-specific questions
+where you want a tight, deterministic context for the LLM. A future
+`--mode global` (blocked on #93) will mirror this for community-level
+overview queries.
+
+Token counting currently uses a `chars / 4` heuristic. The plan is to
+switch to `tiktoken-rs` (`cl100k_base`) once PR #126 lands so OpenAI
+budgets are precise.
+
 ## Configuration
 
 ### Basic Configuration (config.toml)

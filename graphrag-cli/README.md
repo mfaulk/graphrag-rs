@@ -144,6 +144,32 @@ cargo run -p graphrag-cli -- bench \
 
 Output JSON includes: `init_ms`, `build_ms`, `total_query_ms`, `entities`, `relationships`, `chunks`, per-query `answer`, `confidence`, `sources`.
 
+### query --mode local (#102)
+
+The deprecated `query` subcommand now accepts an explicit retrieval mode:
+
+```bash
+# Default: hybrid (multi-strategy)
+graphrag query "Tell me about Alice" --mode hybrid
+
+# Local Search: entity-anchored, token-budgeted (Edge et al. 2024)
+graphrag query "Tell me about Alice" --mode local --budget 2048
+```
+
+`--mode` is case-insensitive (`local`, `Local`, `HYBRID` all parse).
+Both modes share a single dispatch path through
+`RetrievalSystem::search_with_mode`, so the CLI and library API behave
+identically.
+
+Local mode prints (or returns as JSON, with `--format json`) the packed
+context tiers — entities, relationships, source chunks, communities —
+along with `total_tokens`, `budget`, and `dropped_tier` (set when the
+budget capped output). The packer is item-by-item (partial-pack): items
+that fit are kept; the first item to overflow records `dropped_tier`
+and skips the remainder of that tier and every lower-priority tier.
+A future `--mode global` (#93) will mirror this for community-level
+queries.
+
 ---
 
 ## TUI Layout

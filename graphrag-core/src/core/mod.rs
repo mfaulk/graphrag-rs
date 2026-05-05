@@ -499,6 +499,42 @@ impl KnowledgeGraph {
         }
     }
 
+    /// Return every relationship incident to `entity_id` paired with the
+    /// *other* endpoint, regardless of edge direction.
+    ///
+    /// Unlike [`get_neighbors`](Self::get_neighbors), which only walks
+    /// outgoing edges, this surfaces edges where `entity_id` is the
+    /// relationship `target` as well. Required by paper-aligned Local
+    /// Search so a seed entity that is only the *recipient* of an edge
+    /// still contributes to the relationship tier (#102 review).
+    pub fn get_incident_relationships(
+        &self,
+        entity_id: &EntityId,
+    ) -> Vec<(&Entity, &Relationship)> {
+        use petgraph::visit::EdgeRef;
+        use petgraph::Direction;
+
+        let Some(&node_idx) = self.entity_index.get(entity_id) else {
+            return Vec::new();
+        };
+
+        let outgoing = self
+            .graph
+            .edges_directed(node_idx, Direction::Outgoing)
+            .filter_map(|edge| {
+                let target_entity = self.graph.node_weight(edge.target())?;
+                Some((target_entity, edge.weight()))
+            });
+        let incoming = self
+            .graph
+            .edges_directed(node_idx, Direction::Incoming)
+            .filter_map(|edge| {
+                let source_entity = self.graph.node_weight(edge.source())?;
+                Some((source_entity, edge.weight()))
+            });
+        outgoing.chain(incoming).collect()
+    }
+
     /// Get all relationships in the graph
     pub fn get_all_relationships(&self) -> Vec<&Relationship> {
         self.graph.edge_weights().collect()

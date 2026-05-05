@@ -10,6 +10,8 @@ pub mod enriched;
 pub mod hipporag_ppr;
 /// Hybrid retrieval combining multiple search strategies
 pub mod hybrid;
+/// Local Search: token-budgeted, entity-anchored context packer (Edge et al. 2024).
+pub mod local_search;
 pub mod pagerank_retrieval;
 /// Symbolic anchoring for conceptual queries (Phase 2.1 - CatRAG)
 pub mod symbolic_anchoring;
@@ -28,6 +30,9 @@ use std::collections::{HashMap, HashSet};
 pub use bm25::{BM25Result, BM25Retriever, Document as BM25Document};
 pub use enriched::{EnrichedRetrievalConfig, EnrichedRetriever};
 pub use hybrid::{FusionMethod, HybridConfig, HybridRetriever, HybridSearchResult};
+pub use local_search::{
+    estimate_tokens, LocalContext, LocalContextTier, LocalSearch, LocalSearchConfig,
+};
 
 #[cfg(feature = "pagerank")]
 pub use pagerank_retrieval::{PageRankRetrievalSystem, ScoredResult};
@@ -150,6 +155,50 @@ pub struct SearchResult {
     pub entities: Vec<String>,
     /// IDs of source chunks this result is derived from
     pub source_chunks: Vec<String>,
+}
+
+/// User-selectable retrieval mode.
+///
+/// `Hybrid` is the existing multi-strategy default (vector + graph + hierarchical).
+/// `Local` is the paper-aligned entity-anchored mode that produces a
+/// token-budgeted [`LocalContext`] for one LLM synthesis call. A future
+/// `Global` variant (see #93) will mirror Local for community-level queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryMode {
+    /// Multi-strategy adaptive retrieval (default).
+    Hybrid,
+    /// Entity-anchored token-budgeted local context.
+    Local,
+}
+
+impl Default for QueryMode {
+    fn default() -> Self {
+        QueryMode::Hybrid
+    }
+}
+
+impl std::str::FromStr for QueryMode {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hybrid" | "" | "default" => Ok(QueryMode::Hybrid),
+            "local" => Ok(QueryMode::Local),
+            other => Err(format!(
+                "unknown query mode '{}' (expected 'hybrid' or 'local')",
+                other
+            )),
+        }
+    }
+}
+
+/// Output of [`RetrievalSystem::search_with_mode`], discriminated by the
+/// requested [`QueryMode`].
+#[derive(Debug, Clone)]
+pub enum SearchOutput {
+    /// Result of `QueryMode::Hybrid` — ranked search results.
+    Hybrid(Vec<SearchResult>),
+    /// Result of `QueryMode::Local` — packed, token-budgeted context.
+    Local(LocalContext),
 }
 
 /// Type of search result indicating the retrieval strategy used
@@ -662,6 +711,32 @@ impl RetrievalSystem {
     ) -> Result<Vec<SearchResult>> {
         self.hybrid_query_with_trees(query, graph, &HashMap::new())
             .await
+    }
+
+    /// Dispatch a query to the requested [`QueryMode`].
+    ///
+    /// `budget` is consulted only for `QueryMode::Local`; the hybrid path
+    /// ignores it and uses the configured `top_k`. Closes the user-facing
+    /// half of #102 — this is the single entrypoint the CLI/API can call to
+    /// pick a paper-aligned mode explicitly.
+    pub async fn search_with_mode(
+        &mut self,
+        query: &str,
+        mode: QueryMode,
+        budget: usize,
+        graph: &KnowledgeGraph,
+    ) -> Result<SearchOutput> {
+        match mode {
+            QueryMode::Hybrid => {
+                let results = self.hybrid_query(query, graph).await?;
+                Ok(SearchOutput::Hybrid(results))
+            },
+            QueryMode::Local => {
+                let ls = LocalSearch::with_default_config(graph);
+                let ctx = ls.search(query, budget)?;
+                Ok(SearchOutput::Local(ctx))
+            },
+        }
     }
 
     /// Hybrid query with access to document trees for hierarchical retrieval
@@ -2125,5 +2200,66 @@ mod tests {
         assert!(source_types.contains(&&SourceType::TextChunk));
         assert!(source_types.contains(&&SourceType::Entity));
         assert!(source_types.contains(&&SourceType::Relationship));
+    }
+
+    /// `QueryMode::from_str` accepts the documented mode names case-insensitively.
+    #[test]
+    fn query_mode_from_str_accepts_known_modes() {
+        use std::str::FromStr;
+        assert_eq!(QueryMode::from_str("local").unwrap(), QueryMode::Local);
+        assert_eq!(QueryMode::from_str("Local").unwrap(), QueryMode::Local);
+        assert_eq!(QueryMode::from_str("hybrid").unwrap(), QueryMode::Hybrid);
+        assert_eq!(QueryMode::from_str("").unwrap(), QueryMode::Hybrid);
+        assert!(QueryMode::from_str("global").is_err());
+    }
+
+    /// `search_with_mode(QueryMode::Local, ...)` returns a `SearchOutput::Local`
+    /// carrying a packed `LocalContext` (and not a `Hybrid` variant).
+    #[tokio::test]
+    async fn search_with_mode_local_returns_local_context() {
+        use crate::core::{
+            ChunkId, DocumentId, Entity, EntityId, EntityMention, KnowledgeGraph, TextChunk,
+        };
+
+        let mut graph = KnowledgeGraph::new();
+        graph
+            .add_chunk(TextChunk::new(
+                ChunkId::new("c1".into()),
+                DocumentId::new("d1".into()),
+                "Alice met Bob in Wonderland.".into(),
+                0,
+                28,
+            ))
+            .unwrap();
+        graph
+            .add_entity(
+                Entity::new(
+                    EntityId::new("alice".into()),
+                    "Alice".into(),
+                    "PERSON".into(),
+                    0.9,
+                )
+                .with_mentions(vec![EntityMention {
+                    chunk_id: ChunkId::new("c1".into()),
+                    start_offset: 0,
+                    end_offset: 5,
+                    confidence: 1.0,
+                }]),
+            )
+            .unwrap();
+
+        let config = Config::default();
+        let mut retrieval = RetrievalSystem::new(&config).unwrap();
+        let out = retrieval
+            .search_with_mode("Tell me about Alice", QueryMode::Local, 1024, &graph)
+            .await
+            .unwrap();
+        match out {
+            SearchOutput::Local(ctx) => {
+                assert!(!ctx.entity_descriptions.is_empty());
+                assert!(ctx.total_tokens <= 1024);
+            },
+            SearchOutput::Hybrid(_) => panic!("expected Local output"),
+        }
     }
 }

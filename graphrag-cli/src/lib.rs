@@ -95,6 +95,16 @@ pub enum Commands {
         /// Configuration file (required if not already initialized)
         #[arg(short, long)]
         config: Option<PathBuf>,
+
+        /// Retrieval mode: "hybrid" (default, multi-strategy) or "local"
+        /// (entity-anchored, token-budgeted; Edge et al. 2024 Local Search).
+        /// Case-insensitive; resolved via `QueryMode::from_str`.
+        #[arg(long, default_value = "hybrid")]
+        mode: String,
+
+        /// Token budget for `--mode local` context packer. Ignored otherwise.
+        #[arg(long, default_value_t = 2048)]
+        budget: usize,
     },
 
     /// List entities in the knowledge graph (deprecated: prefer TUI with /entities)
@@ -212,7 +222,12 @@ pub async fn run() -> Result<()> {
                 println!("✅ {}", result);
             }
         },
-        Some(Commands::Query { query, config }) => {
+        Some(Commands::Query {
+            query,
+            config,
+            mode,
+            budget,
+        }) => {
             setup_logging(cli.debug)?;
             eprintln!(
                 "⚠️  `query` is deprecated. Prefer: graphrag tui, then /query {}",
@@ -220,22 +235,77 @@ pub async fn run() -> Result<()> {
             );
 
             let handler = init_handler(config).await?;
-            let (answer, raw_results) = handler.query_with_raw(&query).await?;
 
-            if cli.format == "json" {
-                println!(
-                    "{}",
-                    serde_json::json!({"query": query, "answer": answer, "sources": raw_results})
-                );
-            } else {
-                println!("📝 Query: {}\n", query);
-                println!("💡 Answer:\n{}\n", answer);
-                if !raw_results.is_empty() {
-                    println!("📚 Sources:");
-                    for (i, src) in raw_results.iter().enumerate() {
-                        println!("   {}. {}", i + 1, src);
+            // Parse `--mode` case-insensitively via the core enum so the
+            // CLI shares the same vocabulary as the library API.
+            use std::str::FromStr;
+            let parsed_mode = graphrag_core::retrieval::QueryMode::from_str(&mode)
+                .map_err(|e| color_eyre::eyre::eyre!(e))?;
+
+            match parsed_mode {
+                graphrag_core::retrieval::QueryMode::Local => {
+                    // Route through the unified entrypoint and unwrap the
+                    // local variant for legacy CLI rendering.
+                    let out = handler.query_with_mode(&query, parsed_mode, budget).await?;
+                    let ctx = match out {
+                        graphrag_core::retrieval::SearchOutput::Local(c) => c,
+                        graphrag_core::retrieval::SearchOutput::Hybrid(_) => {
+                            return Err(color_eyre::eyre::eyre!(
+                                "search_with_mode(Local) returned Hybrid output"
+                            ));
+                        },
+                    };
+
+                    if cli.format == "json" {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "query": query,
+                                "mode": "local",
+                                "budget": budget,
+                                "total_tokens": ctx.total_tokens,
+                                "seed_entities": ctx.seed_entities,
+                                "entity_descriptions": ctx.entity_descriptions,
+                                "relationship_descriptions": ctx.relationship_descriptions,
+                                "source_chunks": ctx.source_chunks,
+                                "community_context": ctx.community_context,
+                                "dropped_tier": ctx.dropped_tier.map(|t| t.label()),
+                            })
+                        );
+                    } else {
+                        println!("📝 Query: {}\n", query);
+                        println!(
+                            "🎯 Mode: local  |  Budget: {} tokens  |  Used: {} tokens",
+                            budget, ctx.total_tokens
+                        );
+                        if let Some(tier) = ctx.dropped_tier {
+                            println!("⚠️  Truncated at tier: {}", tier.label());
+                        }
+                        println!("\n{}", ctx.to_prompt());
                     }
-                }
+                },
+                graphrag_core::retrieval::QueryMode::Hybrid => {
+                    // Hybrid still goes through the LLM-synthesis path;
+                    // `query_with_mode` would skip synthesis. Keep the
+                    // existing `query_with_raw` for human-friendly output.
+                    let (answer, raw_results) = handler.query_with_raw(&query).await?;
+
+                    if cli.format == "json" {
+                        println!(
+                            "{}",
+                            serde_json::json!({"query": query, "answer": answer, "sources": raw_results})
+                        );
+                    } else {
+                        println!("📝 Query: {}\n", query);
+                        println!("💡 Answer:\n{}\n", answer);
+                        if !raw_results.is_empty() {
+                            println!("📚 Sources:");
+                            for (i, src) in raw_results.iter().enumerate() {
+                                println!("   {}. {}", i + 1, src);
+                            }
+                        }
+                    }
+                },
             }
         },
         Some(Commands::Entities { filter, config }) => {
@@ -945,5 +1015,32 @@ mod tests {
             result.is_err(),
             "invalid TOML must produce a non-zero exit, got Ok"
         );
+    }
+
+    // `--mode` accepts mixed-case values (`Local`, `HYBRID`, `LoCaL`) and
+    // resolves them via `QueryMode::from_str`. Pins the case-insensitivity
+    // fix from the #102 review.
+    #[test]
+    fn cli_query_mode_accepts_mixed_case() {
+        use std::str::FromStr;
+        let cli = Cli::try_parse_from(["graphrag", "query", "What is AI?", "--mode", "Local"])
+            .expect("clap should accept mixed-case --mode");
+        let mode = match cli.command {
+            Some(Commands::Query { mode, .. }) => mode,
+            _ => panic!("expected Query subcommand"),
+        };
+        let parsed = graphrag_core::retrieval::QueryMode::from_str(&mode)
+            .expect("QueryMode::from_str must accept mixed-case Local");
+        assert_eq!(parsed, graphrag_core::retrieval::QueryMode::Local);
+
+        let cli = Cli::try_parse_from(["graphrag", "query", "anything", "--mode", "HYBRID"])
+            .expect("clap should accept HYBRID");
+        let mode = match cli.command {
+            Some(Commands::Query { mode, .. }) => mode,
+            _ => panic!("expected Query subcommand"),
+        };
+        let parsed = graphrag_core::retrieval::QueryMode::from_str(&mode)
+            .expect("QueryMode::from_str must accept HYBRID");
+        assert_eq!(parsed, graphrag_core::retrieval::QueryMode::Hybrid);
     }
 }
